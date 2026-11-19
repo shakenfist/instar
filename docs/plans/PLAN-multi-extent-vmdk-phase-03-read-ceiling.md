@@ -724,6 +724,47 @@ step.
 with. It was not asked for, and it is where a user-visible output change
 belongs; the CHANGELOG and the format-coverage table remain step 3h's.
 
+**Step 3g changed nothing, which is the right answer.** Run 2026-11-19
+(AEDT) on sonnet at medium effort. The baselines the row asks for were
+already generated: the testdata commit of 2026-11-18 added them for all
+five fixtures across all 80 versions, and the derived profiles with
+them. `instar-testdata` is clean and nothing was committed or pushed.
+
+**The brief this session wrote for the step was wrong about `map` and
+`measure`, and the step corrected it.** Their baselines are not absent.
+They are stored under a format bucket -- `map-json/vmdk/<version>/`,
+beside `raw/` rather than under it -- so a probe that looked only under
+`raw/` found none. There are 1245 map files and 4860 measure files for
+the five fixtures, matching `vmdk-multi-flat` and `plaso-vmdk` exactly.
+
+The derived profiles were validated by the management session rather
+than taken from the step: `validate-profiles` compares 175932 files
+across 960 versions and reports no mismatch, no missing source and no
+hand-maintained gap, and re-deriving them from `raw/` reproduces the
+committed tree apart from the `generated_at` and `created_at` stamps.
+That matters because these directories have twice been silently wrong
+while `raw/` was fine.
+
+**`compare-human` really is incomplete, and is deliberately left so.**
+It covers 39 of 48 fixtures and was last generated before the four
+synthetic split-sparse fixtures and `vmdk-multi-flat` existed. Nothing
+reads it: `get_expected_output` is called only for `info`, `check`,
+`measure`, `map`, `dd` and `snapshot-list`, and no test asks it for a
+`compare` baseline. Filling it would add roughly 1200 files that
+nothing consumes. It is a pre-existing property of the testdata
+repository rather than anything this phase changed.
+
+**What the phase does not reach, measured rather than assumed.** Thirty
+`map` and `measure` scenarios for these five fixtures skip, with
+baselines present, because instar refuses a VMDK descriptor as a source
+outright: `map: monolithicFlat source images are not yet supported`,
+exit 1. `vmdk-multi-flat` is refused identically, so this is a
+format-wide limit that predates the phase, not something the split
+sparse fixtures introduced. This phase makes a descriptor readable for
+`info`; `map` and `measure` still refuse one. The refusal also names
+monolithicFlat for an image that is not flat, which is now inaccurate.
+Both belong in the format coverage table.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs.
