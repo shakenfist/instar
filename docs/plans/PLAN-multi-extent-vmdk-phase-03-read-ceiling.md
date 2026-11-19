@@ -165,21 +165,34 @@ consequence.
    the boundaries reads sparse images wrongly, and would do it
    silently.
 
-3. **The extent table carries three `u64`s per extent**: the device
-   offset where the extent's bytes begin, the extent file's length, and
-   the extent's virtual span in bytes. The span cannot be derived from
-   the length, because a sparse extent's file is shorter than its span
-   and phase 2 measured a real image declaring 3.96 GiB extents under
-   `twoGbMaxExtentSparse`. Reading the declared sector count rather than
-   assuming 2 GiB is therefore not a refinement, it is the only thing
-   that works.
+3. **The extent table carries three `u64`s and a kind per extent**: the
+   device offset where the extent's bytes begin, the extent file's
+   length, the extent's virtual span in bytes, and whether that file is
+   flat or sparse. The span cannot be derived from the length, because a
+   sparse extent's file is shorter than its span and phase 2 measured a
+   real image declaring 3.96 GiB extents under `twoGbMaxExtentSparse`.
+   Reading the declared sector count rather than assuming 2 GiB is
+   therefore not a refinement, it is the only thing that works.
+
+   **Amended 2026-11-19 by step 3c.** Three `u64`s cannot say whether an
+   extent is flat or sparse, and a guest left to work it out has to
+   guess from the bytes. Looking for a sparse header would read a flat
+   extent whose first sector happens to hold one as sparse; comparing
+   the file's length with its span would read a sparse extent padded out
+   to its span as flat. Either way one file means different bytes to
+   instar than to qemu, which believes the type on the descriptor's
+   extent line -- a line only the host has read. So the host states it:
+   `ChainExtent::kind` is `KIND_FLAT` or `KIND_SPARSE`, and zero, the
+   value a writer that never set it leaves behind, is refused rather
+   than read as either.
 
 4. **`MAX_CHAIN_EXTENTS = 64`, and the refusal above it is
    documented.** `ChainConfig` lives at `CHAIN_CONFIG_ADDR`
    (`0x000F2000`) and the next region, `VMM_PARAMS_ADDR`, begins at
-   `0x000F3000`, so the whole structure must fit in 4096 bytes. At 24
-   bytes per entry, 64 extents costs 1536 bytes, which the current
-   structure has room for; step 3a proves it with a `const_assert` on
+   `0x000F3000`, so the whole structure must fit in 4096 bytes. At 32
+   bytes per entry -- 24 as first planned, plus the kind decision 3 now
+   carries -- 64 extents costs 2048 bytes, which the page has room for;
+   step 3a proves it with a free-standing `const _: () = assert!(..)` on
    `size_of::<ChainConfig>()` rather than by arithmetic in this plan.
    Sixty-four extents is 128 GiB at qemu's 2 GiB default and covers both
    corpus images (17 and 26 extents). qemu has no such limit, so this is
@@ -244,6 +257,42 @@ and 3d, because all three consume the ABI it defines.
 | 3f | medium | sonnet | none | Un-flag the fixtures and resolve what that empties. Remove `instar_unsupported` from all five entries in `tests/manifest.json` that carry it (`vmdk-split-sparse-2049m`, `-5g`, `-5g-boundary`, `-33g`, and `osboxes-vmdk-split-sparse`) and give each a description of what it now proves. That empties the field across all 222 images, which makes `TestInstarUnsupportedIsStillUnsupported` in `tests/test_info_safe.py` fail by design -- it asserts the field is set somewhere. Nothing else in the suite reads the field except the skip at `tests/test_info_safe.py:126` and `is_instar_unsupported` in `tests/base.py`. Since no image is unsupported any more, remove the field's handling and that test together rather than leaving a mechanism with no subject, and say so in the commit message; if you find a reason to keep the field, keep the test too and say why. Then add the positive assertions the fixtures now support: each of the five reads, reports the virtual size its manifest entry declares, and for `-5g-boundary` the 131072 bytes of `0xAB` at offset 2147418112 straddling the first extent boundary read back correctly. |
 | 3g | medium | sonnet | none | Generate baselines in `instar-testdata` for the five newly supported fixtures, across the version matrix, and validate them. That repository takes direct commits to `main`, never a merge request, and is git-LFS backed; rebase before pushing because the fuzz automation moves `main` daily. Run `generate-baselines.py --no-commit`, then `make profiles`, then `make validate-profiles`, and do not trust the derived `profiles/` directories -- they have twice been silently wrong while `raw/` was fine. Report the file count per operation and per version. Leave the work uncommitted in the instar worktree; the testdata commit is the management session's to make. |
 | 3h | medium | sonnet | none | Records. Add a `### Fixed` entry to `CHANGELOG.md` under `[Unreleased]` for reading multi-extent VMDK (both split subformats) and for #927, as two separate entries because they are two faults. Document the new readable subformat in `docs/format-coverage.md` and wherever `docs/` states the extent or device limit, including the `MAX_CHAIN_EXTENTS` bound and that qemu has no equivalent. Do not cite plan, phase or step numbers anywhere outside `docs/plans/`. |
+
+### What step 3c hands step 3d
+
+The reader is in place and the host does not yet feed it. These are the
+constraints the reader now imposes, found while writing it, and they are
+step 3d's to satisfy rather than to rediscover:
+
+* every entry must state `kind`, `KIND_FLAT` or `KIND_SPARSE`, from the
+  type on the descriptor's extent line. An entry left at zero is
+  refused;
+* a sparse extent's `device_offset` must be a multiple of 512. Sparse
+  VMDK counts in 512-byte sectors from the start of its own file, so
+  only then does each header and table entry sit whole inside one
+  device sector;
+* step 3b's `declared_len` for an extent must be the file's own length.
+  A fully allocated sparse file is longer than its span, and a span
+  would truncate it;
+* `vmdk::MAX_EXTENTS` is 32, below `MAX_CHAIN_EXTENTS`, so the
+  descriptor parser is the tighter bound today. Whichever bound refuses
+  an image, the message must name the one that actually applied;
+* `ChainConfig::data_devices_are_owned` still permits a descriptor to
+  own a run of marked data devices. Nothing reads a descriptor that way
+  any more, so that clause and the VMM test pinning it are vestigial and
+  3d should remove them with the attachment code they describe;
+* a descriptor's `virtual_size` must still be the sum of its extents'
+  spans, and the device's capacity the sum of their file lengths: the
+  reader bounds a flat read with the device capacity, not the extent's.
+
+Two refusals the reader makes that qemu would not, both deliberate and
+both needing a message that names the bound rather than a bare failure:
+a compressed sparse extent (nothing can hold a compressed grain to its
+extent's file, and qemu only compresses the single-file stream-optimised
+subformat), and a sparse extent whose header capacity is not the span
+the descriptor line declares (qemu takes the span from the header and
+the host has only the line, so where they differ every later extent sits
+at a different virtual offset for each reader).
 
 ## Risks and mitigations
 
@@ -327,6 +376,63 @@ have their own. The descriptor device keeps one extent's state at a
 time and re-reads it at an extent crossing. Noted because it means the
 rotation this phase removed from the device slots came back in the
 parser state, one layer down.
+
+**Step 3c carried the extent's kind, and the ten tests that fail until
+step 3d.** The step found that nothing else in a table entry can say
+whether an extent is flat or sparse; decision 3 is amended above and
+decision 4's arithmetic with it. An entry grew from 24 to 32 bytes and
+`ChainConfig` from 2392 to 2904, still inside the page, and the version
+stays 5 because nothing has yet run against version 5's old shape.
+
+The step also removed the per-device extent walk, which is what
+decision 5 asked for, and the host does not fill the extent table until
+step 3d. Between the two commits a flat descriptor is refused at guest
+init rather than read, so ten integration tests fail by design:
+
+| Test | File |
+|---|---|
+| `test_convert_vmdk_flat_1m`, `test_convert_vmdk_flat_10m` | `tests/test_convert.py` |
+| `test_convert_vmdk_flat_roundtrip`, `test_convert_flat_to_vmdk_flat`, `test_convert_raw_to_vmdk_flat` | `tests/test_convert.py` |
+| `test_convert_multi_extent_flat_to_raw`, `test_convert_flat_with_parent_chain` | `tests/test_convert.py` |
+| `test_compare_qcow2_over_smaller_flat_vmdk`, `test_compare_reversed_qcow2_over_smaller_flat_vmdk`, `test_convert_qcow2_over_smaller_flat_vmdk` | `tests/test_qcow2_subclusters.py` |
+
+Each fails as a clean refusal (`convert operation failed`), not as a
+wrong answer, and step 3d restores all ten. Recorded here because the
+branch is red in the middle of its own phase, which a reader of the
+history is owed an explanation for, and because the definition of done
+has to show these ten green before the phase is finished.
+
+**Guest binary sizes across step 3c**, the "after" column measured by
+the management session with `make check-binary-sizes` on its own build
+and the "before" taken from the step's record at `b6f13211`, against the
+cap of 768KB (`core`'s is 128KB). Only the operations that link the chain
+reader move:
+
+| Operation | Before | After |
+|---|---|---|
+| `convert` | 369KB | 372KB |
+| `compare` | 244KB | 247KB |
+| `bench` | 220KB | 224KB |
+| `rebase` | 119KB | 120KB |
+| `measure` | 41KB | 42KB |
+| `core` | 70KB | 70KB |
+
+The reader's own frame is unchanged at 10728 bytes against the ~10.7KB
+per device the budget allows, because the new work is in a function of
+its own that is not inlined and is not live across a descent. An extent
+crossing costs a transient 66KB header read instead of a permanent
+frame.
+
+**The qcow2 crate's VMDK reader arms had never been tested.** The
+feature matrix in `Makefile`, `scripts/check-rust.sh` and
+`tools/ci/rust-feature-tests.sh` listed every input format's feature but
+`vmdk-input`, so before step 3c the crate had no test gated on it at
+all -- the arm shipped in the guest binaries and nothing exercised it in
+either `make test-rust` or CI. The step added `vmdk-decompress`, which
+implies `vmdk-input`, to all three. This is the failure class the CI
+script's own comment names, and the same script is still missing the
+`vhd-input,vhdx-input` the Makefile has, which predates this plan and is
+left for an issue rather than fixed here.
 
 **One step 3c premise the survey had backwards.** The plan asked for
 each extent's declared sector count to be honoured "rather than
