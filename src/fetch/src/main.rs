@@ -42,9 +42,10 @@
 //!
 //! # Exit status
 //!
-//! `0` when the peer closes the socket, which is how a normal run ends; `2`
-//! for a usage error, before any descriptor is touched; `1` for everything
-//! else, each case preceded by a line on stderr saying what failed.
+//! `0` when the peer closes the socket, which is how a normal run ends, and
+//! for `--help`, which serves no bytes and touches no descriptor; `2` for a
+//! usage error, before any descriptor is touched; `1` for everything else,
+//! each case preceded by a line on stderr saying what failed.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -54,7 +55,7 @@ use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
 
 use fetch_protocol::{
-    negotiate_block_size, InitReply, InitRequest, ProtocolError, ReadReply, ReadRequest,
+    negotiate_block_size, Datagram, InitReply, InitRequest, ProtocolError, ReadReply, ReadRequest,
     SeqPacketSocket, Status,
 };
 
@@ -75,8 +76,9 @@ opened. instar-fetch takes no paths and opens nothing.";
 /// datagram that is merely malformed still lands in the buffer, which means
 /// its request id can be recovered and the request refused by id, whereas a
 /// buffer sized exactly to the header would turn the same mistake into an
-/// unanswerable receive error. Anything larger than this is discarded with a
-/// note, which `MSG_TRUNC` makes detectable rather than silent.
+/// unanswerable receive error. A datagram larger than this is refused by the
+/// id in the prefix the kernel kept, which `MSG_TRUNC` makes detectable
+/// rather than silent.
 const REQUEST_BUFFER: usize = 1024;
 
 /// The bytes being served.
@@ -268,20 +270,26 @@ fn serve(args: Args) -> io::Result<()> {
     );
 
     loop {
-        let len = match socket.recv(&mut datagram) {
-            Ok(0) => {
+        let len = match socket.recv_allowing_overlong(&mut datagram)? {
+            Datagram::Whole(0) => {
                 eprintln!("instar-fetch: the peer closed the socket, exiting");
                 return Ok(());
             }
-            Ok(len) => len,
-            // An oversized datagram has already been consumed and discarded
-            // by the kernel, so there is nothing to resynchronise and no id
-            // to answer by. Keep serving: the next message may be sound.
-            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                eprintln!("instar-fetch: discarded a datagram that does not fit a request: {err}");
+            Datagram::Whole(len) => len,
+            // The remainder of an oversized datagram is already gone: the
+            // kernel discarded it on delivery, so there is nothing to
+            // resynchronise. What it kept is the head of the datagram,
+            // which is where the request id lives, so this is refused by id
+            // like any other malformed request rather than dropped in
+            // silence. Keep serving: the next message may be sound.
+            Datagram::Overlong { len, kept } => {
+                eprintln!(
+                    "instar-fetch: refusing a {len}-byte datagram, which is longer than a \
+                     request"
+                );
+                refuse_overlong(&socket, &datagram[..kept])?;
                 continue;
             }
-            Err(err) => return Err(err),
         };
         answer(&socket, &file, capacity, block_size, &datagram[..len])?;
     }
@@ -333,6 +341,25 @@ fn refuse_init(socket: &SeqPacketSocket, err: ProtocolError) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("refusing the init request: {err}"),
     )
+}
+
+/// Refuse a datagram that was longer than the request buffer, by its id.
+///
+/// `head` is the prefix the kernel kept. A request header is fixed-size and
+/// far shorter than that buffer, so the id is present whenever the peer sent
+/// anything header-shaped at all; the one shape left unanswered is the same
+/// one [`answer`] leaves unanswered, for the same reason.
+fn refuse_overlong(socket: &SeqPacketSocket, head: &[u8]) -> io::Result<()> {
+    match ReadRequest::peek_id(head) {
+        Some(id) => reply(socket, id, Status::BadRequest, &[]),
+        None => {
+            eprintln!(
+                "instar-fetch: the datagram is too short to carry a request id, so \
+                 there is nothing to answer"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Answer one datagram from the peer.

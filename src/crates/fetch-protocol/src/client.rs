@@ -9,6 +9,12 @@
 //! sector, so the guest's last read legitimately reaches past it, and both
 //! stores answer the overhang with zeros rather than an error.
 //!
+//! The capacity is what the fetcher advertised at init and is not re-read,
+//! so a source that grows afterwards reads back as zeros past the advertised
+//! size and one that shrinks fails with `UnexpectedEof`. That is also what
+//! the local store does with a file that changes under it, which is what
+//! keeps the two interchangeable.
+//!
 //! # Time
 //!
 //! The bound on a read is a deadline for the whole call, not for each
@@ -16,6 +22,11 @@
 //! trips, and a peer that answered each one just inside a per-datagram
 //! timeout could hold the privileged process for as long as it liked while
 //! never tripping it.
+//!
+//! The deadline covers both directions. A peer that stops answering blocks
+//! the reply, and a peer that stops reading blocks the request in the
+//! kernel once its receive buffer is full; both are the same hang from this
+//! side, so both are bounded.
 //!
 //! # Trust
 //!
@@ -131,6 +142,9 @@ impl FetchClient {
     /// a block size this side cannot carry.
     pub fn new(socket: SeqPacketSocket) -> io::Result<Self> {
         socket.set_recv_timeout(DEFAULT_REPLY_TIMEOUT)?;
+        // Both directions, because a peer that stops reading blocks a send
+        // in the kernel just as a peer that stops answering blocks a recv.
+        socket.set_send_timeout(DEFAULT_REPLY_TIMEOUT)?;
         // The socket arrives already sized by whoever created the pair, and
         // this measures what it was given rather than changing it: a caller
         // that deliberately chose a smaller buffer must not have it put
@@ -176,7 +190,21 @@ impl FetchClient {
     /// splits into several round trips gets this long for all of them
     /// together.
     pub fn set_reply_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        // A deadline shorter than the window a round trip is given would
+        // fail every read before sending anything, which is a stuck client
+        // rather than a tight one. Refusing it here is the same guard the
+        // socket applies to a timeout that would round away to none.
+        if timeout < MIN_REPLY_WINDOW {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a reply timeout of {timeout:?} is below the {MIN_REPLY_WINDOW:?} a round \
+                     trip is given, so no read could ever be attempted"
+                ),
+            ));
+        }
         self.socket.set_recv_timeout(timeout)?;
+        self.socket.set_send_timeout(timeout)?;
         self.reply_timeout = timeout;
         Ok(())
     }
@@ -237,12 +265,15 @@ impl FetchClient {
     }
 
     /// The error for a read whose deadline ran out at `offset`.
-    fn timed_out(&self, offset: u64) -> io::Error {
+    ///
+    /// `stage` says what the peer had not done, because the two ends of a
+    /// round trip fail differently: a peer that has stopped reading blocks
+    /// the request, and a peer that has stopped answering blocks the reply.
+    fn timed_out(&self, offset: u64, stage: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "the fetcher did not finish this read within {:?}; it was still \
-                 answering at offset {offset}",
+                "the fetcher did not finish this read within {:?}; it {stage} at offset {offset}",
                 self.reply_timeout
             ),
         )
@@ -262,17 +293,28 @@ impl FetchClient {
         // What is left of the read's deadline is what this block gets.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining < MIN_REPLY_WINDOW {
-            return Err(self.timed_out(offset));
+            return Err(self.timed_out(offset, "had run out of time before the request for"));
         }
         self.socket.set_recv_timeout(remaining)?;
+        self.socket.set_send_timeout(remaining)?;
         // chunks_mut of a block-sized slice cannot exceed the block, which
         // is a u32, so this conversion cannot fail.
         let length = u32::try_from(chunk.len())
             .map_err(|_| io::Error::other("fetch block does not fit a 32-bit length"))?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.socket
-            .send(&ReadRequest::new(id, offset, length).encode())?;
+        if let Err(err) = self
+            .socket
+            .send(&ReadRequest::new(id, offset, length).encode())
+        {
+            // A full peer receive buffer blocks the send itself, and an
+            // expired `SO_SNDTIMEO` surfaces the same way an expired
+            // `SO_RCVTIMEO` does.
+            if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut {
+                return Err(self.timed_out(offset, "had not taken the request for"));
+            }
+            return Err(err);
+        }
 
         let got = match recv_nonempty(&self.socket, &mut self.recv_buf, "read reply") {
             Ok(got) => got,
@@ -283,7 +325,7 @@ impl FetchClient {
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
-                return Err(self.timed_out(offset));
+                return Err(self.timed_out(offset, "was still answering"));
             }
             Err(err) => return Err(err),
         };
@@ -525,6 +567,26 @@ mod tests {
             .expect_err("overflow");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("overflows"), "{err}");
+        drop(client);
+        handle.join().expect("peer thread");
+        Ok(())
+    }
+
+    #[test]
+    fn a_deadline_too_short_for_a_round_trip_is_refused_not_accepted() -> io::Result<()> {
+        // Accepting one would leave a client that fails every read without
+        // sending anything, which looks like a dead peer rather than a
+        // deadline the caller chose.
+        let (client, handle) = spawn_peer(good_init(), |_sock| {})?;
+        let mut client = client?;
+        for timeout in [Duration::ZERO, Duration::from_micros(999)] {
+            let err = client.set_reply_timeout(timeout).expect_err("refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+            assert!(err.to_string().contains("round trip"), "{err}");
+        }
+        // The floor itself is accepted: the guard is a floor, not a minimum
+        // anyone has to guess at.
+        client.set_reply_timeout(MIN_REPLY_WINDOW)?;
         drop(client);
         handle.join().expect("peer thread");
         Ok(())

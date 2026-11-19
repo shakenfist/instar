@@ -46,6 +46,22 @@ pub const DATAGRAM_OVERHEAD: u32 = 32;
 /// granted, not this figure, so it is only ever a request.
 pub const WANTED_SOCKET_BUFFER: u32 = MAX_BLOCK_SIZE + READ_REPLY_LEN as u32 + DATAGRAM_OVERHEAD;
 
+/// What one `recv` delivered.
+///
+/// A `SOCK_SEQPACKET` socket keeps message boundaries, so a datagram larger
+/// than the buffer offered for it is not a short read to be continued: the
+/// kernel copies what fits, discards the rest, and the message is gone. The
+/// two cases are distinguished rather than merged because the only side that
+/// meets the second one is the fetcher, which still owes the peer an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Datagram {
+    /// The whole datagram, of this length, is in the buffer.
+    Whole(usize),
+    /// The datagram was longer than the buffer: `kept` bytes of its `len`
+    /// are in the buffer and the remainder has been discarded.
+    Overlong { len: usize, kept: usize },
+}
+
 /// One end of an `AF_UNIX`/`SOCK_SEQPACKET` socketpair.
 ///
 /// The descriptor is owned: it is closed when the socket is dropped, and
@@ -156,6 +172,29 @@ impl SeqPacketSocket {
     /// remainder either way; with it, the real length comes back and the
     /// mismatch becomes an error instead of a silently truncated header.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.recv_allowing_overlong(buf)? {
+            Datagram::Whole(len) => Ok(len),
+            Datagram::Overlong { len, .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer sent a {len}-byte datagram into a {}-byte buffer",
+                    buf.len()
+                ),
+            )),
+        }
+    }
+
+    /// Receive one datagram, reporting an oversized one instead of refusing
+    /// it.
+    ///
+    /// [`SeqPacketSocket::recv`] is the right call for a side that has
+    /// nothing to say to a peer that overran the buffer. A fetcher does: it
+    /// owes an answer, and the bytes that fit still carry the request id at
+    /// its fixed offset, so the datagram can be refused by id rather than
+    /// dropped in silence. The remainder is gone either way -- the kernel
+    /// discarded it as the datagram was delivered -- so this reports the
+    /// prefix it kept and the length that was really sent.
+    pub fn recv_allowing_overlong(&self, buf: &mut [u8]) -> io::Result<Datagram> {
         // SAFETY: the pointer and length describe `buf`, which outlives the
         // call and is only read from after the length is validated below.
         let ret = unsafe {
@@ -171,15 +210,12 @@ impl SeqPacketSocket {
         }
         let len = usize::try_from(ret).unwrap_or(usize::MAX);
         if len > buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "peer sent a {len}-byte datagram into a {}-byte buffer",
-                    buf.len()
-                ),
-            ));
+            return Ok(Datagram::Overlong {
+                len,
+                kept: buf.len(),
+            });
         }
-        Ok(len)
+        Ok(Datagram::Whole(len))
     }
 
     /// The granted send buffer, as the kernel reports it.
@@ -214,10 +250,30 @@ impl SeqPacketSocket {
     /// so rounding down would quietly remove the bound a caller was asking
     /// to tighten -- the one failure this setting exists to prevent.
     pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_timeout(libc::SO_RCVTIMEO, "receive", timeout)
+    }
+
+    /// Give up on a `send` that has waited this long.
+    ///
+    /// The receive side is the obvious one to bound, but it is not the only
+    /// unbounded wait on the socket. `SOCK_SEQPACKET` blocks a `send` whose
+    /// datagram will not fit in the peer's receive buffer, so a peer that
+    /// stops reading holds the sender in the kernel for as long as it likes
+    /// -- the same hang as a peer that stops answering, reached from the
+    /// other direction. A privileged process must bound both.
+    pub fn set_send_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_timeout(libc::SO_SNDTIMEO, "send", timeout)
+    }
+
+    /// Set one of the two `timeval` timeouts.
+    ///
+    /// A timeout under a microsecond is refused rather than rounded, for the
+    /// reason given on [`SeqPacketSocket::set_recv_timeout`].
+    fn set_timeout(&self, option: libc::c_int, what: &str, timeout: Duration) -> io::Result<()> {
         if timeout.as_micros() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "a receive timeout below one microsecond would mean no timeout at all",
+                format!("a {what} timeout below one microsecond would mean no timeout at all"),
             ));
         }
         let timeval = libc::timeval {
@@ -228,12 +284,12 @@ impl SeqPacketSocket {
         let len = u32::try_from(std::mem::size_of::<libc::timeval>())
             .map_err(|_| io::Error::other("timeval size does not fit a socklen_t"))?;
         // SAFETY: the pointer and length describe one timeval, which is what
-        // SO_RCVTIMEO expects, and the result is checked.
+        // both timeout options expect, and the result is checked.
         let ret = unsafe {
             libc::setsockopt(
                 self.fd.as_raw_fd(),
                 libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
+                option,
                 std::ptr::addr_of!(timeval).cast(),
                 len,
             )
@@ -449,6 +505,28 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Send `datagram` and receive it back, or return `None` if the kernel
+    /// could not find the memory for it.
+    ///
+    /// A datagram of the default ceiling is several hundred kilobytes, which
+    /// the kernel must allocate as one physically contiguous `skb` -- an
+    /// order-7 allocation at 416 KiB. On a host whose free memory is
+    /// fragmented that allocation fails with `ENOBUFS`, which says nothing
+    /// about the size being derived correctly and is not a property this
+    /// crate can assert. The protocol never asks for it either: the
+    /// negotiation caps a block at 64 KiB, two orders of magnitude below the
+    /// sizes that need a high-order allocation.
+    fn round_trip(a: &SeqPacketSocket, b: &SeqPacketSocket, datagram: &[u8]) -> Option<Vec<u8>> {
+        match a.send(datagram) {
+            Ok(()) => {}
+            Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => return None,
+            Err(err) => panic!("send of {} bytes failed: {err:?}", datagram.len()),
+        }
+        let mut buf = vec![0u8; datagram.len()];
+        assert_eq!(b.recv(&mut buf).expect("recv"), datagram.len());
+        Some(buf)
+    }
+
     #[test]
     fn a_datagram_of_the_derived_maximum_really_sends() {
         let (a, b) = SeqPacketSocket::pair().expect("socketpair");
@@ -457,11 +535,18 @@ mod tests {
             max >= 4096,
             "default socket buffer is unexpectedly small: {max}"
         );
-        a.send(&vec![0xC3u8; max])
-            .expect("the derived maximum sends");
-        let mut buf = vec![0u8; max];
-        assert_eq!(b.recv(&mut buf).expect("recv"), max);
-        assert_eq!(buf[max - 1], 0xC3);
+        match round_trip(&a, &b, &vec![0xC3u8; max]) {
+            Some(got) => assert_eq!(got[max - 1], 0xC3),
+            None => {
+                // The host could not allocate a datagram that size. What the
+                // protocol will actually ask of this socket still has to go
+                // through, and that is the assertion worth keeping here.
+                let block = crate::wire::DEFAULT_BLOCK_SIZE as usize + READ_REPLY_LEN;
+                let got = round_trip(&a, &b, &vec![0xC3u8; block])
+                    .expect("a full negotiated block sends");
+                assert_eq!(got[block - 1], 0xC3);
+            }
+        }
     }
 
     #[test]
@@ -514,20 +599,90 @@ mod tests {
     }
 
     #[test]
+    fn a_send_timeout_expires_rather_than_blocking_on_a_peer_that_stopped_reading() {
+        // The sending runs on its own thread with a watchdog, because the
+        // failure this guards against is an unbounded block: without the
+        // timeout the send never returns, and a test that waits for it
+        // would hang the suite instead of failing it. A hung run says far
+        // less than a failed one, and costs whatever the CI timeout is.
+        let (done, waiting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+            a.set_send_buffer_size(2048).expect("set SO_SNDBUF");
+            b.set_recv_buffer_size(2048).expect("set SO_RCVBUF");
+            a.set_send_timeout(Duration::from_millis(50))
+                .expect("set SO_SNDTIMEO");
+            // `b` never reads, so its receive buffer fills and the send
+            // blocks. The loop is bounded so that a kernel which never
+            // blocks is a failure rather than a spin.
+            let datagram = vec![0u8; 512];
+            for _ in 0..1000 {
+                match a.send(&datagram) {
+                    Ok(()) => continue,
+                    Err(err) => {
+                        let _ = done.send(Some(err.kind()));
+                        return;
+                    }
+                }
+            }
+            let _ = done.send(None);
+        });
+        match waiting.recv_timeout(Duration::from_secs(10)) {
+            Ok(Some(kind)) => assert!(
+                matches!(kind, io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+                "unexpected kind: {kind:?}"
+            ),
+            Ok(None) => panic!("a 2 KiB receive buffer accepted 1000 datagrams without blocking"),
+            // The thread is still blocked in `send` and stays that way
+            // until the process ends, which is what the bound is supposed
+            // to make impossible.
+            Err(_) => panic!("the send did not give up: SO_SNDTIMEO is not bounding it"),
+        }
+    }
+
+    #[test]
     fn a_timeout_that_would_round_to_no_timeout_is_refused() {
         // `{0, 0}` means wait forever, so accepting these would turn the
         // tightest possible bound into none at all.
         let (a, _b) = SeqPacketSocket::pair().expect("socketpair");
         for timeout in [Duration::ZERO, Duration::from_nanos(999)] {
+            // Both directions: the option and the trap are the same.
             let err = a.set_recv_timeout(timeout).expect_err("refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+            let err = a.set_send_timeout(timeout).expect_err("refused");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         }
         // One microsecond is representable, so it is accepted and the
         // socket really does stop waiting.
         a.set_recv_timeout(Duration::from_micros(1))
             .expect("one microsecond");
+        a.set_send_timeout(Duration::from_micros(1))
+            .expect("one microsecond");
         let mut buf = [0u8; 64];
         assert!(a.recv(&mut buf).is_err(), "a 1 us timeout should expire");
+    }
+
+    #[test]
+    fn an_overlong_datagram_keeps_its_head_for_the_side_that_must_answer() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        let sent: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        a.send(&sent).expect("send");
+        let mut buf = [0u8; 64];
+        match b
+            .recv_allowing_overlong(&mut buf)
+            .expect("the datagram arrived")
+        {
+            Datagram::Overlong { len, kept } => {
+                assert_eq!(len, sent.len(), "the real length is reported");
+                assert_eq!(kept, buf.len(), "the buffer was filled");
+                assert_eq!(&buf[..], &sent[..buf.len()], "the head is the head");
+            }
+            other => panic!("expected an overlong datagram, got {other:?}"),
+        }
+        // The strict call, which the privileged side uses, still refuses it.
+        a.send(&sent).expect("send");
+        let err = b.recv(&mut buf).expect_err("oversized datagram");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
     /// The buffer each side asks for has to be able to carry the largest
     /// block the protocol permits.

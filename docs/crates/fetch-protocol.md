@@ -186,6 +186,16 @@ without ever tripping it, which is the hang the partition exists to prevent.
 Each block is given what remains of the call's deadline, and a deadline that
 runs out is `TimedOut` naming the offset the peer stopped at.
 
+The deadline covers both directions of each round trip. A peer that stops
+answering blocks the reply, and a peer that stops reading blocks the request
+itself once its receive buffer is full, which is the same hang reached from
+the other end; `SO_SNDTIMEO` and `SO_RCVTIMEO` are both set from what remains
+of the deadline. Below one microsecond a `timeval` rounds to zero, which the
+kernel reads as no timeout at all, so the socket refuses such a value rather
+than quietly removing the bound -- and the client refuses a whole-read
+deadline shorter than the window one round trip is given, which would fail
+every read before sending anything.
+
 ## Framing
 
 `SOCK_SEQPACKET` preserves message boundaries in the kernel, so there is no
@@ -217,6 +227,12 @@ a parsing mistake. Every `ProtocolError` carries numbers this side computed or
 read, never bytes from the peer. The fetcher's own stderr remains available
 for diagnostics that never become part of the protocol.
 
+That stderr carries one line per refused or non-`Ok` request, so its volume
+is set by the peer rather than by the fetcher. Nothing reads it today -- the
+only peer is the privileged side itself -- but whatever eventually routes it
+into a log owns that rate, and should bound or sample it rather than assume
+the fetcher is quiet.
+
 ## Usage
 
 ### Host side
@@ -238,7 +254,15 @@ sector, so a guest reading the last sector of an image that is not a sector
 multiple legitimately reads past the end of the file; both stores answer the
 overhang with zeros, and the client produces those zeros itself rather than
 asking the fetcher for bytes it would refuse as `OutOfRange`. A read starting
-past the capacity is zeros and no round trip at all. The client matches each
+past the capacity is zeros and no round trip at all.
+
+The capacity is the size the fetcher advertised at init, and it is not
+re-read. A source that *grows* afterwards therefore reads back as zeros past
+the advertised size rather than as the new bytes, and a source that *shrinks*
+fails with `UnexpectedEof` from the fetcher's `ShortRead`. Both are what the
+VMM's local backing store does with a file that changes under it, which is
+the point: the two stores answer a changing source alike, so whatever sits
+above them cannot tell which one it has. The client matches each
 reply to its request by id rather than assuming order, and a reply for an id
 it did not ask for is an error. The first failure ends the client, because the socket
 cannot be resynchronised without knowing how many answers are outstanding.
@@ -254,9 +278,15 @@ fetcher takes no paths and opens nothing, so it can in principle be given no
 filesystem access at all. It is single-threaded, answers each read with
 `pread` on the file, and never panics on anything the peer sends: a malformed
 request is answered with a status, or noted on stderr. It exits 0 when the
-peer closes the socket, 2 for a usage error, and 1 for anything else --
-including a descriptor that is not a regular file, which is refused before
-the init reply rather than failing every request.
+peer closes the socket and for `--help`, 2 for a usage error, and 1 for
+anything else -- including a descriptor that is not a regular file, which is
+refused before the init reply rather than failing every request.
+
+A datagram longer than the fetcher's request buffer is refused by its id like
+any other malformed request. `MSG_TRUNC` reports the length that was really
+sent while the kernel keeps only the head of it, and the head is where the id
+lives, so the remainder being gone is no reason to leave the peer without an
+answer.
 
 One malformed shape is answered with silence: a datagram too short to carry a
 request id. A reply is addressed by the id it carries back, so there is

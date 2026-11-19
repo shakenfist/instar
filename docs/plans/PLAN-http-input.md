@@ -576,10 +576,17 @@ the fetch client's `read_at` zero-fills past the advertised capacity,
 exactly as the local store does past the end of its file, because a
 device's capacity is the image's length rounded up to a whole sector
 and the guest's last read of a ragged image legitimately overhangs it.
-The two are interchangeable there, so nothing above has to clamp. This
-phase should also fix #932, the virtqueue error the host cannot read
-that hangs the guest, because it multiplies the ways the host can
-fail to answer a request.
+The two are interchangeable there, so nothing above has to clamp. The
+second review round added two facts this phase inherits rather than
+decides: the advertised capacity is read once at init and never
+re-read, so a source that grows afterwards reads as zeros past the old
+size and one that shrinks fails with `UnexpectedEof` -- again what the
+local store does with a file that changes under it -- and the
+fetcher's stderr carries one line per refused or non-`Ok` request, so
+whatever routes that stderr into a log owns a rate the peer sets and
+should bound or sample it. This phase should also fix #932, the
+virtqueue error the host cannot read that hangs the guest, because it
+multiplies the ways the host can fail to answer a request.
 
 **4. Confinement.** Landlock, seccomp-bpf, user and mount
 namespaces, rlimits (`RLIMIT_FSIZE` 0 and `RLIMIT_NPROC` 0 are the

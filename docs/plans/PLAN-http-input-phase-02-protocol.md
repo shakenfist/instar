@@ -654,6 +654,94 @@ happen.
     `DEFAULT_BLOCK_SIZE` in phase 6: the largest datagram the protocol
     permits is not always allocatable.
 
+27. **The automated review's second round, 2026-11-19 (AEDT).** One
+    `fix`, one `document`, eight `consider`, one informational -- down
+    from four `fix`. Both of the first two were taken, six of the
+    `consider` items were taken, two were declined, and no third round
+    was asked for. The reason for stopping is in the counts: three of
+    the eight `consider` items are about code the *first* round added,
+    which is the point at which the generator is reviewing its own
+    suggestions rather than the change.
+28. **Note 26's flake became the round's one `fix` item, and the
+    reviewer was right.** A test that fails for a reason unrelated to
+    the code under test still has to not fail, whatever the cause. An
+    `ENOBUFS` send is now treated as the host declining a high-order
+    allocation rather than as a derivation error -- but the test does
+    not simply pass in that case: it falls back to a datagram of
+    `DEFAULT_BLOCK_SIZE + READ_REPLY_LEN`, which is what the protocol
+    will actually ask of the socket, and asserts that it round trips.
+    Fragmentation costs the stronger assertion, not the test.
+29. **The receive side was bounded and the send side was not.**
+    `SOCK_SEQPACKET` blocks a `send` whose datagram will not fit in the
+    peer's receive buffer, so a peer that stops *reading* holds the
+    privileged process in the kernel exactly as a peer that stops
+    *answering* does. `SO_SNDTIMEO` now carries the same bound as
+    `SO_RCVTIMEO`, set from what remains of the read's deadline, and
+    the error names which half missed it. With one request in flight a
+    32-byte request always fits, so no client call can reach this
+    today; the proof is therefore at the socket, where a test fills a
+    2 KiB buffer that nothing is reading and watches the send give up
+    instead of blocking.
+30. **An oversized request was the second shape answered with silence,
+    which made the module header wrong.** `MSG_TRUNC` reports the
+    length that was really sent while the kernel keeps the head of the
+    datagram -- and the head is where the request id lives, so there
+    was an id to answer by all along. `SeqPacketSocket` now exposes
+    both readings: `recv` refuses an oversized datagram, which is what
+    the privileged side wants, and `recv_allowing_overlong` reports the
+    prefix it kept, which is what a side that owes an answer needs. The
+    fetcher refuses it by id and keeps serving. One shape is still
+    answered with silence, and it is the one the header describes: a
+    datagram too short to carry an id.
+31. **A limit that cannot bind is worse than no limit, because the next
+    reader has to work out whether it can.** The ceiling a refusal
+    names was `ours.min(MAX_BLOCK_SIZE)`, and `ours` can never exceed
+    `MAX_BLOCK_SIZE` because the negotiation caps its answer at
+    `DEFAULT_BLOCK_SIZE`. The `min` is gone and the invariant it was
+    standing in for is now a test over a spread of datagram ceilings,
+    which is the version that keeps holding if `DEFAULT_BLOCK_SIZE`
+    moves.
+32. **Two items were declined.** One asked for tests of the fetcher's
+    serve loop, init handshake and refusal paths, on the grounds that
+    they have none; the serve loop and the init exchange are in fact
+    covered end to end against the real binary by every test in
+    `src/fetch/tests/end_to_end.rs`, and the gap that was real -- a
+    hostile *client*, as opposed to the hostile peers the client is
+    tested against -- is closed by the oversized-datagram test this
+    round adds. The other asked for the file descriptor's readability
+    to be checked at init beside its type. A pipe is refused because it
+    cannot answer *any* positional read, so serving one means failing
+    every request; a write-only descriptor fails loudly on the first
+    read with the errno attached, which is a parent-side mistake
+    reported where it happens. The check would add a syscall and a
+    second way to be wrong about `F_GETFL` on an unusual descriptor.
+33. **The mutation harness now extracts its own source text.** Two of
+    the six round-one definitions had gone stale against the tree --
+    one line was rewritten by clippy's `manual_is_multiple_of`, another
+    by note 31 -- and a stale definition fails as an assertion in the
+    middle of a run. `build-mutations.py` locates each mutation by a
+    start and end marker, extracts the exact span from the file as it
+    is now, checks it is unique, and writes `mutations.json`. There is
+    also no `revert` any more: several mutations delete a guard, so
+    reverting means finding an empty string, which matches everywhere
+    -- and finding out that way deleted a guard that had to be put back
+    by hand. Restores come from the pristine copy, and `check` proves a
+    definition still fits without writing anything.
+34. **CI's one red job on this head is not this change's.**
+    `test_qemu_create_pins` failed on `prealloc-vpc` under qemu-img
+    10.2.0 with `modes.full.same_bytes_as_off: True != False`. That
+    test runs only the static `qemu-img` builds from instar-testdata,
+    so no instar code is involved. The cause is in the pin harness:
+    `volatile_mask()` decides which bytes are volatile by observing
+    four `preallocation=off` images created within 1.1 s of each other,
+    which moves only the low byte of the VHD footer's creation
+    timestamp, so the byte above it -- which changes once every 256
+    seconds -- is not masked. A run that straddles that boundary
+    compares two images differing at an unmasked offset. Measured with
+    the harness's own `volatile_mask()` and `same_content()`: inside
+    one 256-second block the comparison holds, across a wrap it does
+    not, and the offsets that escape are 26 and 2074. Filed as #939.
+
 ## Mutation results
 
 Step 2d's tests are only worth their runtime if they fail when the thing
@@ -689,6 +777,39 @@ integration tests covering the same properties were not reached.
 | The overhang of a read spanning the end is not zeros | In the same function, change `past_end.fill(0)` to `past_end.fill(1)` | `client::tests::a_read_overhanging_the_source_is_zero_filled_not_refused` |
 | The deadline covers one datagram rather than the read | In `FetchClient::fetch` (`client.rs`), change `Instant::now() + self.reply_timeout` to `Instant::now() + self.reply_timeout * 1000`, so every reply is inside its own bound and the read has none | `client::tests::the_deadline_bounds_the_whole_read_not_each_reply`, `client::tests::silent_peer_times_out` |
 | A receive timeout that rounds to zero is accepted | In `SeqPacketSocket::set_recv_timeout` (`socket.rs`), delete the `if timeout.as_micros() == 0 { ... }` guard | `socket::tests::a_timeout_that_would_round_to_no_timeout_is_refused` |
+
+Two of those six definitions have since been rewritten by the code they
+describe -- clippy's `manual_is_multiple_of` took the first, and the second
+round's note 31 removed the line the ceiling one quotes -- so the harness no
+longer stores its own copy of the source. `build-mutations.py` extracts each
+span from the tree by a start and end marker and checks it is unique, which
+is what the definitions above would have needed to stay runnable.
+
+Five more were run on the second round's changes, each on its own, and all
+five were killed by a test that names the property. A sixth entry is a
+control rather than a mutant: it forces the `ENOBUFS` path that the round's
+one `fix` item added, and the suite has to *pass*, because what is being
+checked is that the fallback runs and still asserts rather than quietly
+skipping.
+
+| Mutation | The exact edit | Result |
+|---|---|---|
+| The negotiation may answer above the wire format's maximum | In `negotiate_block_size` (`wire.rs`), change `payload.min(DEFAULT_BLOCK_SIZE)` to `payload.min(MAX_BLOCK_SIZE * 2)` | Killed: `wire::tests::the_negotiated_block_never_exceeds_the_protocol_maximum`, plus `negotiation_caps_at_the_default_block_size`, `a_refusal_names_the_ceiling_that_was_applied`, `a_greedy_peer_block_size_is_clamped_to_what_this_side_can_carry` and `client::tests::init_with_an_unusable_block_size_is_an_error` |
+| A whole-read deadline too short for one round trip is accepted | In `set_reply_timeout` (`client.rs`), delete the `if timeout < MIN_REPLY_WINDOW { ... }` refusal | Killed: `client::tests::a_deadline_too_short_for_a_round_trip_is_refused_not_accepted` |
+| An overlong datagram goes back to being answered with silence | In the serve loop (`src/fetch/src/main.rs`), replace the `refuse_overlong(...)` call with `let _ = kept;`, leaving the `continue` | Killed: `end_to_end::a_datagram_longer_than_a_request_is_refused_by_its_id` |
+| The send side is unbounded again | In `SeqPacketSocket::set_send_timeout` (`socket.rs`), drop the `setsockopt` and return `Ok(())` | Killed: `socket::tests::a_send_timeout_expires_rather_than_blocking_on_a_peer_that_stopped_reading`, and `a_timeout_that_would_round_to_no_timeout_is_refused` for the half of it that covers this direction |
+| The refusal names a ceiling that was never applied (round one's, re-pointed at the simplified line) | In `InitReply::accepted_block_size` (`wire.rs`), change `let ceiling = ours;` to `let ceiling = MAX_BLOCK_SIZE;` | Carried: killed in round one against the old form of the line |
+| *Control:* every large send is treated as `ENOBUFS` | In `round_trip` (`socket.rs`'s tests), return `None` before any send of more than `DEFAULT_BLOCK_SIZE + READ_REPLY_LEN` | Suite passes, which is the point: the fallback runs and asserts a full negotiated block still round trips |
+
+The send-side mutant is the one worth reading twice, and the first attempt at
+it was wrong in a way worth recording. Removing the bound makes the send
+block forever, so the test that catches it would *hang* the suite rather than
+fail it -- a 40-minute timeout that names nothing, in place of a failure that
+names the property. The test now does its sending on a thread with a
+ten-second watchdog, so the mutant fails in seconds and says why. The control
+made the same mistake from the other side: it first reported `ENOBUFS` after
+the send had already succeeded, which left 416 KiB filling the buffer the
+fallback then tried to use, and that hung too.
 
 ## Definition of done
 

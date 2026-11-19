@@ -38,7 +38,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use fetch_protocol::{
-    negotiate_block_size, FetchClient, SeqPacketSocket, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE,
+    negotiate_block_size, FetchClient, InitReply, InitRequest, ReadReply, ReadRequest,
+    SeqPacketSocket, Status, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE, READ_REPLY_LEN,
 };
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -480,6 +481,69 @@ fn a_pipe_is_refused_before_the_init_reply() -> io::Result<()> {
 
     let status = fetcher.wait()?;
     assert_eq!(status.code(), Some(1), "{status}");
+    Ok(())
+}
+
+/// A datagram longer than the fetcher's buffer is refused by its id.
+///
+/// The fetcher's claim is that every request it can read an id from is
+/// answered, so that the privileged side never waits for a reply that was
+/// never coming. An oversized datagram is the shape where the id survives
+/// but the request does not: `MSG_TRUNC` reports the real length while the
+/// kernel keeps only the head. This drives it through the real binary,
+/// because the client cannot send the shape -- it is a hostile peer's
+/// datagram, and the point is what the fetcher does with it.
+#[test]
+fn a_datagram_longer_than_a_request_is_refused_by_its_id() -> io::Result<()> {
+    let image = TempImage::new(IMAGE_LEN)?;
+    let served = image.open()?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+    let max_datagram = ours.max_datagram()?;
+    let mut fetcher = spawn_fetcher(theirs, &served)?;
+    drop(served);
+    ours.set_recv_timeout(REPLY_TIMEOUT)?;
+
+    // The init exchange by hand, because what follows it is not something a
+    // client can be asked to send.
+    ours.send(&InitRequest::new(max_datagram).encode())?;
+    let mut buf = vec![0u8; READ_REPLY_LEN + MAX_BLOCK_SIZE as usize];
+    let len = ours.recv(&mut buf)?;
+    let init = InitReply::decode(&buf[..len]).expect("the init reply decodes");
+    let block_size = init
+        .accepted_block_size(max_datagram)
+        .expect("a block size");
+
+    // A well-formed read request with 4 KiB of rubbish stuck on the end:
+    // longer than the fetcher's 1 KiB request buffer, so the kernel delivers
+    // the head and discards the rest.
+    let id = 0x5151_5151_5151_5151;
+    let mut overlong = ReadRequest::new(id, 0, 512).encode().to_vec();
+    overlong.resize(overlong.len() + 4096, 0xEE);
+    ours.send(&overlong)?;
+
+    let len = ours.recv(&mut buf)?;
+    let (reply, payload) = ReadReply::decode(&buf[..len], block_size).expect("a reply decodes");
+    assert_eq!(reply.id, id, "the refusal names the request that caused it");
+    assert_eq!(reply.status, Status::BadRequest, "{:?}", reply.status);
+    assert!(payload.is_empty(), "a refusal carries no bytes");
+
+    // And the fetcher is still serving: a refusal is not a reason to stop.
+    let wanted = 512usize;
+    ours.send(&ReadRequest::new(id + 1, 0, wanted as u32).encode())?;
+    let len = ours.recv(&mut buf)?;
+    let (reply, payload) = ReadReply::decode(&buf[..len], block_size).expect("a reply decodes");
+    assert_eq!(reply.id, id + 1);
+    assert_eq!(reply.status, Status::Ok, "{:?}", reply.status);
+    let mut expected = vec![0u8; wanted];
+    image.open()?.read_exact_at(&mut expected, 0)?;
+    assert_eq!(
+        payload,
+        &expected[..],
+        "the bytes after a refusal are right"
+    );
+
+    drop(ours);
+    fetcher.wait()?;
     Ok(())
 }
 

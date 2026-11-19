@@ -593,11 +593,13 @@ impl InitReply {
     pub fn accepted_block_size(&self, our_max_datagram: u32) -> Result<u32, ProtocolError> {
         let ours = negotiate_block_size(our_max_datagram, our_max_datagram)?;
         // One ceiling, so that the refusal names the limit that was
-        // actually applied. `ours` is already capped at the settled block
-        // size, which is at or below the protocol's own maximum, so a peer
-        // told "the maximum is 262144" would be told a figure no proposal
-        // is ever measured against.
-        let ceiling = ours.min(MAX_BLOCK_SIZE);
+        // actually applied: a peer told "the maximum is 262144" would be
+        // told a figure no proposal is ever measured against. There is no
+        // second limit to take the smaller of, because the negotiation
+        // already caps its answer at `DEFAULT_BLOCK_SIZE`, which is below
+        // the protocol's own maximum; the test below pins that rather than
+        // leaving a `min` here that can never bind.
+        let ceiling = ours;
         if self.block_size < MIN_BLOCK_SIZE {
             return Err(ProtocolError::BlockSizeTooSmall {
                 block_size: self.block_size,
@@ -1357,6 +1359,22 @@ mod tests {
                 block_size: MIN_BLOCK_SIZE - 1
             })
         );
+    }
+
+    /// The negotiation's own answer is always inside the wire format's
+    /// maximum, which is why the ceiling a refusal names is simply that
+    /// answer. If this ever stopped holding, a peer could propose a block
+    /// larger than a reply header can describe and be told it was fine.
+    #[test]
+    fn the_negotiated_block_never_exceeds_the_protocol_maximum() {
+        for datagram in (0..=MAX_BLOCK_SIZE * 2).step_by(997) {
+            if let Ok(block) = negotiate_block_size(datagram, datagram) {
+                assert!(
+                    block <= MAX_BLOCK_SIZE,
+                    "a {datagram}-byte datagram negotiated {block}"
+                );
+            }
+        }
     }
 
     #[test]

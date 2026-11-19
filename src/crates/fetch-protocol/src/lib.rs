@@ -41,7 +41,7 @@ pub mod socket;
 pub mod wire;
 
 pub use client::FetchClient;
-pub use socket::{SeqPacketSocket, DATAGRAM_OVERHEAD};
+pub use socket::{Datagram, SeqPacketSocket, DATAGRAM_OVERHEAD};
 pub use wire::{
     negotiate_block_size, InitReply, InitRequest, ProtocolError, ReadReply, ReadRequest, Status,
     BLOCK_SIZE_GRANULARITY, DEFAULT_BLOCK_SIZE, INIT_REPLY_LEN, INIT_REQUEST_LEN, MAGIC,
