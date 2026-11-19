@@ -1,0 +1,462 @@
+//! The one socket the two sides share.
+//!
+//! `SOCK_SEQPACKET` is the point of this module: it keeps message boundaries
+//! in the kernel, so the privileged side never has to reassemble a stream or
+//! recover from a framing desynchronisation. One `recv` is one message, or an
+//! error.
+//!
+//! Rust's standard library cannot create one. `std::os::unix::net` offers
+//! `UnixStream`, whose constructors hardcode `SOCK_STREAM`, and
+//! `UnixDatagram`, whose constructors hardcode `SOCK_DGRAM`, and nothing that
+//! takes a socket type -- confirmed against the standard library source the
+//! toolchain ships, and asserted by a test below. So the choice is a
+//! third-party socket crate in the process that holds `/dev/kvm`, or a
+//! handful of `libc` calls behind a type that owns its descriptor. This is
+//! the second, in the same shape as the VMM's ioeventfd wrapper: a raw call,
+//! its return value checked, and the descriptor owned by something that
+//! closes it.
+//!
+//! It is a socketpair rather than a socket bound to a path because the
+//! privileged side is the fetcher's parent. There is no name for anything
+//! else to connect to, no directory to choose, no mode to get wrong, and
+//! nothing for a filesystem sandbox to have to permit.
+
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Duration;
+
+/// Bytes the kernel charges against the socket buffer for each datagram, on
+/// top of its payload.
+///
+/// A socket whose granted buffer is `n` bytes carries a single datagram of at
+/// most `n - 32`, which is where the largest datagram either side can manage
+/// comes from. The figure is not derivable from any sysctl by inspection:
+/// `SO_SNDBUF` as granted is already not the value that was asked for, since
+/// the kernel clamps the request to `wmem_max` and then doubles it. So both
+/// sides read back what they were actually granted and derive the ceiling
+/// from that, which is what [`SeqPacketSocket::max_datagram`] does.
+pub const DATAGRAM_OVERHEAD: u32 = 32;
+
+/// One end of an `AF_UNIX`/`SOCK_SEQPACKET` socketpair.
+///
+/// The descriptor is owned: it is closed when the socket is dropped, and
+/// nothing else holds a copy unless it was deliberately duplicated.
+#[derive(Debug)]
+pub struct SeqPacketSocket {
+    fd: OwnedFd,
+}
+
+impl SeqPacketSocket {
+    /// Create a connected pair of `SOCK_SEQPACKET` sockets.
+    ///
+    /// Both ends are created with `SOCK_CLOEXEC`, so neither leaks into an
+    /// unrelated child; the end handed to a fetcher is duplicated onto a
+    /// known descriptor number deliberately, which clears the flag for that
+    /// copy alone.
+    pub fn pair() -> io::Result<(Self, Self)> {
+        let mut fds = [-1 as libc::c_int; 2];
+        // SAFETY: fds is a two-element array of c_int, which is exactly what
+        // socketpair writes on success. The return value is checked before
+        // either descriptor is looked at.
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: socketpair reported success, so both entries are fresh
+        // descriptors this process owns and nothing else holds.
+        let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: as above, for the other end of the same pair.
+        let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((Self { fd: first }, Self { fd: second }))
+    }
+
+    /// Adopt a descriptor that is already a `SOCK_SEQPACKET` socket, such as
+    /// one inherited from a parent process.
+    ///
+    /// The type is verified rather than assumed: a fetcher handed the wrong
+    /// descriptor number should fail immediately and say so, not read a
+    /// header out of whatever that descriptor happens to be.
+    pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+        let actual = socket_type_of(fd.as_raw_fd())?;
+        if actual != libc::SOCK_SEQPACKET {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("descriptor is socket type {actual}, not SOCK_SEQPACKET"),
+            ));
+        }
+        Ok(Self { fd })
+    }
+
+    /// Send one datagram.
+    ///
+    /// A `SOCK_SEQPACKET` send is all or nothing, so a short send is treated
+    /// as a protocol failure rather than something to retry from. `send` is
+    /// made with `MSG_NOSIGNAL`: a peer that has died must become an error
+    /// this side can report, never a `SIGPIPE` that takes the process down
+    /// mid-operation.
+    pub fn send(&self, datagram: &[u8]) -> io::Result<()> {
+        // SAFETY: the pointer and length describe `datagram`, which outlives
+        // the call, and the result is checked before it is used.
+        let ret = unsafe {
+            libc::send(
+                self.fd.as_raw_fd(),
+                datagram.as_ptr().cast(),
+                datagram.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sent = usize::try_from(ret).unwrap_or(0);
+        if sent != datagram.len() {
+            return Err(io::Error::other(format!(
+                "sent {sent} of {} bytes of one datagram",
+                datagram.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Receive one datagram, returning its length.
+    ///
+    /// A return of zero means the peer closed its end: nothing in this
+    /// protocol sends an empty datagram.
+    ///
+    /// `MSG_TRUNC` is what makes an oversized datagram detectable. Without
+    /// it, a peer sending more than the buffer holds looks exactly like a
+    /// peer sending a short message, because the kernel discards the
+    /// remainder either way; with it, the real length comes back and the
+    /// mismatch becomes an error instead of a silently truncated header.
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: the pointer and length describe `buf`, which outlives the
+        // call and is only read from after the length is validated below.
+        let ret = unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_TRUNC,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = usize::try_from(ret).unwrap_or(usize::MAX);
+        if len > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer sent a {len}-byte datagram into a {}-byte buffer",
+                    buf.len()
+                ),
+            ));
+        }
+        Ok(len)
+    }
+
+    /// The granted send buffer, as the kernel reports it.
+    pub fn send_buffer_size(&self) -> io::Result<u32> {
+        option_as_u32(self.int_option(libc::SO_SNDBUF)?)
+    }
+
+    /// The granted receive buffer, as the kernel reports it.
+    pub fn recv_buffer_size(&self) -> io::Result<u32> {
+        option_as_u32(self.int_option(libc::SO_RCVBUF)?)
+    }
+
+    /// Ask for a send buffer of `bytes`. The kernel grants what it likes;
+    /// read it back with [`SeqPacketSocket::send_buffer_size`].
+    pub fn set_send_buffer_size(&self, bytes: u32) -> io::Result<()> {
+        self.set_int_option(libc::SO_SNDBUF, bytes)
+    }
+
+    /// Ask for a receive buffer of `bytes`. The kernel grants what it likes;
+    /// read it back with [`SeqPacketSocket::recv_buffer_size`].
+    pub fn set_recv_buffer_size(&self, bytes: u32) -> io::Result<()> {
+        self.set_int_option(libc::SO_RCVBUF, bytes)
+    }
+
+    /// Give up on a `recv` that has waited this long.
+    ///
+    /// A privileged process that waits forever on an untrusted peer is a
+    /// hang, so the side that can afford to time out should.
+    pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        let timeval = libc::timeval {
+            tv_sec: libc::time_t::try_from(timeout.as_secs())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timeout too large"))?,
+            tv_usec: libc::suseconds_t::from(timeout.subsec_micros()),
+        };
+        let len = u32::try_from(std::mem::size_of::<libc::timeval>())
+            .map_err(|_| io::Error::other("timeval size does not fit a socklen_t"))?;
+        // SAFETY: the pointer and length describe one timeval, which is what
+        // SO_RCVTIMEO expects, and the result is checked.
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                std::ptr::addr_of!(timeval).cast(),
+                len,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The largest single datagram this end can send or receive.
+    ///
+    /// Both directions are accounted for by taking the smaller of the two
+    /// granted buffers, so the figure means the same thing whichever way a
+    /// datagram is travelling, and the init exchange can settle on the
+    /// smaller of the two sides' figures without further qualification.
+    pub fn max_datagram(&self) -> io::Result<u32> {
+        let send = self.send_buffer_size()?;
+        let recv = self.recv_buffer_size()?;
+        Ok(send.min(recv).saturating_sub(DATAGRAM_OVERHEAD))
+    }
+
+    /// Read an integer socket option at `SOL_SOCKET`.
+    fn int_option(&self, name: libc::c_int) -> io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        let mut len = u32::try_from(std::mem::size_of::<libc::c_int>())
+            .map_err(|_| io::Error::other("c_int size does not fit a socklen_t"))?;
+        // SAFETY: value is a c_int and len is its size, which is what an
+        // integer socket option expects; both outlive the call, and the
+        // result is checked before value is read.
+        let ret = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                std::ptr::addr_of_mut!(len),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+
+    /// Set an integer socket option at `SOL_SOCKET`.
+    fn set_int_option(&self, name: libc::c_int, value: u32) -> io::Result<()> {
+        let value = libc::c_int::try_from(value)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "option value too large"))?;
+        let len = u32::try_from(std::mem::size_of::<libc::c_int>())
+            .map_err(|_| io::Error::other("c_int size does not fit a socklen_t"))?;
+        // SAFETY: value is a c_int and len is its size, which is what an
+        // integer socket option expects; both outlive the call, and the
+        // result is checked.
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                std::ptr::addr_of!(value).cast(),
+                len,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+impl AsRawFd for SeqPacketSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl AsFd for SeqPacketSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl From<SeqPacketSocket> for OwnedFd {
+    fn from(socket: SeqPacketSocket) -> Self {
+        socket.fd
+    }
+}
+
+/// Convert a socket option's `c_int` to the unsigned size it represents.
+fn option_as_u32(value: libc::c_int) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| io::Error::other("socket option is negative"))
+}
+
+/// The `SO_TYPE` of a descriptor, which is an error if it is not a socket.
+fn socket_type_of(fd: RawFd) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = u32::try_from(std::mem::size_of::<libc::c_int>())
+        .map_err(|_| io::Error::other("c_int size does not fit a socklen_t"))?;
+    // SAFETY: value is a c_int and len is its size, which is what SO_TYPE
+    // expects; both outlive the call, and the result is checked before value
+    // is read.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(value).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    #[test]
+    fn a_pair_is_seqpacket_and_close_on_exec() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        assert_eq!(
+            socket_type_of(a.as_raw_fd()).expect("SO_TYPE"),
+            libc::SOCK_SEQPACKET
+        );
+        assert_eq!(
+            socket_type_of(b.as_raw_fd()).expect("SO_TYPE"),
+            libc::SOCK_SEQPACKET
+        );
+        // SAFETY: a owns a live descriptor and F_GETFD only reads its flags.
+        let flags = unsafe { libc::fcntl(a.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "fcntl failed: {}", io::Error::last_os_error());
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    /// The reason this module exists at all: neither of the standard
+    /// library's socket pair constructors can be asked for SEQPACKET, so if
+    /// one of them ever grows the ability this test is where it will show up.
+    #[test]
+    fn the_standard_library_offers_only_stream_and_datagram() {
+        let (stream, _other) = UnixStream::pair().expect("UnixStream::pair");
+        assert_eq!(
+            socket_type_of(stream.as_raw_fd()).expect("SO_TYPE"),
+            libc::SOCK_STREAM
+        );
+        let (datagram, _other) = UnixDatagram::pair().expect("UnixDatagram::pair");
+        assert_eq!(
+            socket_type_of(datagram.as_raw_fd()).expect("SO_TYPE"),
+            libc::SOCK_DGRAM
+        );
+    }
+
+    #[test]
+    fn from_fd_refuses_a_descriptor_that_is_not_seqpacket() {
+        let (stream, _other) = UnixStream::pair().expect("UnixStream::pair");
+        let err = SeqPacketSocket::from_fd(OwnedFd::from(stream)).expect_err("not seqpacket");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn from_fd_accepts_an_inherited_seqpacket_descriptor() {
+        let (a, _b) = SeqPacketSocket::pair().expect("socketpair");
+        let adopted = SeqPacketSocket::from_fd(OwnedFd::from(a)).expect("adopts");
+        assert_eq!(
+            socket_type_of(adopted.as_raw_fd()).expect("SO_TYPE"),
+            libc::SOCK_SEQPACKET
+        );
+    }
+
+    #[test]
+    fn message_boundaries_survive() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        a.send(&[1u8; 100]).expect("send");
+        a.send(&[2u8; 7]).expect("send");
+        let mut buf = [0u8; 4096];
+        assert_eq!(b.recv(&mut buf).expect("recv"), 100);
+        assert_eq!(buf[0], 1);
+        assert_eq!(b.recv(&mut buf).expect("recv"), 7);
+        assert_eq!(buf[0], 2);
+    }
+
+    #[test]
+    fn an_oversized_datagram_is_an_error_not_a_truncation() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        a.send(&[0u8; 100]).expect("send");
+        let mut buf = [0u8; 10];
+        let err = b.recv(&mut buf).expect_err("oversized datagram");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_datagram_of_the_derived_maximum_really_sends() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        let max = a.max_datagram().expect("max datagram") as usize;
+        assert!(
+            max >= 4096,
+            "default socket buffer is unexpectedly small: {max}"
+        );
+        a.send(&vec![0xC3u8; max])
+            .expect("the derived maximum sends");
+        let mut buf = vec![0u8; max];
+        assert_eq!(b.recv(&mut buf).expect("recv"), max);
+        assert_eq!(buf[max - 1], 0xC3);
+    }
+
+    #[test]
+    fn the_derived_maximum_tracks_a_smaller_buffer() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        a.set_send_buffer_size(2048).expect("set SO_SNDBUF");
+        b.set_recv_buffer_size(2048).expect("set SO_RCVBUF");
+        let max = a.max_datagram().expect("max datagram");
+        assert!(max < 65536, "a 2 KiB request granted a large buffer: {max}");
+        // The block this buffer settles on is what a read reply will actually
+        // carry, so that is the size worth proving still fits.
+        let block = crate::wire::negotiate_block_size(max, max).expect("usable block");
+        let datagram = crate::wire::READ_REPLY_LEN + block as usize;
+        a.send(&vec![0x5Au8; datagram])
+            .expect("a negotiated block still sends");
+        let mut buf = vec![0u8; datagram];
+        assert_eq!(b.recv(&mut buf).expect("recv"), datagram);
+    }
+
+    #[test]
+    fn a_closed_peer_is_an_error_not_a_signal() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        drop(b);
+        let err = a.send(&[0u8; 16]).expect_err("the peer is gone");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn a_closed_peer_reads_as_end_of_stream() {
+        let (a, b) = SeqPacketSocket::pair().expect("socketpair");
+        drop(a);
+        let mut buf = [0u8; 64];
+        assert_eq!(b.recv(&mut buf).expect("recv"), 0);
+    }
+
+    #[test]
+    fn a_recv_timeout_expires_rather_than_waiting() {
+        let (a, _b) = SeqPacketSocket::pair().expect("socketpair");
+        a.set_recv_timeout(Duration::from_millis(50))
+            .expect("set SO_RCVTIMEO");
+        let mut buf = [0u8; 64];
+        let err = a.recv(&mut buf).expect_err("nothing was sent");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected kind: {err:?}"
+        );
+    }
+}
