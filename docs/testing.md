@@ -2069,6 +2069,7 @@ differential fuzzing cannot reach.
 | `fuzz_luks_header` | luks | Buffer-based |
 | `fuzz_vdi_header` | vdi | Buffer-based |
 | `fuzz_vdi_bat` | vdi | CallTable |
+| `fuzz_fetch_protocol` | fetch-protocol | Buffer-based |
 | `fuzz_parallels_header` | parallels | Buffer-based |
 | `fuzz_parallels_bat` | parallels | CallTable |
 | `fuzz_qcow1_header` | qcow1 | Buffer-based |
