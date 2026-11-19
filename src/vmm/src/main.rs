@@ -4834,7 +4834,7 @@ fn write_chain_config_header(
     // - extent_count: u32 (offset 784)
     // - extents: [ChainExtent; 64] (offset 792, 8-aligned, so four bytes
     //   of padding follow extent_count)
-    // - _reserved: [u8; 64] (offset 2328)
+    // - _reserved: [u8; 64] (offset 2840)
     //
     // ChainDeviceInfo layout (40 bytes each):
     // - format: u32 (offset 0)
@@ -4850,10 +4850,12 @@ fn write_chain_config_header(
     // - first: u32 (offset 0)
     // - count: u32 (offset 4)
     //
-    // ChainExtent layout (24 bytes each):
+    // ChainExtent layout (32 bytes each):
     // - device_offset: u64 (offset 0)
     // - file_length: u64 (offset 8)
     // - virtual_span: u64 (offset 16)
+    // - kind: u32 (offset 24)
+    // - _reserved: u32 (offset 28)
     if segments.len() > shared::MAX_CHAIN_SEGMENTS {
         return Err(format!(
             "chain config describes {} chains, more than the {} the config holds",

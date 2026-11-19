@@ -5209,8 +5209,8 @@ pub const MAX_CHAIN_SEGMENTS: usize = MAX_CHAIN_DEVICES;
 /// extents are found through [`ChainConfig::extents`], so an extent
 /// costs a table entry rather than a device slot.
 ///
-/// The limit is what the page holds. At 24 bytes an entry, 64 extents
-/// is 1536 bytes of the space between [`CHAIN_CONFIG_ADDR`] and
+/// The limit is what the page holds. At 32 bytes an entry, 64 extents
+/// is 2048 bytes of the space between [`CHAIN_CONFIG_ADDR`] and
 /// [`VMM_PARAMS_ADDR`], and it covers 128 GiB of image at qemu's 2 GiB
 /// default extent size. qemu has no equivalent limit, so a descriptor
 /// declaring more extents than this is refused with a message naming
@@ -5309,6 +5309,16 @@ impl ChainSegment {
 /// corpus has an image declaring 3.96 GiB extents under
 /// `twoGbMaxExtentSparse` -- so the declared sector count is the only
 /// thing that puts the next extent's base in the right place.
+///
+/// `kind` is carried rather than worked out by the guest because
+/// nothing else in the entry can decide it. The descriptor's extent
+/// line says whether a file is raw sectors or a sparse image, and qemu
+/// believes the line. A guest that looked for a sparse header at the
+/// start of the file would parse a flat extent whose first sector
+/// happens to hold one, and a guest that compared the two lengths
+/// would read a sparse extent padded out to its span as raw sectors.
+/// Either way one file would mean different bytes to instar and to
+/// qemu, which is the confusion a converter must not have.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ChainExtent {
@@ -5323,16 +5333,42 @@ pub struct ChainExtent {
     /// Bytes of the virtual disk this extent covers, from the sector
     /// count the descriptor declares for it.
     pub virtual_span: u64,
+
+    /// How the file holds its span: [`Self::KIND_FLAT`] or
+    /// [`Self::KIND_SPARSE`], from the type on the descriptor's extent
+    /// line. Zero is neither, so an entry whose writer never stated a
+    /// kind is refused rather than read as one of them.
+    pub kind: u32,
+
+    /// Reserved, zero. Stated rather than left as padding so that all
+    /// 32 bytes of the entry are named.
+    pub _reserved: u32,
 }
 
 impl ChainExtent {
+    /// The file is the extent's sectors, byte for byte from its start.
+    /// Bytes of the span past the end of the file read as zeros.
+    pub const KIND_FLAT: u32 = 1;
+
+    /// The file is a sparse VMDK image of its own covering only this
+    /// extent's span: a header, a grain directory and grain tables,
+    /// with every offset in them counted from the start of the file.
+    pub const KIND_SPARSE: u32 = 2;
+
     /// Create an empty extent.
     pub const fn new() -> Self {
         Self {
             device_offset: 0,
             file_length: 0,
             virtual_span: 0,
+            kind: 0,
+            _reserved: 0,
         }
+    }
+
+    /// Whether the entry states a kind the reader knows.
+    pub fn has_known_kind(&self) -> bool {
+        self.kind == Self::KIND_FLAT || self.kind == Self::KIND_SPARSE
     }
 }
 
@@ -5364,9 +5400,13 @@ pub struct ChainDeviceInfo {
     /// 0 = data is in this device itself (normal case).
     /// Non-zero = device index of the external data file.
     /// Used for QCOW2 images with external data files where
-    /// metadata (L1/L2/refcounts) and cluster data are separate,
-    /// and for a VMDK flat descriptor, whose extents start here.
+    /// metadata (L1/L2/refcounts) and cluster data are separate.
     /// The device it names carries [`Self::FLAG_DATA_DEVICE`].
+    ///
+    /// A VMDK descriptor may name the first of a run of data devices
+    /// here too, but nothing reads its content through them: a
+    /// descriptor's extents are the ones the extent table gives it,
+    /// through [`Self::first_extent`] and [`Self::extent_count`].
     pub data_device_idx: u32,
 
     /// Index in [`ChainConfig::extents`] of this device's first extent.
@@ -5667,8 +5707,11 @@ impl ChainConfig {
     ///   its owner, inside `device_count`, and that slot is marked;
     /// * every marked device is claimed by an owner: a qcow2 claims the
     ///   one device its `data_device_idx` names, and a VMDK descriptor
-    ///   claims the run of marked devices that starts there, which is
-    ///   also where the reader's extent walk stops.
+    ///   claims the run of marked devices that starts there. That says
+    ///   only where such a run may sit. The reader does not read a
+    ///   descriptor through it: a descriptor's content is the extents
+    ///   the extent table gives its device, and
+    ///   [`Self::extents_are_sound`] refuses one the table gives none.
     ///
     /// No device can be claimed twice under these rules. A second owner
     /// would have to sit inside the first owner's run to name a device
@@ -5723,6 +5766,110 @@ impl ChainConfig {
             .iter()
             .zip(claimed.iter())
             .all(|(info, &claimed)| claimed || !info.is_data_device())
+    }
+
+    /// The extents the device at `dev_idx` is made of, in virtual-offset
+    /// order, or an empty slice for a device that is a single file.
+    ///
+    /// Empty as well when the device names entries outside the table,
+    /// so a caller indexing what this returns stays inside the table
+    /// whatever the config says. [`Self::extents_are_sound`] is what
+    /// refuses such a config; this only keeps a reader that was never
+    /// shown one in bounds.
+    pub fn device_extents(&self, dev_idx: usize) -> &[ChainExtent] {
+        let Some(info) = self.devices.get(dev_idx) else {
+            return &[];
+        };
+        let declared = (self.extent_count as usize).min(MAX_CHAIN_EXTENTS);
+        let first = info.first_extent as usize;
+        match first.checked_add(info.extent_count as usize) {
+            Some(end) if end <= declared => &self.extents[first..end],
+            _ => &[],
+        }
+    }
+
+    /// True if the extent table describes the first `device_count`
+    /// devices the way the host lays a multi-extent image out.
+    ///
+    /// The host attaches a VMDK descriptor and its extents as one
+    /// device and writes one entry per extent, device by device and in
+    /// descriptor order within each. The reader finds the extent a
+    /// virtual offset falls in by summing spans, and reads that
+    /// extent's file at its `device_offset`, so an entry that is
+    /// missing, shared between devices, out of order or overlapping
+    /// its neighbour is a read of the wrong bytes reported as success.
+    /// As with the segmentation and the data device marks, the host
+    /// writes every field involved, so a table that breaks the rule is
+    /// the host and the guest disagreeing about the layout, and is
+    /// refused rather than read.
+    ///
+    /// The rule, all of which the host's own layout satisfies:
+    ///
+    /// * `extent_count` fits the table;
+    /// * the devices' slices tile the table from its first entry, in
+    ///   device order: a device with extents starts where the last one
+    ///   ended, and a device with none has a `first_extent` of zero;
+    /// * a VMDK descriptor that is a layer of the chain has at least
+    ///   one extent, and no other device has any. A descriptor's own
+    ///   bytes are text, so without its extents there is nothing of
+    ///   its content to read, and reading it straight through would
+    ///   serve that text as the disk;
+    /// * every entry states a kind, [`ChainExtent::KIND_FLAT`] or
+    ///   [`ChainExtent::KIND_SPARSE`];
+    /// * within a device the extents' files are in ascending order and
+    ///   do not overlap, and none ends past the addressable range;
+    /// * within a device the spans sum without overflowing, which is
+    ///   what lets the reader add them up unchecked.
+    ///
+    /// Callers pass the device count they are about to walk, as for
+    /// [`Self::segmentation_covers`]. Entries past the last walked
+    /// device's slice are not looked at.
+    pub fn extents_are_sound(&self, device_count: usize) -> bool {
+        if device_count > MAX_CHAIN_DEVICES {
+            return false;
+        }
+        let declared = self.extent_count as usize;
+        if declared > MAX_CHAIN_EXTENTS {
+            return false;
+        }
+
+        let mut next = 0usize;
+        for info in &self.devices[..device_count] {
+            let count = info.extent_count as usize;
+            let is_descriptor = !info.is_data_device()
+                && matches!(info.detected_format(), ImageFormat::VmdkDescriptor);
+            if count == 0 {
+                if is_descriptor || info.first_extent != 0 {
+                    return false;
+                }
+                continue;
+            }
+            if !is_descriptor || info.first_extent as usize != next {
+                return false;
+            }
+            let end = match next.checked_add(count) {
+                Some(end) if end <= declared => end,
+                _ => return false,
+            };
+
+            let mut file_end = 0u64;
+            let mut span_end = 0u64;
+            for extent in &self.extents[next..end] {
+                if !extent.has_known_kind() || extent.device_offset < file_end {
+                    return false;
+                }
+                file_end = match extent.device_offset.checked_add(extent.file_length) {
+                    Some(file_end) => file_end,
+                    None => return false,
+                };
+                span_end = match span_end.checked_add(extent.virtual_span) {
+                    Some(span_end) => span_end,
+                    None => return false,
+                };
+            }
+            next = end;
+        }
+        true
     }
 
     /// Get the number of devices in the chain
@@ -8103,10 +8250,10 @@ mod tests {
         // comment cannot catch a reordered field or inserted padding.
         assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
         assert_eq!(core::mem::align_of::<ChainSegment>(), 4);
-        assert_eq!(core::mem::size_of::<ChainExtent>(), 24);
+        assert_eq!(core::mem::size_of::<ChainExtent>(), 32);
         assert_eq!(core::mem::align_of::<ChainExtent>(), 8);
         assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 40);
-        assert_eq!(core::mem::size_of::<ChainConfig>(), 2392);
+        assert_eq!(core::mem::size_of::<ChainConfig>(), 2904);
         assert_eq!(core::mem::align_of::<ChainConfig>(), 8);
         assert!(
             core::mem::size_of::<ChainConfig>() <= CHAIN_CONFIG_MAX_SIZE,
@@ -8140,7 +8287,222 @@ mod tests {
             784
         );
         assert_eq!(offset_of(config.extents.as_ptr() as *const u8), 792);
-        assert_eq!(offset_of(config._reserved.as_ptr()), 2328);
+        assert_eq!(offset_of(config._reserved.as_ptr()), 2840);
+
+        // An extent entry is written field by field too.
+        let extent = &config.extents[0];
+        let extent_base = extent as *const ChainExtent as usize;
+        let within = |field: *const u8| field as usize - extent_base;
+        assert_eq!(within(&extent.device_offset as *const u64 as *const u8), 0);
+        assert_eq!(within(&extent.file_length as *const u64 as *const u8), 8);
+        assert_eq!(within(&extent.virtual_span as *const u64 as *const u8), 16);
+        assert_eq!(within(&extent.kind as *const u32 as *const u8), 24);
+        assert_eq!(within(&extent._reserved as *const u32 as *const u8), 28);
+    }
+
+    /// A config of `counts.len()` devices in one chain, each a VMDK
+    /// descriptor owning as many extents as its entry says, laid out
+    /// the way the host lays them out: slices in device order, each
+    /// extent a 4096-byte flat file covering 4096 bytes, files end to
+    /// end within a device. A count of zero is a raw single-file device.
+    fn extent_config(counts: &[u32]) -> ChainConfig {
+        let mut config = ChainConfig::single_chain(counts.len() as u32);
+        let mut next = 0u32;
+        for (dev, &count) in counts.iter().enumerate() {
+            let info = &mut config.devices[dev];
+            if count == 0 {
+                info.format = ImageFormat::Raw as u32;
+                continue;
+            }
+            info.format = ImageFormat::VmdkDescriptor as u32;
+            info.first_extent = next;
+            info.extent_count = count;
+            for i in 0..count {
+                config.extents[(next + i) as usize] = ChainExtent {
+                    device_offset: i as u64 * 4096,
+                    file_length: 4096,
+                    virtual_span: 4096,
+                    kind: ChainExtent::KIND_FLAT,
+                    _reserved: 0,
+                };
+            }
+            next += count;
+        }
+        config.extent_count = next;
+        config
+    }
+
+    #[test]
+    fn extent_table_accepts_what_the_host_lays_out() {
+        for (counts, label) in [
+            (&[0u32][..], "a single file"),
+            (&[1][..], "a descriptor with one extent"),
+            (&[3][..], "a descriptor with three extents"),
+            (&[0, 2][..], "a single file over a descriptor"),
+            (&[2, 0, 3][..], "two descriptors around a single file"),
+            (&[MAX_CHAIN_EXTENTS as u32][..], "a full table"),
+        ] {
+            let config = extent_config(counts);
+            assert!(config.extents_are_sound(counts.len()), "{label}");
+        }
+        // A sparse extent's file is not the length of its span, in
+        // either direction, and files need not touch.
+        let mut config = extent_config(&[2]);
+        config.extents[0].kind = ChainExtent::KIND_SPARSE;
+        config.extents[0].virtual_span = 1 << 31;
+        config.extents[1].kind = ChainExtent::KIND_SPARSE;
+        config.extents[1].device_offset = 65536;
+        config.extents[1].file_length = 1 << 20;
+        assert!(config.extents_are_sound(1), "sparse extents with a gap");
+    }
+
+    #[test]
+    fn extent_table_refuses_a_count_past_the_table() {
+        let mut config = extent_config(&[2]);
+        config.extent_count = MAX_CHAIN_EXTENTS as u32 + 1;
+        assert!(!config.extents_are_sound(1));
+        assert!(!extent_config(&[1]).extents_are_sound(MAX_CHAIN_DEVICES + 1));
+    }
+
+    #[test]
+    fn extent_table_refuses_slices_that_do_not_tile_it() {
+        // Past the declared entries.
+        let mut config = extent_config(&[2]);
+        config.extent_count = 1;
+        assert!(!config.extents_are_sound(1), "a slice past extent_count");
+
+        // Two devices naming the same entries: the second would read
+        // the first one's files.
+        let mut config = extent_config(&[2, 2]);
+        config.devices[1].first_extent = 0;
+        assert!(!config.extents_are_sound(2), "a shared slice");
+
+        // A gap before a device's slice.
+        let mut config = extent_config(&[2]);
+        config.devices[0].first_extent = 1;
+        config.extent_count = 3;
+        assert!(
+            !config.extents_are_sound(1),
+            "a slice not at the next entry"
+        );
+
+        // A start that only reads as "none" because the count is zero.
+        let mut config = extent_config(&[0]);
+        config.devices[0].first_extent = 1;
+        assert!(!config.extents_are_sound(1), "a first_extent with no count");
+
+        // A count far past anything the table holds.
+        let mut config = extent_config(&[2]);
+        config.devices[0].extent_count = u32::MAX;
+        assert!(!config.extents_are_sound(1), "a count past the table");
+    }
+
+    #[test]
+    fn extent_table_refuses_extents_on_the_wrong_device() {
+        // A descriptor's content is its extents: with none, the only
+        // bytes the device has are the descriptor's text.
+        let mut config = extent_config(&[0]);
+        config.devices[0].format = ImageFormat::VmdkDescriptor as u32;
+        assert!(!config.extents_are_sound(1), "a descriptor with no extents");
+
+        // Nothing but a descriptor is a concatenation of files.
+        for format in [ImageFormat::Raw, ImageFormat::Qcow2, ImageFormat::Vmdk4] {
+            let mut config = extent_config(&[1]);
+            config.devices[0].format = format as u32;
+            assert!(
+                !config.extents_are_sound(1),
+                "{} with extents",
+                format.name()
+            );
+        }
+
+        // A data device is another image's data, not an image.
+        let mut config = extent_config(&[0, 1]);
+        config.devices[1].flags = ChainDeviceInfo::FLAG_DATA_DEVICE;
+        assert!(!config.extents_are_sound(2), "a data device with extents");
+    }
+
+    #[test]
+    fn extent_table_refuses_an_entry_that_does_not_say_what_it_is() {
+        for kind in [0u32, 3, u32::MAX] {
+            let mut config = extent_config(&[2]);
+            config.extents[1].kind = kind;
+            assert!(!config.extents_are_sound(1), "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn extent_table_refuses_files_that_overlap_or_run_backwards() {
+        // The second extent's file starting inside the first's.
+        let mut config = extent_config(&[2]);
+        config.extents[1].device_offset = 4095;
+        assert!(!config.extents_are_sound(1), "overlapping files");
+
+        // Out of order.
+        let mut config = extent_config(&[2]);
+        config.extents[0].device_offset = 8192;
+        assert!(!config.extents_are_sound(1), "files out of order");
+
+        // A file ending past the addressable range.
+        let mut config = extent_config(&[1]);
+        config.extents[0].device_offset = u64::MAX - 4096;
+        assert!(config.extents_are_sound(1), "a file ending at the very top");
+        config.extents[0].device_offset = u64::MAX - 4095;
+        assert!(!config.extents_are_sound(1), "a file end that overflows");
+
+        // Spans that sum past the addressable range.
+        let mut config = extent_config(&[2]);
+        config.extents[0].virtual_span = u64::MAX;
+        assert!(!config.extents_are_sound(1), "spans that overflow");
+        config.extents[1].virtual_span = 0;
+        assert!(config.extents_are_sound(1), "spans that just fit");
+    }
+
+    #[test]
+    fn extent_table_checks_only_the_devices_walked() {
+        // An operation may walk a prefix of the device array. What the
+        // devices past it name is not its business.
+        let mut config = extent_config(&[1, 1]);
+        config.extents[1].kind = 0;
+        assert!(!config.extents_are_sound(2));
+        assert!(config.extents_are_sound(1));
+    }
+
+    #[test]
+    fn device_extents_is_the_devices_own_slice() {
+        let config = extent_config(&[2, 0, 3]);
+        assert_eq!(config.device_extents(0).len(), 2);
+        assert!(config.device_extents(1).is_empty());
+        let third = config.device_extents(2);
+        assert_eq!(third.len(), 3);
+        assert_eq!(
+            third.as_ptr(),
+            config.extents[2..].as_ptr(),
+            "the third device's slice starts after the first device's"
+        );
+    }
+
+    #[test]
+    fn device_extents_never_leaves_the_table() {
+        // Whatever a config that was never checked says, the slice a
+        // reader indexes is inside the declared part of the table.
+        let mut config = extent_config(&[2]);
+        config.extent_count = 1;
+        assert!(config.device_extents(0).is_empty(), "past extent_count");
+
+        let mut config = extent_config(&[2]);
+        config.devices[0].first_extent = MAX_CHAIN_EXTENTS as u32;
+        config.extent_count = u32::MAX;
+        assert!(config.device_extents(0).is_empty(), "past the table");
+
+        let mut config = extent_config(&[2]);
+        config.devices[0].first_extent = u32::MAX;
+        config.devices[0].extent_count = u32::MAX;
+        assert!(config.device_extents(0).is_empty(), "a wrapping slice");
+
+        assert!(extent_config(&[2])
+            .device_extents(MAX_CHAIN_DEVICES)
+            .is_empty());
     }
 
     #[test]

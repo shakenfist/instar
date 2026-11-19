@@ -2281,13 +2281,13 @@ mod tests {
             // ChainSegment: 4 + 4 = 8 bytes
             assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
 
-            // ChainExtent: 8 + 8 + 8 = 24 bytes
-            assert_eq!(core::mem::size_of::<ChainExtent>(), 24);
+            // ChainExtent: 8 + 8 + 8 + 4 + 4 = 32 bytes
+            assert_eq!(core::mem::size_of::<ChainExtent>(), 32);
 
             // ChainConfig: 16 header + (16 * 40) devices
             // + (16 * 8) segments + 4 extent count + 4 padding
-            // + (64 * 24) extents + 64 reserved = 2392 bytes
-            assert_eq!(core::mem::size_of::<ChainConfig>(), 2392);
+            // + (64 * 32) extents + 64 reserved = 2904 bytes
+            assert_eq!(core::mem::size_of::<ChainConfig>(), 2904);
         }
 
         #[test]

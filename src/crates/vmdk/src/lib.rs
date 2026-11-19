@@ -85,6 +85,11 @@ pub const GRAIN_MARKER_SIZE: usize = 12;
 /// VMDK4 magic number.
 pub const VMDK4_MAGIC: u32 = 0x564D_444B;
 
+/// The sector a sparse VMDK counts in, whatever the sector size of the
+/// device it is read from: its header is one of these, and every
+/// offset and capacity in it is a number of them.
+const VMDK_SECTOR: u64 = 512;
+
 // ============================================================================
 // Metadata marker types (streamOptimized)
 // ============================================================================
@@ -581,6 +586,21 @@ pub struct VmdkState {
     pub capacity_sectors: u64,
     pub has_zero_grain: bool,
     pub is_compressed: bool,
+    /// Byte offset within the device at which this image's file
+    /// begins: zero for an image that is the whole device, and
+    /// wherever its file was laid for one extent of a multi-extent
+    /// descriptor. Every offset a sparse image holds -- its grain
+    /// directory's, each grain table's, each grain's -- counts sectors
+    /// from the start of its own file, so each one is read at this
+    /// plus that.
+    pub base_offset: u64,
+    /// Byte offset within the device at which this image's file ends,
+    /// or `u64::MAX` for an image that is the whole device, which ends
+    /// where the device does. Nothing the image points at is read past
+    /// it. For an extent the bytes that follow are the next extent's
+    /// file, and an entry pointing there would otherwise be served
+    /// that file's header and tables as this one's data.
+    pub image_end: u64,
     // Sector cache for grain directory reads
     pub gd_cached_sector: u64,
     pub gd_cache_buf: *mut u8,
@@ -613,14 +633,170 @@ impl VmdkState {
         gt_cache_buf: *mut u8,
         bytes_read: &mut u64,
     ) -> Option<Self> {
-        // Read first sector (contains the 512-byte VMDK4 header)
+        Self::init_image(
+            call_table,
+            device_idx,
+            sector_size,
+            input_capacity,
+            None,
+            actual_file_size,
+            gd_cache_buf,
+            gt_cache_buf,
+            bytes_read,
+        )
+    }
+
+    /// Initialize VMDK state for a sparse image that begins partway
+    /// through a device: one extent of a multi-extent descriptor, whose
+    /// files the host lays end to end as a single device.
+    ///
+    /// `base_offset` is the byte offset within the device at which the
+    /// extent's file begins, and `file_length` the length of that file.
+    /// Each extent is a sparse image in its own right, covering only its
+    /// own span, so its header is read at `base_offset` and everything
+    /// the header and tables point at is found relative to it. The
+    /// state [`Self::init`] builds assumes its image starts at device
+    /// offset zero, which is true of exactly one extent.
+    ///
+    /// Stricter than [`Self::init`] in four ways, each because the
+    /// image is not alone on its device:
+    ///
+    /// * The header must carry the VMDK4 magic. A whole device reaches
+    ///   `init` only after format detection found the magic there; an
+    ///   extent reaches this because a descriptor's extent line called
+    ///   its file sparse, and nothing has looked at the file.
+    /// * `base_offset` must be a multiple of 512. Sparse VMDK counts in
+    ///   512-byte sectors from the start of the file, so only then do
+    ///   the header and every table entry sit whole inside one device
+    ///   sector, whatever the device's sector size.
+    /// * The header, the grain directory, each grain table entry and
+    ///   each grain must lie inside the file. Past its end is the next
+    ///   extent's file, not the end of the device.
+    /// * A compressed image is refused. A compressed grain's length is
+    ///   stated only by the marker in front of it, so nothing here can
+    ///   hold it to the file. qemu compresses only the stream-optimised
+    ///   subformat, which is a single file, so the extents of the split
+    ///   subformats it writes are never compressed; it would read one
+    ///   that was, and this does not.
+    ///
+    /// Returns `None` on any of those, or where `init` would.
+    ///
+    /// # Safety
+    ///
+    /// `gd_cache_buf` and `gt_cache_buf` must each point to at least
+    /// `MAX_SECTOR_SIZE` writable bytes. `call_table` must be valid.
+    pub unsafe fn init_at(
+        call_table: &CallTable,
+        device_idx: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        base_offset: u64,
+        file_length: u64,
+        gd_cache_buf: *mut u8,
+        gt_cache_buf: *mut u8,
+        bytes_read: &mut u64,
+    ) -> Option<Self> {
+        let state = Self::init_image(
+            call_table,
+            device_idx,
+            sector_size,
+            input_capacity,
+            Some(base_offset),
+            file_length,
+            gd_cache_buf,
+            gt_cache_buf,
+            bytes_read,
+        )?;
+        if state.is_compressed {
+            return None;
+        }
+        Some(state)
+    }
+
+    /// Whether this state was read from the image whose file occupies
+    /// `file_length` bytes of the device from `base_offset`.
+    ///
+    /// A device holding several extents keeps the state of one at a
+    /// time, and this is how a reader tells whether the one it holds is
+    /// the one it wants: a state is a parse of the bytes in a range, so
+    /// it serves whichever extent occupies exactly that range.
+    pub fn is_image_at(&self, base_offset: u64, file_length: u64) -> bool {
+        self.base_offset == base_offset
+            && base_offset.checked_add(file_length) == Some(self.image_end)
+    }
+
+    /// Where byte `file_offset` of this image's own file sits in the
+    /// device, or `None` if that is past the addressable range.
+    #[inline]
+    fn device_offset(&self, file_offset: u64) -> Option<u64> {
+        self.base_offset.checked_add(file_offset)
+    }
+
+    /// The body of [`Self::init`] and [`Self::init_at`].
+    ///
+    /// `extent_base` is `None` for an image that is the whole device
+    /// and the offset its file begins at otherwise. `file_size` is the
+    /// length of the image's own file either way: the footer of a
+    /// stream-optimised image is found from it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::init`].
+    unsafe fn init_image(
+        call_table: &CallTable,
+        device_idx: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        extent_base: Option<u64>,
+        file_size: u64,
+        gd_cache_buf: *mut u8,
+        gt_cache_buf: *mut u8,
+        bytes_read: &mut u64,
+    ) -> Option<Self> {
+        // Where the image's file sits in the device, and where its
+        // 512-byte header is: the device sector holding it and the
+        // header's offset within that sector. An image that is the
+        // whole device has its header at the start of sector 0. An
+        // extent's base is a multiple of 512, so its header starts on a
+        // 512-byte boundary of some device sector and, a device sector
+        // being a multiple of 512 itself, ends inside the same one; a
+        // sector size that would break that is refused rather than
+        // read across.
+        let (base_offset, image_end, header_sector, header_at) = match extent_base {
+            Some(base) => {
+                let ssz = sector_size as u64;
+                if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
+                    return None;
+                }
+                if !base.is_multiple_of(VMDK_SECTOR) || file_size < VMDK_SECTOR {
+                    return None;
+                }
+                let header_at = (base % ssz) as usize;
+                if header_at + VMDK_SECTOR as usize > sector_size {
+                    return None;
+                }
+                (base, base.checked_add(file_size)?, base / ssz, header_at)
+            }
+            None => (0, u64::MAX, 0, 0),
+        };
+
         let mut header_buf = [0u8; MAX_SECTOR_SIZE];
-        if !(call_table.read_input_sector)(device_idx, 0, header_buf.as_mut_ptr(), sector_size) {
+        if !(call_table.read_input_sector)(
+            device_idx,
+            header_sector,
+            header_buf.as_mut_ptr(),
+            sector_size,
+        ) {
             return None;
         }
         *bytes_read += sector_size as u64;
+        let header_bytes = &header_buf[header_at..];
 
-        let header = Vmdk4HeaderFull::parse(&header_buf)?;
+        if extent_base.is_some() && le_u32(header_bytes, MAGIC_OFFSET) != VMDK4_MAGIC {
+            return None;
+        }
+
+        let header = Vmdk4HeaderFull::parse(header_bytes)?;
 
         // Validate basic fields
         if header.version == 0 || header.version > 3 {
@@ -653,23 +829,27 @@ impl VmdkState {
                 device_idx,
                 sector_size,
                 input_capacity,
-                actual_file_size,
+                base_offset,
+                file_size,
                 bytes_read,
             )?
         } else {
             header.gd_offset_sectors
         };
 
-        // Validate GD offset
+        // Validate GD offset. The grain directory has to be inside the
+        // device and, for an extent, inside the extent's own file: the
+        // nearer of the two ends is the limit.
         let actual_size = input_capacity.checked_mul(sector_size as u64)?;
-        let gd_byte_offset = gd_offset_sectors.checked_mul(512)?;
-        if gd_byte_offset >= actual_size {
+        let limit = actual_size.min(image_end);
+        let gd_byte_offset = base_offset.checked_add(gd_offset_sectors.checked_mul(512)?)?;
+        if gd_byte_offset >= limit {
             return None;
         }
         // Validate GD doesn't extend beyond file
         let gd_size_bytes = (num_gd_entries as u64).checked_mul(4)?;
         let gd_end = gd_byte_offset.checked_add(gd_size_bytes)?;
-        if gd_end > actual_size {
+        if gd_end > limit {
             return None;
         }
 
@@ -683,6 +863,8 @@ impl VmdkState {
             capacity_sectors: header.capacity_sectors,
             has_zero_grain: header.has_zero_grain,
             is_compressed: header.is_compressed,
+            base_offset,
+            image_end,
             gd_cached_sector: u64::MAX,
             gd_cache_buf,
             gt_cached_sector: u64::MAX,
@@ -696,11 +878,16 @@ impl VmdkState {
     /// The footer is a copy of the VMDK4 header located 1536 bytes
     /// before EOF (3 x 512-byte sectors). Its `gd_offset` field
     /// contains the actual grain directory location.
+    ///
+    /// `base_offset` is where the image's file begins in the device:
+    /// the end of file the footer is counted back from is the file's
+    /// own, `actual_file_size` bytes on from there.
     unsafe fn read_footer_gd_offset(
         call_table: &CallTable,
         device_idx: u32,
         sector_size: usize,
         input_capacity: u64,
+        base_offset: u64,
         actual_file_size: u64,
         bytes_read: &mut u64,
     ) -> Option<u64> {
@@ -711,7 +898,7 @@ impl VmdkState {
         // divide the sector size the capacity is rounded up and
         // the calculated offset would land in zero-padded space
         // beyond the real file data.
-        let footer_byte_offset = actual_file_size.checked_sub(1024)?;
+        let footer_byte_offset = base_offset.checked_add(actual_file_size.checked_sub(1024)?)?;
         let footer_sector = footer_byte_offset / sector_size as u64;
         let offset_in_sector = (footer_byte_offset % sector_size as u64) as usize;
 
@@ -787,10 +974,11 @@ impl VmdkState {
         }
 
         // Read GD entry (u32 LE, sector offset to grain table)
-        let gd_byte_offset = self
-            .gd_offset_sectors
-            .checked_mul(512)?
-            .checked_add(gd_index.checked_mul(4)?)?;
+        let gd_byte_offset = self.device_offset(
+            self.gd_offset_sectors
+                .checked_mul(512)?
+                .checked_add(gd_index.checked_mul(4)?)?,
+        )?;
         let gd_entry = read_u32_le_cached(
             call_table,
             self.device_idx,
@@ -807,13 +995,21 @@ impl VmdkState {
         }
 
         // Read GT entry (u32 LE, sector offset to grain data)
-        let gt_byte_offset = (gd_entry as u64)
-            .checked_mul(512)?
-            .checked_add(gt_index.checked_mul(4)?)?;
+        let gt_byte_offset = self.device_offset(
+            (gd_entry as u64)
+                .checked_mul(512)?
+                .checked_add(gt_index.checked_mul(4)?)?,
+        )?;
 
         // Validate GT offset within file
         let actual_size = input_capacity.checked_mul(sector_size as u64)?;
         if gt_byte_offset >= actual_size {
+            return None;
+        }
+        // And, for an extent, within the extent's own file. Never true
+        // of an image that is the whole device, whose end is the
+        // device's and was checked just above.
+        if gt_byte_offset.saturating_add(4) > self.image_end {
             return None;
         }
 
@@ -836,14 +1032,25 @@ impl VmdkState {
             return Some(GrainLookup::Zeroed);
         }
 
+        // Either way the GTE counts sectors from the start of the
+        // image's own file, and what is returned is where that is in
+        // the device, which is what the caller reads.
         if self.is_compressed {
             // For compressed images, the GTE is the sector offset
             // to the grain marker (12-byte header + compressed data).
-            let marker_byte_offset = (gte as u64).checked_mul(512)?;
+            // Only an image that is the whole device is compressed
+            // (`init_at` refuses one), so there is no file end short of
+            // the device's to hold the grain to.
+            let marker_byte_offset = self.device_offset((gte as u64).checked_mul(512)?)?;
             Some(GrainLookup::Compressed(marker_byte_offset))
         } else {
             // Standard grain: GTE is sector offset to grain data.
-            let host_byte_offset = (gte as u64).checked_mul(512)?;
+            let host_byte_offset = self.device_offset((gte as u64).checked_mul(512)?)?;
+            // An extent's grain is the extent's own bytes or it is not
+            // read: past the end of its file is the next extent's.
+            if host_byte_offset.saturating_add(self.grain_size_bytes) > self.image_end {
+                return None;
+            }
             Some(GrainLookup::Standard(host_byte_offset))
         }
     }
@@ -877,10 +1084,11 @@ impl VmdkState {
 
         for gd_index in 0..self.num_gd_entries as u64 {
             // Compute byte offset of this GD entry.
-            let gd_byte_offset = self
-                .gd_offset_sectors
-                .checked_mul(512)?
-                .checked_add(gd_index.checked_mul(4)?)?;
+            let gd_byte_offset = self.device_offset(
+                self.gd_offset_sectors
+                    .checked_mul(512)?
+                    .checked_add(gd_index.checked_mul(4)?)?,
+            )?;
 
             let gd_entry = read_u32_le_cached(
                 call_table,
@@ -898,9 +1106,12 @@ impl VmdkState {
                 continue;
             }
 
-            // The GT starts at byte offset gd_entry * 512.
-            let gt_start_byte = (gd_entry as u64).checked_mul(512)?;
+            // The GT starts gd_entry * 512 bytes into the image's file.
+            let gt_start_byte = self.device_offset((gd_entry as u64).checked_mul(512)?)?;
             let gt_end_byte = gt_start_byte.checked_add(gt_size_bytes)?;
+            if gt_end_byte > self.image_end {
+                return None;
+            }
 
             // Walk the GT in MAX_SECTOR_SIZE-sized chunks.
             let gt_start_sector = gt_start_byte / sector_size as u64;
@@ -993,6 +1204,12 @@ impl VmdkState {
     /// range. A trailing `Hole` covers any virtual range past the
     /// last walked grain up to `virtual_size`.
     ///
+    /// A `Data` extent's `file_offset` is an offset into the image's
+    /// own file, as the grain table states it, whatever
+    /// [`Self::base_offset`] is: it names where the data is in the
+    /// file a user can open, not where the host laid that file in the
+    /// device.
+    ///
     /// Returns `Some(())` on success (including early termination);
     /// `None` on I/O failure.
     ///
@@ -1023,10 +1240,11 @@ impl VmdkState {
         let mut next_unwalked: u64 = 0;
 
         'gd_loop: for gd_index in 0..self.num_gd_entries as u64 {
-            let gd_byte_offset = self
-                .gd_offset_sectors
-                .checked_mul(512)?
-                .checked_add(gd_index.checked_mul(4)?)?;
+            let gd_byte_offset = self.device_offset(
+                self.gd_offset_sectors
+                    .checked_mul(512)?
+                    .checked_add(gd_index.checked_mul(4)?)?,
+            )?;
             let gd_entry = read_u32_le_cached(
                 call_table,
                 self.device_idx,
@@ -1058,8 +1276,11 @@ impl VmdkState {
                 continue;
             }
 
-            let gt_start_byte = (gd_entry as u64).checked_mul(512)?;
+            let gt_start_byte = self.device_offset((gd_entry as u64).checked_mul(512)?)?;
             let gt_end_byte = gt_start_byte.checked_add(gt_size_bytes)?;
+            if gt_end_byte > self.image_end {
+                return None;
+            }
             let gt_start_sector = gt_start_byte / sector_size as u64;
             let gt_end_sector =
                 gt_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
@@ -2413,5 +2634,792 @@ mod heapless_collect {
         pub fn as_slice(&self) -> &[&'static str] {
             &self.buf[..self.len]
         }
+    }
+}
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod extent_tests {
+    //! `VmdkState` over a sparse image that does not start its device:
+    //! one extent of a multi-extent descriptor, whose files the host
+    //! lays end to end as one device.
+    //!
+    //! Each test puts the image under test somewhere other than device
+    //! offset zero, and usually puts a different image at zero, so a
+    //! read that forgets the base lands on the wrong image's header,
+    //! tables or grains instead of failing.
+    use super::*;
+    use std::sync::Mutex;
+
+    // The `read_input_sector` callback is an `extern "C" fn` and can
+    // only close over `'static` state, so the mock device lives in a
+    // global buffer guarded by a lock that serializes the tests.
+    const MOCK_LEN: usize = 4 * MAX_SECTOR_SIZE;
+    static MOCK_LOCK: Mutex<()> = Mutex::new(());
+    static mut MOCK_IMAGE: [u8; MOCK_LEN] = [0u8; MOCK_LEN];
+    static mut GD_CACHE: [u8; MAX_SECTOR_SIZE] = [0u8; MAX_SECTOR_SIZE];
+    static mut GT_CACHE: [u8; MAX_SECTOR_SIZE] = [0u8; MAX_SECTOR_SIZE];
+
+    unsafe extern "C" fn mock_read_input_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        if start + sector_size > MOCK_LEN {
+            return false;
+        }
+        let src = core::ptr::addr_of!(MOCK_IMAGE) as *const u8;
+        core::ptr::copy_nonoverlapping(src.add(start), out_buf, sector_size);
+        true
+    }
+
+    fn stub_call_table() -> shared::CallTable {
+        unsafe extern "C" fn s_dev_count() -> u32 {
+            1
+        }
+        unsafe extern "C" fn s_in_cap(_: u32) -> u64 {
+            (MOCK_LEN / 512) as u64
+        }
+        unsafe extern "C" fn s_in_secsz(_: u32) -> usize {
+            512
+        }
+        unsafe extern "C" fn s_write_out(_: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_out_cap() -> u64 {
+            0
+        }
+        unsafe extern "C" fn s_out_secsz() -> usize {
+            512
+        }
+        unsafe extern "C" fn s_prog_int() -> u32 {
+            100
+        }
+        unsafe extern "C" fn s_send_prog(_: *const u8, _: u64, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_err(_: *const u8, _: *const u8, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_complete(_: *const u8, _: u64, _: bool) {}
+        unsafe extern "C" fn s_dbg(_: *const u8) {}
+        unsafe extern "C" fn s_verb(_: *const u8) {}
+        unsafe extern "C" fn s_get_op_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_get_chain_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_send_info(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_q(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::Qcow2Info,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_v(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VmdkInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_vdi(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VdiInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_l(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::LuksInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_check(_: *const shared::CheckResult) {}
+        unsafe extern "C" fn s_send_compare(_: *const shared::CompareResult) {}
+        unsafe extern "C" fn s_send_measure(_: *const shared::MeasureResult) {}
+        unsafe extern "C" fn s_send_create(_: *const shared::CreateResult) {}
+        unsafe extern "C" fn s_read_out(_: u64, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_resize(_: *const shared::ResizeResult) {}
+        unsafe extern "C" fn s_send_rebase(_: *const shared::RebaseResult) {}
+        unsafe extern "C" fn s_send_commit(_: *const shared::CommitResult) {}
+        unsafe extern "C" fn s_write_in(_: u32, _: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_map_ex(_: *const shared::MapExtentRecord) {}
+        unsafe extern "C" fn s_send_map_res(_: *const shared::MapResult) {}
+        unsafe extern "C" fn s_send_snap_ent(_: *const shared::SnapshotEntryRecord) {}
+        unsafe extern "C" fn s_send_snap_res(_: *const shared::SnapshotResult) {}
+        unsafe extern "C" fn s_fsync_in(_: u32) -> bool {
+            true
+        }
+        unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
+        unsafe extern "C" fn s_send_bitmap(_: *const shared::BitmapResult) {}
+        unsafe extern "C" fn s_send_bench_start() {}
+        unsafe extern "C" fn s_send_bench_result(_: *const shared::BenchResult) {}
+        shared::CallTable {
+            magic: shared::CallTable::MAGIC,
+            version: shared::CallTable::VERSION,
+            get_input_device_count: s_dev_count,
+            read_input_sector: mock_read_input_sector,
+            get_input_capacity: s_in_cap,
+            get_input_sector_size: s_in_secsz,
+            write_output_sector: s_write_out,
+            get_output_capacity: s_out_cap,
+            get_output_sector_size: s_out_secsz,
+            get_progress_interval: s_prog_int,
+            send_progress: s_send_prog,
+            send_error: s_send_err,
+            send_complete: s_send_complete,
+            debug_print: s_dbg,
+            verbose_print: s_verb,
+            get_operation_config: s_get_op_cfg,
+            get_chain_config: s_get_chain_cfg,
+            send_info_result: s_send_info,
+            send_info_result_qcow2: s_send_info_q,
+            send_info_result_vmdk: s_send_info_v,
+            send_info_result_vdi: s_send_info_vdi,
+            send_info_result_luks: s_send_info_l,
+            send_check_result: s_send_check,
+            send_compare_result: s_send_compare,
+            send_measure_result: s_send_measure,
+            send_create_result: s_send_create,
+            read_output_sector: s_read_out,
+            send_resize_result: s_send_resize,
+            send_rebase_result: s_send_rebase,
+            send_commit_result: s_send_commit,
+            write_input_sector: s_write_in,
+            send_map_extent: s_send_map_ex,
+            send_map_result: s_send_map_res,
+            send_snapshot_entry: s_send_snap_ent,
+            send_snapshot_result: s_send_snap_res,
+            fsync_input: s_fsync_in,
+            send_amend_result: s_send_amend,
+            send_bitmap_result: s_send_bitmap,
+            send_bench_start: s_send_bench_start,
+            send_bench_result: s_send_bench_result,
+        }
+    }
+
+    // ====================================================================
+    // A small sparse image
+    // ====================================================================
+
+    /// 4096-byte grains, four to a grain table.
+    const GRAIN_SECTORS: u64 = 8;
+    const GRAIN_BYTES: u64 = GRAIN_SECTORS * 512;
+    const GTES_PER_GT: u32 = 4;
+    /// Bytes of virtual disk one grain table covers.
+    const GT_SPAN: u64 = GTES_PER_GT as u64 * GRAIN_BYTES;
+    /// The file, in its own 512-byte sectors: the header, the grain
+    /// directory, room for two grain tables, then eight grains.
+    const GD_SECTOR: u64 = 1;
+    const GT_SECTOR: [u32; 2] = [2, 3];
+    const FIRST_GRAIN: u32 = 8;
+    const IMAGE_SECTORS: u64 = FIRST_GRAIN as u64 + 8 * GRAIN_SECTORS;
+    const IMAGE_LEN: u64 = IMAGE_SECTORS * 512;
+
+    /// What a test image's header and tables say.
+    #[derive(Clone, Copy)]
+    struct Image {
+        capacity_sectors: u64,
+        flags: u32,
+        /// The header's grain directory offset, in sectors.
+        gd_offset: u64,
+        /// Grain directory entries: the sector of each grain table.
+        gd: [u32; 2],
+        /// The grain tables, as sectors within the image's own file.
+        gts: [[u32; 4]; 2],
+    }
+
+    /// An image of two grain tables, every grain allocated in file
+    /// order.
+    fn full_image() -> Image {
+        let grain = |n: u32| FIRST_GRAIN + n * GRAIN_SECTORS as u32;
+        Image {
+            capacity_sectors: 2 * GT_SPAN / 512,
+            flags: FLAG_VALID_NEW_LINE,
+            gd_offset: GD_SECTOR,
+            gd: GT_SECTOR,
+            gts: [
+                [grain(0), grain(1), grain(2), grain(3)],
+                [grain(4), grain(5), grain(6), grain(7)],
+            ],
+        }
+    }
+
+    /// Write `image` into the mock device with its file starting at
+    /// `base`.
+    unsafe fn put_image(base: usize, image: &Image) {
+        let dev = core::ptr::addr_of_mut!(MOCK_IMAGE) as *mut u8;
+        let file = core::slice::from_raw_parts_mut(dev.add(base), IMAGE_LEN as usize);
+        file.fill(0);
+        build_sparse_header(
+            file,
+            image.capacity_sectors,
+            GRAIN_SECTORS,
+            GTES_PER_GT,
+            image.gd_offset,
+            FIRST_GRAIN as u64,
+        );
+        write_le_u32(file, FLAGS_OFFSET, image.flags);
+        for (i, &entry) in image.gd.iter().enumerate() {
+            write_le_u32(file, GD_SECTOR as usize * 512 + i * 4, entry);
+        }
+        for (table, entries) in image.gts.iter().enumerate() {
+            for (i, &entry) in entries.iter().enumerate() {
+                write_le_u32(file, GT_SECTOR[table] as usize * 512 + i * 4, entry);
+            }
+        }
+    }
+
+    /// Fill the mock device with a byte no table holds and put each
+    /// image at its base. The guard holds the device for the test.
+    fn install(images: &[(u64, Image)]) -> std::sync::MutexGuard<'static, ()> {
+        let guard = MOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dev = core::ptr::addr_of_mut!(MOCK_IMAGE) as *mut u8;
+            core::ptr::write_bytes(dev, 0xEE, MOCK_LEN);
+            for (base, image) in images {
+                put_image(*base as usize, image);
+            }
+        }
+        guard
+    }
+
+    fn caches() -> (*mut u8, *mut u8) {
+        (
+            core::ptr::addr_of_mut!(GD_CACHE) as *mut u8,
+            core::ptr::addr_of_mut!(GT_CACHE) as *mut u8,
+        )
+    }
+
+    /// The state of the image whose file is `len` bytes at `base`.
+    fn state_at(base: u64, len: u64, sector_size: usize) -> Option<VmdkState> {
+        let (gd, gt) = caches();
+        let mut bytes_read = 0u64;
+        unsafe {
+            VmdkState::init_at(
+                &stub_call_table(),
+                0,
+                sector_size,
+                (MOCK_LEN / sector_size) as u64,
+                base,
+                len,
+                gd,
+                gt,
+                &mut bytes_read,
+            )
+        }
+    }
+
+    /// The state of the image that is the whole device.
+    fn whole_device_state(sector_size: usize) -> Option<VmdkState> {
+        let (gd, gt) = caches();
+        let mut bytes_read = 0u64;
+        unsafe {
+            VmdkState::init(
+                &stub_call_table(),
+                0,
+                sector_size,
+                (MOCK_LEN / sector_size) as u64,
+                MOCK_LEN as u64,
+                gd,
+                gt,
+                &mut bytes_read,
+            )
+        }
+    }
+
+    fn lookup(
+        state: &mut VmdkState,
+        virtual_offset: u64,
+        sector_size: usize,
+    ) -> Option<GrainLookup> {
+        let mut bytes_read = 0u64;
+        unsafe {
+            state.grain_lookup(
+                &stub_call_table(),
+                virtual_offset,
+                sector_size,
+                (MOCK_LEN / sector_size) as u64,
+                &mut bytes_read,
+            )
+        }
+    }
+
+    /// Where a second extent sits when the first is one test image
+    /// long.
+    const SECOND: u64 = IMAGE_LEN;
+
+    // ====================================================================
+    // The header
+    // ====================================================================
+
+    #[test]
+    fn init_at_reads_the_header_where_the_extent_begins() {
+        // Two images with different capacities. The one at the base is
+        // the extent; the one at zero is what a read that forgets the
+        // base finds.
+        let first = full_image();
+        let second = Image {
+            capacity_sectors: GT_SPAN / 512,
+            ..full_image()
+        };
+        let _guard = install(&[(0, first), (SECOND, second)]);
+
+        let state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        assert_eq!(state.capacity_sectors, second.capacity_sectors);
+        assert_eq!(state.num_gd_entries, 1);
+        assert_eq!(state.base_offset, SECOND);
+        assert_eq!(state.image_end, SECOND + IMAGE_LEN);
+
+        // The image that is the whole device is unchanged: it starts
+        // at zero and ends where the device does.
+        let state = whole_device_state(512).expect("the whole device");
+        assert_eq!(state.capacity_sectors, first.capacity_sectors);
+        assert_eq!(state.base_offset, 0);
+        assert_eq!(state.image_end, u64::MAX);
+    }
+
+    #[test]
+    fn init_at_reads_a_header_that_does_not_start_a_device_sector() {
+        // A device sector larger than 512 bytes: an extent's base is a
+        // multiple of 512 but need not be a multiple of the device's
+        // sector, so its header starts partway into one.
+        let image = Image {
+            capacity_sectors: GT_SPAN / 512,
+            ..full_image()
+        };
+        let base = SECOND + 512;
+        for sector_size in [4096usize, MAX_SECTOR_SIZE] {
+            assert_ne!(base % sector_size as u64, 0, "the harness must misalign");
+            let _guard = install(&[(0, full_image()), (base, image)]);
+            let mut state = state_at(base, IMAGE_LEN, sector_size)
+                .unwrap_or_else(|| panic!("sector size {sector_size}"));
+            assert_eq!(state.capacity_sectors, image.capacity_sectors);
+            assert_eq!(
+                lookup(&mut state, GRAIN_BYTES, sector_size),
+                Some(GrainLookup::Standard(base + image.gts[0][1] as u64 * 512)),
+                "sector size {sector_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_at_refuses_a_base_that_is_not_on_a_vmdk_sector() {
+        // A sound image, put where a sparse image cannot be read from.
+        // With 512-byte device sectors its header would straddle two
+        // of them. With larger ones it would fit inside one, and so
+        // would every table entry, so only the rule refuses it.
+        for sector_size in [512usize, 4096] {
+            let _guard = install(&[(SECOND + 256, full_image())]);
+            assert!(
+                state_at(SECOND + 256, IMAGE_LEN, sector_size).is_none(),
+                "sector size {sector_size}"
+            );
+        }
+        // The control: the same image one whole sector along.
+        for sector_size in [512usize, 4096] {
+            let _guard = install(&[(SECOND + 512, full_image())]);
+            assert!(
+                state_at(SECOND + 512, IMAGE_LEN, sector_size).is_some(),
+                "sector size {sector_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_at_refuses_a_file_that_is_not_a_sparse_image() {
+        // An extent is called sparse by its descriptor, and nothing has
+        // looked at the file. Flat data that happens to parse as a
+        // header is not one.
+        let _guard = install(&[(SECOND, full_image())]);
+        assert!(state_at(SECOND, IMAGE_LEN, 512).is_some(), "the control");
+        unsafe {
+            let dev = core::ptr::addr_of_mut!(MOCK_IMAGE) as *mut u8;
+            *dev.add(SECOND as usize) ^= 0xFF;
+        }
+        assert!(state_at(SECOND, IMAGE_LEN, 512).is_none());
+    }
+
+    #[test]
+    fn init_at_refuses_a_file_too_short_to_hold_a_header() {
+        let _guard = install(&[(SECOND, full_image())]);
+        assert!(state_at(SECOND, 511, 512).is_none());
+        assert!(state_at(SECOND, 0, 512).is_none());
+    }
+
+    #[test]
+    fn init_at_refuses_a_compressed_image() {
+        let compressed = Image {
+            flags: FLAG_VALID_NEW_LINE | FLAG_COMPRESSED | FLAG_MARKER,
+            ..full_image()
+        };
+        let _guard = install(&[(0, compressed), (SECOND, compressed)]);
+        assert!(state_at(SECOND, IMAGE_LEN, 512).is_none());
+        // Refused for being an extent, not for being compressed: the
+        // same image as a whole device still initialises.
+        let state = whole_device_state(512).expect("a compressed whole device");
+        assert!(state.is_compressed);
+    }
+
+    #[test]
+    fn init_at_holds_the_grain_directory_to_the_extents_file() {
+        // Two grain directory entries end 520 bytes into the file. A
+        // file that long holds them; one byte shorter does not, though
+        // the device goes on for a long way after it.
+        let _guard = install(&[(SECOND, full_image())]);
+        assert!(state_at(SECOND, GD_SECTOR * 512 + 8, 512).is_some());
+        assert!(state_at(SECOND, GD_SECTOR * 512 + 7, 512).is_none());
+        // A directory that starts past the end of the file.
+        assert!(state_at(SECOND, GD_SECTOR * 512, 512).is_none());
+    }
+
+    #[test]
+    fn init_at_finds_a_footer_from_the_end_of_the_extents_file() {
+        // The header says the grain directory's offset is in the
+        // footer, 1024 bytes before the end of the file. The file's end
+        // is the extent's, not the device's, and not what the end would
+        // be were the file at offset zero.
+        let footed = Image {
+            gd_offset: GD_AT_END,
+            ..full_image()
+        };
+        let _guard = install(&[(SECOND, footed)]);
+        unsafe {
+            let dev = core::ptr::addr_of_mut!(MOCK_IMAGE) as *mut u8;
+            let device = core::slice::from_raw_parts_mut(dev, MOCK_LEN);
+            // The real footer: a header copy naming the directory.
+            let footer_at = (SECOND + IMAGE_LEN - 1024) as usize;
+            write_le_u32(device, footer_at + MAGIC_OFFSET, VMDK4_MAGIC);
+            write_le_u64(device, footer_at + GD_OFFSET_OFFSET, GD_SECTOR);
+            // A decoy where the footer would be for a file at zero.
+            let decoy_at = (IMAGE_LEN - 1024) as usize;
+            write_le_u32(device, decoy_at + MAGIC_OFFSET, VMDK4_MAGIC);
+            write_le_u64(device, decoy_at + GD_OFFSET_OFFSET, 5);
+        }
+        let state = state_at(SECOND, IMAGE_LEN, 512).expect("a footed extent");
+        assert_eq!(state.gd_offset_sectors, GD_SECTOR);
+    }
+
+    // ====================================================================
+    // Lookups
+    // ====================================================================
+
+    /// An extent with one of each kind of grain, behind a first image
+    /// whose directory and tables say something different at every
+    /// index: a different table for the first directory entry, no
+    /// table at all for the second, and a different number of grains,
+    /// so that neither a lookup nor a count comes out the same from
+    /// the wrong image's metadata.
+    fn mixed_pair() -> (Image, Image) {
+        let first = Image {
+            gd: [GT_SECTOR[1], 0],
+            gts: [[40, 48, 56, 64], [16, 24, 32, 0]],
+            ..full_image()
+        };
+        let second = Image {
+            flags: FLAG_VALID_NEW_LINE | FLAG_ZERO_GRAIN,
+            gts: [[8, 0, GTE_ZEROED, 24], [0, 32, 0, 0]],
+            ..full_image()
+        };
+        (first, second)
+    }
+
+    #[test]
+    fn grain_lookup_reads_an_extents_tables_from_its_base() {
+        let (first, second) = mixed_pair();
+        let _guard = install(&[(0, first), (SECOND, second)]);
+        let mut state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+
+        // The grain's place is given in the device: the extent's base
+        // plus the sector its own table names.
+        let at = |sector: u64| Some(GrainLookup::Standard(SECOND + sector * 512));
+        assert_eq!(lookup(&mut state, 0, 512), at(8));
+        assert_eq!(lookup(&mut state, 100, 512), at(8), "inside the grain");
+        assert_eq!(
+            lookup(&mut state, GRAIN_BYTES, 512),
+            Some(GrainLookup::Unallocated)
+        );
+        assert_eq!(
+            lookup(&mut state, 2 * GRAIN_BYTES, 512),
+            Some(GrainLookup::Zeroed)
+        );
+        assert_eq!(lookup(&mut state, 3 * GRAIN_BYTES, 512), at(24));
+        // The second grain table.
+        assert_eq!(
+            lookup(&mut state, GT_SPAN, 512),
+            Some(GrainLookup::Unallocated)
+        );
+        assert_eq!(lookup(&mut state, GT_SPAN + GRAIN_BYTES, 512), at(32));
+        // Past the capacity there is no directory entry to read.
+        assert_eq!(
+            lookup(&mut state, 2 * GT_SPAN, 512),
+            Some(GrainLookup::Unallocated)
+        );
+    }
+
+    #[test]
+    fn grain_lookup_of_a_whole_device_is_counted_from_zero() {
+        let (first, _) = mixed_pair();
+        let _guard = install(&[(0, first)]);
+        let mut state = whole_device_state(512).expect("the whole device");
+        // The first directory entry names the second table's sector,
+        // and the second names no table.
+        assert_eq!(
+            lookup(&mut state, 0, 512),
+            Some(GrainLookup::Standard(16 * 512))
+        );
+        assert_eq!(
+            lookup(&mut state, GRAIN_BYTES, 512),
+            Some(GrainLookup::Standard(24 * 512))
+        );
+        assert_eq!(
+            lookup(&mut state, GT_SPAN, 512),
+            Some(GrainLookup::Unallocated)
+        );
+    }
+
+    #[test]
+    fn grain_lookup_holds_a_grain_to_the_extents_file() {
+        // What follows the extent in the device is the next extent's
+        // file. A grain reaching into it is not this extent's data.
+        let last_whole = (IMAGE_SECTORS - GRAIN_SECTORS) as u32;
+        let image = Image {
+            gts: [[last_whole, last_whole + 1, 8, 8], [8, 8, 8, 8]],
+            ..full_image()
+        };
+        let _guard = install(&[(0, image), (SECOND, image), (2 * SECOND, full_image())]);
+
+        let mut state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        assert_eq!(
+            lookup(&mut state, 0, 512),
+            Some(GrainLookup::Standard(SECOND + last_whole as u64 * 512)),
+            "a grain ending where the file ends is the extent's"
+        );
+        assert_eq!(
+            lookup(&mut state, GRAIN_BYTES, 512),
+            None,
+            "a grain ending one sector past the file is not"
+        );
+
+        // The same tables in an image that is the whole device point
+        // inside the device, and are read as they always were.
+        let mut state = whole_device_state(512).expect("the whole device");
+        assert_eq!(
+            lookup(&mut state, GRAIN_BYTES, 512),
+            Some(GrainLookup::Standard((last_whole as u64 + 1) * 512))
+        );
+    }
+
+    #[test]
+    fn grain_lookup_holds_a_grain_table_to_the_extents_file() {
+        // The second directory entry names the sector after the file's
+        // last: in the device that is the start of the next extent's
+        // file. What is there reads as a grain table entry naming the
+        // extent's own first grain, so a lookup that followed the
+        // pointer would come back with an answer.
+        let image = Image {
+            gd: [GT_SECTOR[0], IMAGE_SECTORS as u32],
+            ..full_image()
+        };
+        let _guard = install(&[(0, image), (SECOND, image)]);
+        unsafe {
+            let dev = core::ptr::addr_of_mut!(MOCK_IMAGE) as *mut u8;
+            let device = core::slice::from_raw_parts_mut(dev, MOCK_LEN);
+            write_le_u32(device, 2 * SECOND as usize, FIRST_GRAIN);
+        }
+
+        let mut state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        assert!(lookup(&mut state, 0, 512).is_some(), "the control");
+        assert_eq!(lookup(&mut state, GT_SPAN, 512), None);
+
+        // A whole device has no such end short of its own.
+        let mut state = whole_device_state(512).expect("the whole device");
+        assert!(lookup(&mut state, GT_SPAN, 512).is_some());
+    }
+
+    // ====================================================================
+    // The walks
+    // ====================================================================
+
+    fn allocation_of(state: &mut VmdkState) -> Option<AllocationSummary> {
+        let mut bytes_read = 0u64;
+        unsafe {
+            state.scan_allocation(
+                &stub_call_table(),
+                512,
+                (MOCK_LEN / 512) as u64,
+                &mut bytes_read,
+            )
+        }
+    }
+
+    /// The first eight extents `map_extents` emits.
+    fn map_of(state: &mut VmdkState) -> ([Option<MapExtent>; 8], usize) {
+        let mut out = [None; 8];
+        let mut count = 0usize;
+        let mut bytes_read = 0u64;
+        let walked = unsafe {
+            state.map_extents(
+                &stub_call_table(),
+                512,
+                (MOCK_LEN / 512) as u64,
+                &mut bytes_read,
+                &mut |extent| {
+                    if count < out.len() {
+                        out[count] = Some(extent);
+                    }
+                    count += 1;
+                    true
+                },
+            )
+        };
+        assert!(walked.is_some(), "the walk must not fail");
+        (out, count)
+    }
+
+    #[test]
+    fn the_walks_read_an_extents_tables_from_its_base() {
+        let (first, second) = mixed_pair();
+
+        // What the second image says when it is the whole device.
+        let (alone_allocation, alone_map) = {
+            let _guard = install(&[(0, second)]);
+            let mut state = whole_device_state(512).expect("alone");
+            (allocation_of(&mut state), map_of(&mut state))
+        };
+        // And what the first says, which is what a walk that forgets
+        // the base would report for the second.
+        let first_allocation = {
+            let _guard = install(&[(0, first)]);
+            let mut state = whole_device_state(512).expect("the first alone");
+            allocation_of(&mut state)
+        };
+        let alone = alone_allocation.expect("the scan must not fail");
+        // Three data grains and the zeroed one, which the scan counts.
+        assert_eq!(alone.allocated_bytes, 4 * GRAIN_BYTES);
+        assert_ne!(
+            first_allocation.map(|a| a.allocated_bytes),
+            Some(alone.allocated_bytes),
+            "the two images must differ for the test to mean anything"
+        );
+
+        let _guard = install(&[(0, first), (SECOND, second)]);
+        let mut state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        let based = allocation_of(&mut state).expect("the scan must not fail");
+        assert_eq!(based.allocated_bytes, alone.allocated_bytes);
+        assert_eq!(based.virtual_size, alone.virtual_size);
+
+        // The map is the same too, down to each data extent's offset,
+        // which is an offset into the extent's own file and so does not
+        // move with the base.
+        let based_map = map_of(&mut state);
+        assert_eq!(based_map.1, alone_map.1);
+        assert_eq!(based_map.0, alone_map.0);
+        assert_eq!(
+            based_map.0[0],
+            Some(MapExtent {
+                start: 0,
+                length: GRAIN_BYTES,
+                state: MapExtentState::Data {
+                    file_offset: 8 * 512
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn the_walks_hold_a_grain_table_to_the_extents_file() {
+        let image = Image {
+            gd: [GT_SECTOR[0], IMAGE_SECTORS as u32],
+            ..full_image()
+        };
+        let _guard = install(&[(0, image), (SECOND, image), (2 * SECOND, full_image())]);
+        let mut state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        assert!(allocation_of(&mut state).is_none());
+        let mut bytes_read = 0u64;
+        let walked = unsafe {
+            state.map_extents(
+                &stub_call_table(),
+                512,
+                (MOCK_LEN / 512) as u64,
+                &mut bytes_read,
+                &mut |_| true,
+            )
+        };
+        assert!(walked.is_none());
+    }
+
+    // ====================================================================
+    // Which extent a state belongs to
+    // ====================================================================
+
+    #[test]
+    fn is_image_at_names_the_range_the_state_was_read_from() {
+        let _guard = install(&[(0, full_image()), (SECOND, full_image())]);
+        let state = state_at(SECOND, IMAGE_LEN, 512).expect("the second extent");
+        assert!(state.is_image_at(SECOND, IMAGE_LEN));
+        assert!(!state.is_image_at(0, IMAGE_LEN), "another base");
+        assert!(
+            !state.is_image_at(SECOND, IMAGE_LEN - 512),
+            "another length"
+        );
+        assert!(
+            !state.is_image_at(SECOND, u64::MAX),
+            "a length that overflows"
+        );
+
+        // The first extent starts at zero, as a whole device does, but
+        // its state is still its own.
+        let state = state_at(0, IMAGE_LEN, 512).expect("the first extent");
+        assert!(state.is_image_at(0, IMAGE_LEN));
+        assert!(!state.is_image_at(SECOND, IMAGE_LEN));
     }
 }
