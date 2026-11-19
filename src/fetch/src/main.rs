@@ -25,6 +25,16 @@
 //! stderr, and never an abort: the privileged side is waiting for an answer,
 //! and a crash turns a refusable request into a hang for it to time out.
 //!
+//! There is one shape it answers with silence, and it is a limit rather than
+//! a choice: a datagram too short to contain a request id. A reply is
+//! addressed by the id it carries back, so there is nothing to address, and
+//! inventing one would put an id on the wire that the peer never used --
+//! which a peer that had lost framing could match to a different request in
+//! flight and read as a refusal of that one. A client's read deadline is
+//! what covers this, and no correct client can produce the shape: the
+//! request header is fixed-size, so a short datagram means the peer is
+//! already not speaking the protocol.
+//!
 //! Nothing it says to the privileged side is text. Diagnostics go to stderr,
 //! one line each, where the parent can route them into its own log; the
 //! socket carries only numbers from a closed vocabulary, so nothing this
@@ -354,6 +364,9 @@ fn answer(
             match id {
                 Some(id) => return reply(socket, id, status, &[]),
                 None => {
+                    // Silence, deliberately: see the module header. An
+                    // invented id is worse than nothing, because the peer
+                    // may match it to a request that is really outstanding.
                     eprintln!(
                         "instar-fetch: the datagram is too short to carry a request id, so \
                          there is nothing to answer"

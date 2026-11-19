@@ -37,8 +37,9 @@ instar/
 ├── .devcontainer/  # Development containers (rust-lint)
 ├── src/            # Main instar implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
+│   ├── fetch/      # instar-fetch, the untrusted host-side byte server
 │   ├── core/       # Core guest initialization
-│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks, vdi, parallels, qcow1, dmg)
+│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks, vdi, parallels, qcow1, dmg) and fetch-protocol
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot, amend, bitmap, bench)
 │   └── build.sh    # Build script

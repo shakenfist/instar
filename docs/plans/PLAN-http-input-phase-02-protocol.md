@@ -568,6 +568,92 @@ happen.
     `src/vmm/src` names the new crate -- and cargo links only what a
     manifest declares, so the dependency tree cannot have changed.
 
+20. **The automated review's first round, 2026-11-19 (AEDT).** Four
+    `fix` items, one `document`, six `consider`, two informational.
+    All five of the first two were taken, four of the `consider` items
+    were taken because every one of them is a defect in code this phase
+    added rather than an observation about code that was already there,
+    and one was declined: removing the fetcher's per-request allocation
+    and its extra payload copy. The copy is deliberate and argued for
+    in the design, the figure it saves is invisible beside a network
+    round trip, and the serve loop is what phase 6 restructures to put
+    several requests in flight -- optimising it now would be optimising
+    code about to be rewritten.
+21. **The client's `read_at` did not match the contract it claimed,
+    and the correct fix was to change the client rather than the
+    claim.** `BackingStore::read_at` zero-pads a read past the end of
+    its file and never errors on one (`src/vmm/src/backing.rs`), and
+    the block device's capacity is the image's length rounded *up* to a
+    whole sector (`src/vmm/src/virtio/block.rs`, with the comment
+    saying exactly why), so the guest's last read of any image that is
+    not a sector multiple reaches past the file by design. The client
+    refused it. Nothing is wired up yet, so nothing was broken today,
+    but phase 3's first read of a ragged image would have failed. The
+    client now mirrors the local store: a read starting past the
+    capacity is zeros and no round trip, a read overhanging it fetches
+    what exists and zeros the rest.
+    The review also suggested treating a `ShortRead` status as a
+    zero-fill, and that part was declined. The local store's
+    `current_size` is read once at open, so a file that shrinks
+    underneath it fails with `UnexpectedEof` rather than reading as
+    zeros -- which is exactly what the client already does with
+    `ShortRead`. Zero-filling it would substitute zeros for image data
+    the guest then parses as truth, on the word of the untrusted side.
+22. **The glibc floor was a sixth place that enumerates what instar
+    ships, and the Makefile's packaging guards were a seventh.**
+    `tools/ci/check-glibc-floor.sh` defaults to the `instar` binary and
+    both call sites invoked it with no argument, so the fetcher would
+    have shipped in the `.deb`, the `.rpm` and the release tarball
+    without ever being checked against the published `GLIBC_2.31`
+    promise. Both call sites now check it too, in the same window
+    immediately after `make instar` that the existing comment explains.
+    Sweeping the class then found that `make deb` and `make rpm`
+    pre-flight-check for `instar` and `core.bin` but not for the
+    fetcher their own asset lists name, so a missing fetcher would have
+    surfaced as a cargo-deb asset error rather than the Makefile's own
+    sentence; both guards now name it.
+    The new check was then run both ways on this host, which measured
+    why the existing placement comment matters for the fetcher too.
+    The release-image `instar-fetch` needs at most `GLIBC_2.30` and
+    passes; the same path after `make test-rust` has run needs
+    `GLIBC_2.34` and fails, because the dev image relinks bin targets
+    into the same `src/target/release/`. So the fetcher's check belongs
+    in the same window as `instar`'s -- immediately after `make
+    instar` -- and would report the build image rather than the
+    release image anywhere later.
+23. **Three documented fuzz-target counts were left stale by step
+    2e.** `docs/testing.md` said "44 targets" in two places and
+    `docs/security-audits.md` said 44 in a third, while the tree has 45
+    and `check-fuzz-targets.sh` agrees with the tree. The counts are
+    corrected, and the target is now in `FAST_TIER` as well -- a
+    decoder of four fixed-size headers saturates in seconds and has no
+    business holding a deep-tier slice. Nothing checks the prose counts
+    against the tree, which is why they drifted; that gap is filed as
+    an issue rather than fixed here, because the guard's own test rig
+    builds a synthetic tree with no `docs/` in it.
+24. **Implementing the per-read deadline found a trap in
+    `set_recv_timeout` itself.** `SO_RCVTIMEO` takes a `timeval`, and
+    `{0, 0}` means *no* timeout to the kernel, so any timeout under a
+    microsecond -- including the `Duration::ZERO` a caller might pass
+    meaning "give up at once" -- silently removed the bound instead of
+    tightening it. It is refused now, and the deadline logic gives up a
+    millisecond early rather than relying on that boundary.
+25. **A fetcher that refuses at startup is seen as one of two errors,
+    and the test says so.** The new pipe test first asserted
+    `UnexpectedEof` and failed with `ConnectionReset`: whether the
+    client's `send` of the init request loses to the fetcher's exit
+    decides which. Both mean the same thing and a caller has to treat
+    them alike, so the test accepts either and records why.
+26. **One pre-existing test failed once on this host and passed on
+    re-run:** `socket::tests::a_datagram_of_the_derived_maximum_really_sends`,
+    with `ENOBUFS`. A 416 KiB datagram needs an order-7 skb allocation,
+    and `/proc/buddyinfo` showed no free order-7 block in the Normal
+    zone at the time. It is host memory fragmentation rather than a
+    defect, and it cannot reach a real exchange, where the negotiated
+    block is 64 KiB. Worth knowing before anyone raises
+    `DEFAULT_BLOCK_SIZE` in phase 6: the largest datagram the protocol
+    permits is not always allocatable.
+
 ## Mutation results
 
 Step 2d's tests are only worth their runtime if they fail when the thing
@@ -589,6 +675,20 @@ that uses a default-sized socket passing, because a 64 KiB proposal is
 inside the constant ceiling. Only a test that shrinks its own socket buffer
 and then watches where the negotiation lands can see it, which is why the
 small-buffer cases exist in both halves.
+
+Six more were run on the review round's changes, the same way, each on
+its own and each killed. `make test-rust` stops at the first failing
+package, so the fetch-protocol unit tests are what the log shows; the
+integration tests covering the same properties were not reached.
+
+| Mutation | The exact edit | Tests that failed |
+|---|---|---|
+| A peer's block size need not be a whole number of sectors | In `InitReply::accepted_block_size` (`wire.rs`), delete the `if self.block_size % BLOCK_SIZE_GRANULARITY != 0 { ... }` block | `wire::tests::a_misaligned_peer_block_size_is_refused`, `wire::tests::every_accepted_peer_block_size_is_sector_aligned` |
+| A refusal names a ceiling that was never applied | In the same function, change `let ceiling = ours.min(MAX_BLOCK_SIZE);` to `let ceiling = MAX_BLOCK_SIZE.max(ours);` | `wire::tests::a_refusal_names_the_ceiling_that_was_applied`, `wire::tests::a_greedy_peer_block_size_is_clamped_to_what_this_side_can_carry`, `wire::tests::every_accepted_peer_block_size_is_sector_aligned` |
+| A read starting past the capacity is refused instead of answered with zeros | In `FetchClient::read_at` (`client.rs`), replace the `buf.fill(0); return Ok(());` arm with the old `InvalidInput` refusal | `client::tests::a_read_wholly_past_the_source_asks_the_peer_for_nothing` |
+| The overhang of a read spanning the end is not zeros | In the same function, change `past_end.fill(0)` to `past_end.fill(1)` | `client::tests::a_read_overhanging_the_source_is_zero_filled_not_refused` |
+| The deadline covers one datagram rather than the read | In `FetchClient::fetch` (`client.rs`), change `Instant::now() + self.reply_timeout` to `Instant::now() + self.reply_timeout * 1000`, so every reply is inside its own bound and the read has none | `client::tests::the_deadline_bounds_the_whole_read_not_each_reply`, `client::tests::silent_peer_times_out` |
+| A receive timeout that rounds to zero is accepted | In `SeqPacketSocket::set_recv_timeout` (`socket.rs`), delete the `if timeout.as_micros() == 0 { ... }` guard | `socket::tests::a_timeout_that_would_round_to_no_timeout_is_refused` |
 
 ## Definition of done
 

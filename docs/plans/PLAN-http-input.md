@@ -570,7 +570,13 @@ indirection -- so "gains a second kind" means introducing the
 polymorphism as well as the remote implementation. And the VMM has
 never spawned a child process: the only `Command::new` under
 `src/vmm/src/` runs `qemu-img --version`, so there is no
-descriptor-passing, reaping or child signal handling to extend. This
+descriptor-passing, reaping or child signal handling to extend. Phase
+2's review round added a third thing this phase does not have to do:
+the fetch client's `read_at` zero-fills past the advertised capacity,
+exactly as the local store does past the end of its file, because a
+device's capacity is the image's length rounded up to a whole sector
+and the guest's last read of a ragged image legitimately overhangs it.
+The two are interchangeable there, so nothing above has to clamp. This
 phase should also fix #932, the virtqueue error the host cannot read
 that hangs the guest, because it multiplies the ways the host can
 fail to answer a request.

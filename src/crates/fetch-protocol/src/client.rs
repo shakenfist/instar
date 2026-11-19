@@ -4,7 +4,18 @@
 //! [`FetchClient::read_at`] has the same signature and the same contract as
 //! the VMM's local backing store -- fill the whole buffer or return an error
 //! -- so that the two can be used interchangeably by whatever sits above
-//! them.
+//! them. That contract includes what happens past the end of the source:
+//! the block device's capacity is the source's length rounded up to a whole
+//! sector, so the guest's last read legitimately reaches past it, and both
+//! stores answer the overhang with zeros rather than an error.
+//!
+//! # Time
+//!
+//! The bound on a read is a deadline for the whole call, not for each
+//! datagram. A read larger than the negotiated block is several round
+//! trips, and a peer that answered each one just inside a per-datagram
+//! timeout could hold the privileged process for as long as it liked while
+//! never tripping it.
 //!
 //! # Trust
 //!
@@ -31,22 +42,29 @@
 //! | `BadRequest`  | `InvalidInput`   | the peer rejected a request this side built |
 //! | `Unsupported` | `Unsupported`    | the peer does not implement what was asked |
 //! | `OutOfRange`  | `InvalidInput`   | the range lies outside the capacity        |
-//! | `ShortRead`   | `UnexpectedEof`  | the source ended before the range did      |
+//! | `ShortRead`   | `UnexpectedEof`  | the source ended inside the advertised range |
 //! | `IoError`     | `Other`          | reading the source failed                  |
 //!
 //! A reply that cannot be decoded, names an unknown status or id, or carries
 //! the wrong amount of payload is `InvalidData`.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::socket::SeqPacketSocket;
 use crate::wire::{
     InitReply, InitRequest, ReadReply, ReadRequest, Status, INIT_REPLY_LEN, READ_REPLY_LEN,
 };
 
-/// How long a reply may take before the client gives up on the peer.
+/// How long a whole read may take before the client gives up on the peer.
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The least time left on a read's deadline that is worth a round trip.
+///
+/// `SO_RCVTIMEO` is a `timeval`, so anything under a microsecond rounds to
+/// zero, which the kernel reads as no timeout at all. Giving up a
+/// millisecond early is cheaper than reasoning about that boundary.
+const MIN_REPLY_WINDOW: Duration = Duration::from_millis(1);
 
 /// The error kind and sentence for a status that is not [`Status::Ok`].
 ///
@@ -86,6 +104,8 @@ pub struct FetchClient {
     block_size: u32,
     capacity: u64,
     next_id: u64,
+    /// How long one call to [`FetchClient::read_at`] may take in total.
+    reply_timeout: Duration,
     /// Reused for every reply: a header plus at most one block.
     recv_buf: Vec<u8>,
     /// Set once an exchange has failed, after which this client is done.
@@ -134,6 +154,7 @@ impl FetchClient {
             block_size,
             capacity: reply.capacity,
             next_id: 1,
+            reply_timeout: DEFAULT_REPLY_TIMEOUT,
             failed: false,
             recv_buf: vec![0u8; buf_len],
         })
@@ -149,18 +170,30 @@ impl FetchClient {
         self.capacity
     }
 
-    /// Change how long a reply may take before the read fails.
-    pub fn set_reply_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.socket.set_recv_timeout(timeout)
+    /// Change how long a whole [`FetchClient::read_at`] may take.
+    ///
+    /// The timeout bounds the call rather than each datagram, so a read that
+    /// splits into several round trips gets this long for all of them
+    /// together.
+    pub fn set_reply_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        self.socket.set_recv_timeout(timeout)?;
+        self.reply_timeout = timeout;
+        Ok(())
     }
 
     /// Fill `buf` with the bytes at `offset`, or return an error.
     ///
     /// A read larger than the negotiated block is split into several
-    /// requests, one in flight at a time. A range reaching past the
-    /// advertised capacity is refused without asking the peer. On error the
-    /// contents of `buf` are unspecified, but no byte from a failed reply is
-    /// ever written to it.
+    /// requests, one in flight at a time, and the whole call shares one
+    /// deadline. On error the contents of `buf` are unspecified, but no byte
+    /// from a failed reply is ever written to it.
+    ///
+    /// Bytes past the advertised capacity are zeros, and are never asked of
+    /// the peer. This is the local backing store's behaviour and the reason
+    /// is the same: a block device's capacity is its source's length rounded
+    /// up to a whole sector, so a guest reading the last sector of a source
+    /// that is not a sector multiple is reading past the end of it legally.
+    /// The zeros are this side's, not the peer's.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let len = u64::try_from(buf.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "read length too large"))?;
@@ -170,27 +203,53 @@ impl FetchClient {
                 format!("read of {len} bytes at offset {offset} overflows a 64-bit offset"),
             )
         })?;
+
         if end > self.capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "read of {len} bytes at offset {offset} extends past the fetcher's \
-                     capacity of {} bytes",
-                    self.capacity
-                ),
-            ));
+            if offset >= self.capacity {
+                // Entirely past the source: all zeros, and no round trip.
+                buf.fill(0);
+                return Ok(());
+            }
+            // Partly past it: fetch what the source has, zero the overhang.
+            // The subtraction is below `len`, so the cast cannot truncate.
+            let present = (self.capacity - offset) as usize;
+            let (wanted, past_end) = buf.split_at_mut(present);
+            self.fetch(offset, wanted)?;
+            past_end.fill(0);
+            return Ok(());
         }
 
+        self.fetch(offset, buf)
+    }
+
+    /// Fetch a range that lies wholly inside the advertised capacity.
+    fn fetch(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        // One deadline for the whole call. A per-datagram bound would let a
+        // peer answer each block just inside it and still hold this process
+        // for as long as the read has blocks.
+        let deadline = Instant::now() + self.reply_timeout;
         let mut position = offset;
         for chunk in buf.chunks_mut(self.block_size as usize) {
-            self.read_block(position, chunk)?;
+            self.read_block(deadline, position, chunk)?;
             position += chunk.len() as u64;
         }
         Ok(())
     }
 
+    /// The error for a read whose deadline ran out at `offset`.
+    fn timed_out(&self, offset: u64) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the fetcher did not finish this read within {:?}; it was still \
+                 answering at offset {offset}",
+                self.reply_timeout
+            ),
+        )
+    }
+
     /// One request and its reply, for at most one block.
-    fn read_block(&mut self, offset: u64, chunk: &mut [u8]) -> io::Result<()> {
+    fn read_block(&mut self, deadline: Instant, offset: u64, chunk: &mut [u8]) -> io::Result<()> {
         if self.failed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -200,6 +259,12 @@ impl FetchClient {
         // Anything that returns early from here on leaves an answer owed on
         // the socket, so every path out but the last one ends the client.
         self.failed = true;
+        // What is left of the read's deadline is what this block gets.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < MIN_REPLY_WINDOW {
+            return Err(self.timed_out(offset));
+        }
+        self.socket.set_recv_timeout(remaining)?;
         // chunks_mut of a block-sized slice cannot exceed the block, which
         // is a u32, so this conversion cannot fail.
         let length = u32::try_from(chunk.len())
@@ -209,7 +274,19 @@ impl FetchClient {
         self.socket
             .send(&ReadRequest::new(id, offset, length).encode())?;
 
-        let got = recv_nonempty(&self.socket, &mut self.recv_buf, "read reply")?;
+        let got = match recv_nonempty(&self.socket, &mut self.recv_buf, "read reply") {
+            Ok(got) => got,
+            // The kernel reports an expired `SO_RCVTIMEO` as `EAGAIN`, which
+            // renders as "resource temporarily unavailable" and names
+            // neither the peer nor the deadline it missed.
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(self.timed_out(offset));
+            }
+            Err(err) => return Err(err),
+        };
         let (header, payload) = ReadReply::decode(&self.recv_buf[..got], self.block_size)?;
         if header.id != id {
             return Err(io::Error::new(
@@ -321,7 +398,7 @@ mod tests {
         F: FnOnce(&SeqPacketSocket) + Send + 'static,
     {
         let (client, handle) = spawn_peer(good_init(), script)?;
-        let client = client?;
+        let mut client = client?;
         client.set_reply_timeout(Duration::from_secs(10))?;
         Ok((client, handle))
     }
@@ -403,18 +480,95 @@ mod tests {
     }
 
     #[test]
-    fn read_past_capacity_is_refused_locally() -> io::Result<()> {
+    fn a_read_overhanging_the_source_is_zero_filled_not_refused() -> io::Result<()> {
+        // What the local backing store does, and what the block device's
+        // rounded-up capacity makes the guest's last read look like.
+        let (mut client, handle) = client_for(serve_pattern)?;
+        let mut buf = [0xA5u8; 16];
+        client.read_at(CAPACITY - 8, &mut buf)?;
+        for (i, byte) in buf[..8].iter().enumerate() {
+            assert_eq!(*byte, pattern(CAPACITY - 8 + i as u64), "byte {i}");
+        }
+        assert_eq!(&buf[8..], &[0u8; 8], "the overhang is this side's zeros");
+        drop(client);
+        handle.join().expect("peer thread");
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_wholly_past_the_source_asks_the_peer_for_nothing() -> io::Result<()> {
+        // The peer fails the test if it is asked: zeros for bytes that do
+        // not exist are this side's to produce, and a request for them
+        // would be answered `OutOfRange` anyway.
+        let (mut client, handle) = client_for(|sock| {
+            let mut buf = [0u8; 64];
+            let len = sock.recv(&mut buf).expect("peer: recv");
+            assert_eq!(len, 0, "the client asked for bytes past the capacity");
+        })?;
+        let mut buf = [0xA5u8; 32];
+        client.read_at(CAPACITY, &mut buf)?;
+        assert_eq!(&buf[..], &[0u8; 32]);
+        let mut buf = [0xA5u8; 32];
+        client.read_at(CAPACITY + 4096, &mut buf)?;
+        assert_eq!(&buf[..], &[0u8; 32]);
+        drop(client);
+        handle.join().expect("peer thread");
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_that_overflows_the_offset_space_is_refused() -> io::Result<()> {
         let (mut client, handle) = client_for(serve_pattern)?;
         let mut buf = [0u8; 16];
-        let err = client
-            .read_at(CAPACITY - 8, &mut buf)
-            .expect_err("past end");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let err = client
             .read_at(u64::MAX - 4, &mut buf)
             .expect_err("overflow");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("overflows"), "{err}");
+        drop(client);
+        handle.join().expect("peer thread");
+        Ok(())
+    }
+
+    #[test]
+    fn the_deadline_bounds_the_whole_read_not_each_reply() -> io::Result<()> {
+        // Every reply arrives well inside the timeout; together they do not.
+        // A per-datagram bound passes this and a per-read bound fails it,
+        // which is the whole difference being tested.
+        let (client, handle) = spawn_peer(good_init(), |sock| {
+            let mut buf = [0u8; 64];
+            while let Ok(len) = sock.recv(&mut buf) {
+                if len == 0 {
+                    return;
+                }
+                let Ok(req) = ReadRequest::decode(&buf[..len], BLOCK) else {
+                    return;
+                };
+                std::thread::sleep(Duration::from_millis(200));
+                let payload = vec![0u8; req.length as usize];
+                let reply = ReadReply::new(req.id, Status::Ok, req.length);
+                if sock
+                    .send(&reply.encode_datagram(&payload).expect("peer: encode"))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+        let mut client = client?;
+        client.set_reply_timeout(Duration::from_secs(1))?;
+        // Eight blocks at 200 ms each is 1.6 s of answers, none of which is
+        // itself late.
+        let mut buf = vec![0u8; 8 * BLOCK as usize];
+        let started = Instant::now();
+        let err = client.read_at(0, &mut buf).expect_err("deadline");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1600),
+            "gave up after {:?}, which is the whole read",
+            started.elapsed()
+        );
         drop(client);
         handle.join().expect("peer thread");
         Ok(())

@@ -208,7 +208,18 @@ impl SeqPacketSocket {
     ///
     /// A privileged process that waits forever on an untrusted peer is a
     /// hang, so the side that can afford to time out should.
+    ///
+    /// A timeout under a microsecond is refused rather than rounded. The
+    /// option is a `timeval`, and `{0, 0}` means *no* timeout to the kernel,
+    /// so rounding down would quietly remove the bound a caller was asking
+    /// to tighten -- the one failure this setting exists to prevent.
     pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        if timeout.as_micros() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a receive timeout below one microsecond would mean no timeout at all",
+            ));
+        }
         let timeval = libc::timeval {
             tv_sec: libc::time_t::try_from(timeout.as_secs())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timeout too large"))?,
@@ -500,6 +511,23 @@ mod tests {
             ),
             "unexpected kind: {err:?}"
         );
+    }
+
+    #[test]
+    fn a_timeout_that_would_round_to_no_timeout_is_refused() {
+        // `{0, 0}` means wait forever, so accepting these would turn the
+        // tightest possible bound into none at all.
+        let (a, _b) = SeqPacketSocket::pair().expect("socketpair");
+        for timeout in [Duration::ZERO, Duration::from_nanos(999)] {
+            let err = a.set_recv_timeout(timeout).expect_err("refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        }
+        // One microsecond is representable, so it is accepted and the
+        // socket really does stop waiting.
+        a.set_recv_timeout(Duration::from_micros(1))
+            .expect("one microsecond");
+        let mut buf = [0u8; 64];
+        assert!(a.recv(&mut buf).is_err(), "a 1 us timeout should expire");
     }
     /// The buffer each side asks for has to be able to carry the largest
     /// block the protocol permits.

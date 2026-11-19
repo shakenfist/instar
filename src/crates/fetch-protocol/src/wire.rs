@@ -253,6 +253,26 @@ pub enum ProtocolError {
         /// The largest datagram the smaller side can manage.
         max_datagram: u32,
     },
+    /// The peer proposed a block smaller than [`MIN_BLOCK_SIZE`].
+    ///
+    /// Distinct from [`Self::BlockSizeUnusable`], which is a socket buffer
+    /// too small to carry the minimum: here the buffers are irrelevant and
+    /// the peer simply named a figure below the floor.
+    BlockSizeTooSmall {
+        /// The block size the peer proposed.
+        block_size: u32,
+    },
+    /// The peer proposed a block that is not a whole number of sectors.
+    ///
+    /// The negotiation rounds its own answer down to
+    /// [`BLOCK_SIZE_GRANULARITY`] so that a split read stays sector
+    /// aligned. A peer's proposal has to satisfy the same rule to be
+    /// accepted, because the alignment is a property this side relies on
+    /// rather than one it can assume the peer honoured.
+    BlockSizeMisaligned {
+        /// The block size the peer proposed.
+        block_size: u32,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -304,6 +324,16 @@ impl fmt::Display for ProtocolError {
                 f,
                 "a socket buffer allowing only {max_datagram}-byte datagrams cannot carry a \
                  {MIN_BLOCK_SIZE}-byte block"
+            ),
+            Self::BlockSizeTooSmall { block_size } => write!(
+                f,
+                "the peer proposed a {block_size}-byte block, below the \
+                 {MIN_BLOCK_SIZE}-byte minimum"
+            ),
+            Self::BlockSizeMisaligned { block_size } => write!(
+                f,
+                "the peer proposed a {block_size}-byte block, which is not a multiple of \
+                 {BLOCK_SIZE_GRANULARITY}"
             ),
         }
     }
@@ -554,26 +584,36 @@ impl InitReply {
     /// `our_max_datagram` is the largest datagram this side's own socket can
     /// manage, read back from the kernel. A fetcher proposing more than that
     /// is refused rather than trusted, because the datagram it implies would
-    /// arrive truncated or not at all; a proposal below [`MIN_BLOCK_SIZE`] or
-    /// above [`MAX_BLOCK_SIZE`] is refused for the same reason the
-    /// negotiation would not have produced one.
+    /// arrive truncated or not at all. A proposal below [`MIN_BLOCK_SIZE`],
+    /// above [`MAX_BLOCK_SIZE`], or not a multiple of
+    /// [`BLOCK_SIZE_GRANULARITY`] is refused for the same reason the
+    /// negotiation would not have produced one: every property the
+    /// negotiation gives its own answer is required of the peer's, so that
+    /// accepting a proposal is not a way to lose one.
     pub fn accepted_block_size(&self, our_max_datagram: u32) -> Result<u32, ProtocolError> {
         let ours = negotiate_block_size(our_max_datagram, our_max_datagram)?;
+        // One ceiling, so that the refusal names the limit that was
+        // actually applied. `ours` is already capped at the settled block
+        // size, which is at or below the protocol's own maximum, so a peer
+        // told "the maximum is 262144" would be told a figure no proposal
+        // is ever measured against.
+        let ceiling = ours.min(MAX_BLOCK_SIZE);
         if self.block_size < MIN_BLOCK_SIZE {
-            return Err(ProtocolError::BlockSizeUnusable {
-                max_datagram: self.block_size.saturating_add(READ_REPLY_LEN as u32),
+            return Err(ProtocolError::BlockSizeTooSmall {
+                block_size: self.block_size,
             });
         }
-        if self.block_size > MAX_BLOCK_SIZE {
-            return Err(ProtocolError::LengthTooLarge {
-                length: self.block_size,
-                max: MAX_BLOCK_SIZE,
+        // Checked rather than assumed: the alignment is what keeps a split
+        // read on sector boundaries, and the peer is the untrusted side.
+        if !self.block_size.is_multiple_of(BLOCK_SIZE_GRANULARITY) {
+            return Err(ProtocolError::BlockSizeMisaligned {
+                block_size: self.block_size,
             });
         }
-        if self.block_size > ours {
+        if self.block_size > ceiling {
             return Err(ProtocolError::LengthTooLarge {
                 length: self.block_size,
-                max: ours,
+                max: ceiling,
             });
         }
         Ok(self.block_size)
@@ -1266,15 +1306,40 @@ mod tests {
             })
         );
         // And a proposal past the protocol's own ceiling is refused whatever
-        // the socket would allow.
+        // the socket would allow. The figure reported is the one applied:
+        // this side's settled block size, not the protocol maximum, which
+        // no proposal is ever measured against.
         let reply = InitReply::new(Status::Ok, MAX_BLOCK_SIZE + 512, 1 << 30);
         assert_eq!(
             reply.accepted_block_size(u32::MAX),
             Err(ProtocolError::LengthTooLarge {
                 length: MAX_BLOCK_SIZE + 512,
-                max: MAX_BLOCK_SIZE
+                max: DEFAULT_BLOCK_SIZE
             })
         );
+    }
+
+    #[test]
+    fn a_refusal_names_the_ceiling_that_was_applied() {
+        // The sentence a maintainer debugs a version-skewed fetcher from
+        // has to carry the limit the proposal was measured against, so
+        // nothing here may name a bound that was not in force.
+        let reply = InitReply::new(Status::Ok, MAX_BLOCK_SIZE + 512, 1 << 30);
+        let err = reply.accepted_block_size(u32::MAX).expect_err("refused");
+        assert!(
+            err.to_string().contains(&DEFAULT_BLOCK_SIZE.to_string()),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains(&MAX_BLOCK_SIZE.to_string()),
+            "{err}"
+        );
+        // A small proposal is the peer naming a figure below the floor, so
+        // the sentence must not invent a socket buffer to blame.
+        let reply = InitReply::new(Status::Ok, MIN_BLOCK_SIZE - 1, 1 << 30);
+        let err = reply.accepted_block_size(212_960).expect_err("refused");
+        assert!(err.to_string().contains("511"), "{err}");
+        assert!(!err.to_string().contains("socket buffer"), "{err}");
     }
 
     #[test]
@@ -1286,10 +1351,48 @@ mod tests {
     #[test]
     fn a_peer_block_size_below_the_minimum_is_refused() {
         let reply = InitReply::new(Status::Ok, MIN_BLOCK_SIZE - 1, 1 << 30);
-        assert!(matches!(
+        assert_eq!(
             reply.accepted_block_size(212_960),
-            Err(ProtocolError::BlockSizeUnusable { .. })
-        ));
+            Err(ProtocolError::BlockSizeTooSmall {
+                block_size: MIN_BLOCK_SIZE - 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_misaligned_peer_block_size_is_refused() {
+        // Within the floor and the ceiling, and still refused: a block that
+        // is not a whole number of sectors would put every split read off
+        // its boundary, and the alignment is not the peer's to drop.
+        let reply = InitReply::new(Status::Ok, MIN_BLOCK_SIZE + 1, 1 << 30);
+        assert_eq!(
+            reply.accepted_block_size(212_960),
+            Err(ProtocolError::BlockSizeMisaligned {
+                block_size: MIN_BLOCK_SIZE + 1
+            })
+        );
+        // Including one close enough to the settled size to look right.
+        let reply = InitReply::new(Status::Ok, DEFAULT_BLOCK_SIZE - 1, 1 << 30);
+        assert_eq!(
+            reply.accepted_block_size(212_960),
+            Err(ProtocolError::BlockSizeMisaligned {
+                block_size: DEFAULT_BLOCK_SIZE - 1
+            })
+        );
+    }
+
+    #[test]
+    fn every_accepted_peer_block_size_is_sector_aligned() {
+        // The property the refusals exist to protect, over every proposal
+        // from the floor to past the ceiling.
+        for block_size in (0..=MAX_BLOCK_SIZE + 1024).step_by(509) {
+            let reply = InitReply::new(Status::Ok, block_size, 1 << 30);
+            if let Ok(accepted) = reply.accepted_block_size(212_960) {
+                assert_eq!(accepted % BLOCK_SIZE_GRANULARITY, 0, "{block_size}");
+                assert!(accepted >= MIN_BLOCK_SIZE, "{block_size}");
+                assert!(accepted <= DEFAULT_BLOCK_SIZE, "{block_size}");
+            }
+        }
     }
 
     #[test]

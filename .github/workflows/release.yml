@@ -155,8 +155,10 @@ jobs:
       # one place the floor is the shipped artifact rather than a CI
       # property. build-and-test checks the same thing, but a tag can be
       # cut from a commit that never went through it.
-      - name: Check the release binary's glibc floor
-        run: tools/ci/check-glibc-floor.sh
+      - name: Check the release binaries' glibc floor
+        run: |
+          tools/ci/check-glibc-floor.sh
+          tools/ci/check-glibc-floor.sh src/target/release/instar-fetch
 
       - name: Package tarball
         run: |

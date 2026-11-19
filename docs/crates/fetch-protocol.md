@@ -170,12 +170,21 @@ As a measured example: on the host this was developed on, a pair is granted
 more than the default block needs, so the negotiation settles on 65536. A
 socket deliberately shrunk to ask for only 4096 is granted 8192, which is an
 8160-byte ceiling and a 7680-byte block, and reads larger than that are split.
-The client accepts the fetcher's proposed block only if it is at least 512, at
-most the 262144 maximum, and no larger than what this side could carry
-itself.
+The client accepts the fetcher's proposed block only if it satisfies every
+rule the negotiation itself follows: at least 512, a multiple of 512, and no
+larger than what this side could carry -- which, being capped at the default
+block, is the figure a refusal names. The alignment is checked rather than
+assumed, because it is what keeps a split read on sector boundaries and the
+fetcher is the untrusted side: a peer proposing 513 would otherwise impose
+both a misaligned split and a round trip for every 513 bytes.
 
 A read larger than the negotiated block is split by the client into several
-requests.
+requests. **The timeout bounds the whole `read_at`, not each datagram.** A
+split read is several round trips, and a peer answering each one just inside
+a per-datagram timeout could hold the privileged process indefinitely
+without ever tripping it, which is the hang the partition exists to prevent.
+Each block is given what remains of the call's deadline, and a deadline that
+runs out is `TimedOut` naming the offset the peer stopped at.
 
 ## Framing
 
@@ -223,9 +232,15 @@ client.read_at(0, &mut buf)?;                    // fills buf or returns an erro
 ```
 
 `read_at` has the same signature and contract as the VMM's local backing
-store: fill the whole buffer or return an error. The client matches each reply
-to its request by id rather than assuming order, and a reply for an id it did
-not ask for is an error. The first failure ends the client, because the socket
+store: fill the whole buffer or return an error. That includes the end of the
+source. A block device's capacity is its image's length rounded up to a whole
+sector, so a guest reading the last sector of an image that is not a sector
+multiple legitimately reads past the end of the file; both stores answer the
+overhang with zeros, and the client produces those zeros itself rather than
+asking the fetcher for bytes it would refuse as `OutOfRange`. A read starting
+past the capacity is zeros and no round trip at all. The client matches each
+reply to its request by id rather than assuming order, and a reply for an id
+it did not ask for is an error. The first failure ends the client, because the socket
 cannot be resynchronised without knowing how many answers are outstanding.
 
 ### Fetcher side
@@ -239,7 +254,16 @@ fetcher takes no paths and opens nothing, so it can in principle be given no
 filesystem access at all. It is single-threaded, answers each read with
 `pread` on the file, and never panics on anything the peer sends: a malformed
 request is answered with a status, or noted on stderr. It exits 0 when the
-peer closes the socket, 2 for a usage error, and 1 for anything else.
+peer closes the socket, 2 for a usage error, and 1 for anything else --
+including a descriptor that is not a regular file, which is refused before
+the init reply rather than failing every request.
+
+One malformed shape is answered with silence: a datagram too short to carry a
+request id. A reply is addressed by the id it carries back, so there is
+nothing to address, and an invented id could be matched by a peer that had
+lost framing to a request that really is outstanding. The client's read
+deadline is what covers it, and no correct client can produce the shape,
+since the request header is fixed-size.
 
 ## Dependencies
 
@@ -263,8 +287,10 @@ point.
   implemented.
 - **Capacity is fixed at init.** There is no way to learn that the source
   changed size.
-- **Block size is capped at 256 KiB**, however much socket buffer the kernel
-  grants.
+- **Block size is capped at 64 KiB by the negotiation**, however much socket
+  buffer the kernel grants, and at 256 KiB by the wire format. Raising the
+  first is a change to one constant; raising the second is a change to the
+  protocol.
 
 ## Why Not NBD, and Why Not a Virtqueue
 

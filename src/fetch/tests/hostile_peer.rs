@@ -90,8 +90,8 @@ where
         // theirs is dropped here, so a client still waiting sees the close
         // rather than the timeout.
     });
-    let client = FetchClient::new(ours);
-    if let Ok(client) = &client {
+    let mut client = FetchClient::new(ours);
+    if let Ok(client) = &mut client {
         client.set_reply_timeout(REPLY_TIMEOUT).expect("timeout");
     }
     let peer = Peer {

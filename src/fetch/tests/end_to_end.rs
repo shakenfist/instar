@@ -34,14 +34,14 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fetch_protocol::{
     negotiate_block_size, FetchClient, SeqPacketSocket, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE,
 };
+use std::io::Write;
+use tempfile::NamedTempFile;
 
 /// Size of the file served.
 ///
@@ -95,43 +95,44 @@ impl Rng {
 
 /// A file of known pseudo-random bytes, removed when the test finishes.
 struct TempImage {
-    path: PathBuf,
+    // `NamedTempFile` creates with `O_EXCL` under a random name and removes
+    // the file when it is dropped. A predictable name in a shared temporary
+    // directory would let another user pre-create it as a symlink and have
+    // the test truncate whatever it pointed at.
+    file: NamedTempFile,
 }
 
 impl TempImage {
     fn new(len: usize) -> io::Result<Self> {
-        // The counter keeps concurrently-running tests in the same binary off
-        // each other's file, since cargo runs them on several threads.
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "instar-fetch-end-to-end-{}-{unique}.img",
-            std::process::id()
-        ));
         let mut rng = Rng(SEED);
         let mut bytes = vec![0u8; len];
         for byte in bytes.iter_mut() {
             *byte = (rng.next_u64() & 0xff) as u8;
         }
-        std::fs::write(&path, &bytes)?;
-        Ok(Self { path })
+        let mut file = NamedTempFile::new()?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        Ok(Self { file })
     }
 
     fn open(&self) -> io::Result<File> {
-        File::open(&self.path)
-    }
-}
-
-impl Drop for TempImage {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        File::open(self.file.path())
     }
 }
 
 /// The spawned fetcher, reaped when the test finishes.
 struct Fetcher {
     child: Child,
+}
+
+impl Fetcher {
+    /// Wait for the fetcher to exit and return its status.
+    ///
+    /// `Drop` still runs afterwards; killing and waiting on an already
+    /// reaped child fails harmlessly, and both results are discarded there.
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
 }
 
 impl Drop for Fetcher {
@@ -228,10 +229,19 @@ impl Rig {
         Self::with_socket_buffer(None)
     }
 
+    /// A rig serving a file of `len` bytes instead of the usual one.
+    fn with_image_len(len: usize) -> io::Result<Self> {
+        Self::build(None, len)
+    }
+
     /// A rig, optionally asking for `bytes` of socket buffer in both
     /// directions on this side of the pair before the negotiation runs.
     fn with_socket_buffer(bytes: Option<u32>) -> io::Result<Self> {
-        let image = TempImage::new(IMAGE_LEN)?;
+        Self::build(bytes, IMAGE_LEN)
+    }
+
+    fn build(bytes: Option<u32>, image_len: usize) -> io::Result<Self> {
+        let image = TempImage::new(image_len)?;
         let served = image.open()?;
         let oracle = image.open()?;
 
@@ -245,7 +255,7 @@ impl Rig {
         let fetcher = spawn_fetcher(theirs, &served)?;
         drop(served);
 
-        let client = FetchClient::new(ours)?;
+        let mut client = FetchClient::new(ours)?;
         client.set_reply_timeout(REPLY_TIMEOUT)?;
         Ok(Self {
             client,
@@ -299,7 +309,7 @@ fn the_advertised_capacity_is_the_size_of_the_file() -> io::Result<()> {
     // The file is served from an inherited descriptor and the fetcher takes
     // no path, so the capacity it found can only have come from that
     // descriptor.
-    assert!(rig.image.path.exists());
+    assert!(rig.image.file.path().exists());
     Ok(())
 }
 
@@ -383,26 +393,107 @@ fn a_few_hundred_seeded_offsets_and_lengths_match_pread() -> io::Result<()> {
     Ok(())
 }
 
+/// A read overhanging the end of the file is zeros, not an error.
+///
+/// This is the shape the guest's own reads have: the block device's capacity
+/// is the image's length rounded up to a whole sector, so the last sector of
+/// any image that is not a sector multiple reaches past the file. The local
+/// backing store zero-pads it, and a fetcher that refused it would fail
+/// every such image once the two are interchangeable.
 #[test]
-fn a_read_past_the_end_of_the_file_is_refused() -> io::Result<()> {
+fn a_read_overhanging_the_end_of_the_file_is_zero_filled() -> io::Result<()> {
     let mut rig = Rig::new()?;
-    let mut buf = [0u8; 64];
-    // The capacity came from the fetcher at init, so this is refused here
-    // rather than asked for: the privileged side does not send a request it
-    // already knows is outside what was offered.
+    // The last 64 KiB sector of this file, as the VMM would round it up.
+    let sector = 65536usize;
+    let last = (IMAGE_LEN / sector) * sector;
+    let present = IMAGE_LEN - last;
+    let mut served = vec![0xA5u8; sector];
+    rig.client.read_at(last as u64, &mut served)?;
+
+    let mut expected = vec![0x5Au8; present];
+    rig.oracle.read_exact_at(&mut expected, last as u64)?;
+    assert_eq!(&served[..present], &expected[..], "the bytes that exist");
+    assert!(
+        served[present..].iter().all(|byte| *byte == 0),
+        "the overhang is not zero filled"
+    );
+
+    // A read that begins past the end is all zeros too, and asks the fetcher
+    // for nothing: the request would be refused `OutOfRange` if it were sent.
+    let mut served = vec![0xA5u8; 4096];
+    rig.client.read_at(IMAGE_LEN as u64 + 4096, &mut served)?;
+    assert!(served.iter().all(|byte| *byte == 0));
+
+    // An offset that cannot be reached at all is still a refusal.
     let err = rig
         .client
-        .read_at(IMAGE_LEN as u64 - 8, &mut buf)
-        .expect_err("a read reaching past the end must fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("capacity"), "{err}");
-    // And a read entirely past the end, which is the same refusal.
-    let err = rig
-        .client
-        .read_at(IMAGE_LEN as u64 + 4096, &mut buf)
-        .expect_err("a read beyond the end must fail");
+        .read_at(u64::MAX - 4, &mut served)
+        .expect_err("an overflowing offset must fail");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     Ok(())
+}
+
+/// A source with no bytes at all still serves, and serves only zeros.
+///
+/// An empty file is a legal image file and a plausible mistake, and it is
+/// the one capacity where every read is entirely overhang.
+#[test]
+fn an_empty_file_serves_zeros_without_a_round_trip() -> io::Result<()> {
+    let mut rig = Rig::with_image_len(0)?;
+    assert_eq!(rig.client.capacity(), 0);
+    let mut served = vec![0xA5u8; 8192];
+    rig.client.read_at(0, &mut served)?;
+    assert!(served.iter().all(|byte| *byte == 0));
+    rig.client.read_at(1 << 40, &mut served)?;
+    assert!(served.iter().all(|byte| *byte == 0));
+    Ok(())
+}
+
+/// A descriptor that is not a regular file is refused before init.
+///
+/// A pipe has no size to advertise and cannot answer a positional read, so
+/// the fetcher refuses it outright rather than failing every request. This
+/// is a parent-side mistake, which makes it worth proving through the real
+/// binary: the exit status and the socket close are what the parent sees.
+#[test]
+fn a_pipe_is_refused_before_the_init_reply() -> io::Result<()> {
+    let (read_end, _write_end) = pipe_pair()?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+    let mut fetcher = spawn_fetcher(theirs, &read_end)?;
+
+    let err = FetchClient::new(ours).expect_err("a pipe has no capacity to serve");
+    // Which error depends on a race the parent cannot win either way: a
+    // fetcher that has already exited makes the client's `send` of the init
+    // request `ECONNRESET`, while one still exiting takes the datagram and
+    // the close turns the `recv` into end-of-stream. Both are the same fact
+    // -- the fetcher refused before saying anything -- and a caller reading
+    // this has to treat them alike.
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        ),
+        "unexpected kind: {err:?}"
+    );
+
+    let status = fetcher.wait()?;
+    assert_eq!(status.code(), Some(1), "{status}");
+    Ok(())
+}
+
+/// A pipe, as its read end and the write end that keeps it open.
+fn pipe_pair() -> io::Result<(File, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe fills the two-element array it is given, and the result
+    // is checked before either descriptor is used.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are fresh from pipe and owned here, so each
+    // has exactly one owner from this point on.
+    unsafe { Ok((File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
 }
 
 /// The block size has to follow what the kernel granted, not a constant.

@@ -19,5 +19,10 @@ publish = false
 fetch-protocol = { path = "../crates/fetch-protocol" }
 libc = "0.2"
 
+# Test-only, and not linked into the shipped binary: a temporary file with a
+# random name created `O_EXCL`, which the rest of the suite already uses.
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
