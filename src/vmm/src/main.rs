@@ -5435,9 +5435,40 @@ mod chain_member_disk_size_tests {
 
     #[test]
     fn other_formats_report_their_discovered_size() {
-        let image = member(ImageFormat::Qcow2, PathBuf::from("/nonexistent"), vec![]);
-        assert_eq!(chain_member_disk_size(&image, true), 7);
-        assert_eq!(chain_member_disk_size(&image, false), 7);
+        // The file is real and nothing like `actual_size` in length,
+        // and a data file sits beside it: only the format check can
+        // produce the discovered size from this. A member whose path
+        // did not exist would report it either way, because the
+        // descriptor's own stat would fail and fall back to exactly
+        // that -- so such a test passes whether the format is checked
+        // or not, and pins nothing.
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("top.data");
+        std::fs::write(&data, vec![0u8; 70000]).unwrap();
+        for format in [ImageFormat::Qcow2, ImageFormat::Raw, ImageFormat::Vmdk4] {
+            let top = dir.path().join("top.img");
+            std::fs::write(&top, vec![0u8; 50000]).unwrap();
+            let image = member(format, top, vec![(data.clone(), 1)]);
+            assert_eq!(chain_member_disk_size(&image, true), 7, "{format:?}");
+            assert_eq!(chain_member_disk_size(&image, false), 7, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_that_cannot_be_stat_counts_what_discovery_found() {
+        // The descriptor has been read by the time a chain is printed,
+        // so this is defensive -- but what it falls back to is the size
+        // discovery recorded for it, not nothing, or the extents would
+        // be reported without the descriptor they belong to.
+        let dir = TempDir::new().unwrap();
+        let extent = dir.path().join("f1.vmdk");
+        std::fs::write(&extent, vec![0u8; 1000]).unwrap();
+        let image = member(
+            ImageFormat::VmdkDescriptor,
+            dir.path().join("gone.vmdk"),
+            vec![(extent, 1)],
+        );
+        assert_eq!(chain_member_disk_size(&image, true), 7 + 1000);
     }
 }
 

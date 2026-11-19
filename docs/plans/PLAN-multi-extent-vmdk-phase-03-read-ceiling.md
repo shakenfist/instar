@@ -559,6 +559,66 @@ wart worth removing when something else touches that code.
 because the change is host-side. Raising the parser's extent bound did
 not move them either.
 
+**Step 3e fixed #927 at the printers, not in chain discovery**, and the
+reason is worth recording because the obvious route was the wrong one.
+`ChainImage::actual_size` is not only reported: the host writes it into
+the guest's device table (`src/vmm/src/main.rs`, the `dev_offset + 16`
+field). Folding the extents' allocation into it would therefore have
+changed guest-visible data on every path that attaches a descriptor,
+to fix a number that only two printers read. So the sum is computed
+where the chain is printed, from the extent paths
+`ChainImage::external_data_files` already carries, and
+`InfoDiskSizes::new` was refactored onto the same two helpers so that
+`info` and `info --chain` cannot drift apart. `discover_backing_chain`
+and its ten call sites are untouched.
+
+Parity, reproduced by the management session against the pinned
+qemu-img 10.2.0 rather than taken from the step's report:
+
+| Image | instar | qemu 10.2.0 | `--ignore-quirks` |
+|---|---|---|---|
+| `vmdk-split-sparse-33g.vmdk` | 5443584 | 5443584 | 5440690 |
+| `vmdk-multi-flat.vmdk` | 1576960 | 1576960 | 1573190 |
+| `vmdk-flat-with-parent.vmdk` | 1052672, 1052672 | 1052672, 1052672 | 1048944, 1048813 |
+
+The last row is the chain the issue was filed about, where instar
+reported 368 against qemu's 1052672, and it is the one that proves the
+fix reaches every member rather than only the top. qemu-img has no
+apparent-size flag, so the `--ignore-quirks` column is checked against
+measured file lengths instead: 368 + 1048576 for the child, 237 +
+1048576 for the parent.
+
+**Two surviving mutants were reclassified in review.** The step
+reported 8 of 10 killed and called one survivor an equivalent mutant
+and the other unreachable. Neither held. The guard that keeps this
+change away from non-VMDK members was tested with a member whose path
+did not exist, so the descriptor's own stat failed and the discovered
+size came back through the fallback -- the test passed whether the
+format was checked or not. The second survivor was reachable as a unit
+test all along, since the function is pure in its `ChainImage`. Both
+tests were strengthened and both mutants now die, the first naming a
+real file whose length is nothing like `actual_size` and a data file
+beside it, the second a descriptor whose own path cannot be stat'd.
+10 of 10, re-run at
+`.../scratchpad/review-3e/run-survivors.sh`.
+
+The general lesson, which is not specific to this step: a test that
+reaches a fallback cannot also pin the branch that chose it. A survivor
+called equivalent deserves the same scrutiny as a failure, because
+that label is how a real gap gets shipped.
+
+**Left as it stands, and stated so the next reader does not assume
+otherwise.** Non-VMDK chain members still report the allocation chain
+discovery found for them, and still ignore `--ignore-quirks`; they were
+not compared with qemu. That is the behaviour this phase inherited and
+it is out of scope here. The verbose debug paths in convert, compare
+and dd ask for block sizes, which only affects debug output.
+
+**The plan's 3e row cites `src/vmm/src/main.rs:3809`.** The site was at
+`:4128` by the time the step ran, having moved when step 3d rewrote the
+attachment code above it. The row is left as it was written, since it
+is the brief as given; the line to trust is this note.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs.
