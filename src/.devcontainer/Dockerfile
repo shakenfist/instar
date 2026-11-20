@@ -151,7 +151,7 @@ RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
         cargo-generate-rpm@"${CARGO_GENERATE_RPM_VERSION}"
 
 # renovate: datasource=crate depName=cargo-audit
-ARG CARGO_AUDIT_VERSION=0.22.2
+ARG CARGO_AUDIT_VERSION=0.23.0
 # Install cargo-audit for `make audit` (RUSTSEC advisory check
 # against the workspace dependency tree).
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
