@@ -3769,7 +3769,7 @@ fn execute_info_operation(
 
     // Run the vCPU loop
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 break;
             }
@@ -7098,7 +7098,7 @@ fn run_bench_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -10170,7 +10170,7 @@ fn run_resize_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -11154,7 +11154,7 @@ fn run_amend_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -11566,7 +11566,7 @@ fn run_bitmap_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -12008,7 +12008,7 @@ fn run_rebase_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -12405,7 +12405,7 @@ fn run_commit_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -12935,7 +12935,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let mut saw_info_result = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -13343,7 +13343,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let mut copy_completion: Option<bool> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -13928,7 +13928,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -14784,7 +14784,7 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -15459,6 +15459,36 @@ fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
     text
 }
 
+/// Enter the guest, and say what happened if entering it failed.
+///
+/// Every run loop enters the guest through here rather than calling
+/// `vcpu.run()` itself, because an interrupted `KVM_RUN` is how the I/O
+/// thread reports a failure it has no other way to report.
+///
+/// A virtqueue the host cannot read -- a malformed descriptor chain, or
+/// a descriptor naming an address outside guest memory -- leaves the
+/// device with no status byte it can trust, so nothing is written to
+/// the used ring and the guest's wait for that request never ends. The
+/// I/O thread cannot fail the run, so it records the failure and
+/// signals this thread out of `KVM_RUN`, which `kvm-ioctls` reports as
+/// an `EINTR`. The signal is only the delivery; the recorded message is
+/// the reason, and without it the run would hang until it was
+/// interrupted by hand (issue #932). This also makes the two
+/// queue-service paths agree: the vCPU-exit fallback propagated the
+/// same error and always did fail the run.
+fn run_guest<'vcpu>(
+    vcpu: &'vcpu mut VcpuFd,
+    io_thread: &Option<io_thread::IoThread>,
+) -> Result<VcpuExit<'vcpu>, Box<dyn std::error::Error>> {
+    match vcpu.run() {
+        Ok(exit) => Ok(exit),
+        Err(e) => match io_thread.as_ref().and_then(|t| t.fatal_error()) {
+            Some(failure) => Err(failure.into()),
+            None => Err(e.into()),
+        },
+    }
+}
+
 /// Remove an output file a failed run left empty, if it is this run's
 /// to remove.
 ///
@@ -16089,7 +16119,7 @@ fn execute_convert(
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -17629,7 +17659,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -18039,7 +18069,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     let mut broken_pipe = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Map operation completed");
@@ -18756,7 +18786,7 @@ fn run_snapshot_list(
     let mut broken_pipe = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Snapshot operation completed");
@@ -19215,7 +19245,7 @@ fn run_snapshot_mutating_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -20548,7 +20578,7 @@ fn run_create_guest(
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Create operation completed (HLT)");

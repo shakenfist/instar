@@ -429,6 +429,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A virtqueue the host cannot read fails the run instead of hanging
+  it.** A malformed descriptor chain, or a descriptor naming an address
+  outside guest memory, leaves the device with no status byte it can
+  trust, so nothing reaches the used ring and the guest's wait for that
+  request never ends -- and since that wait became unbounded, the run
+  hung until it was interrupted by hand. The I/O thread now records the
+  failure and signals the vCPU out of `KVM_RUN`, and the run fails with
+  the recorded reason
+  ([#932](https://github.com/shakenfist/instar/issues/932)). The two
+  queue-service paths now agree: whether `IoEvent::register` had
+  succeeded used to decide whether such a failure hung the run or failed
+  it. Every way to reach this is an instar bug rather than anything a
+  hostile image can ask for, so no image behaves differently. See
+  `docs/guest-architecture.md`.
+
 - **A failed `convert`, `dd` or `copy` no longer leaves an empty output
   file behind.** instar creates its output before launching the guest,
   so a run the guest fails has already created the target; for most

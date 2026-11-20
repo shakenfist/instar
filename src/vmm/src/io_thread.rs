@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 use vm_memory::GuestMemoryMmap;
@@ -37,6 +37,138 @@ use vm_memory::GuestMemoryMmap;
 use crate::ioevent::IoEvent;
 use crate::stats::VmmStats;
 use crate::virtio::VirtioBlockDevice;
+
+/// The signal that takes the vCPU thread out of `KVM_RUN`.
+///
+/// `SIGUSR1` is what QEMU uses for the same job (its `SIG_IPI`). The
+/// handler does nothing: interrupting the ioctl is the whole point, and
+/// `KVM_RUN` returning `EINTR` is what the run loop needs to see.
+const KICK_SIGNAL: libc::c_int = libc::SIGUSR1;
+
+static KICK_HANDLER: Once = Once::new();
+
+/// Whether [`arm_kick_signal`] installed the handler.
+static KICK_ARMED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn kick_handler(_signum: libc::c_int) {}
+
+/// Install the kick handler, once per process; report whether kicking
+/// is now safe.
+///
+/// The default action for `SIGUSR1` is to terminate the process, so a
+/// kick sent before the handler is installed would kill the run instead
+/// of ending the wait. Nothing may kick until this has returned true.
+fn arm_kick_signal() -> bool {
+    KICK_HANDLER.call_once(|| {
+        // SAFETY: `action` is fully initialized before sigaction reads
+        // it, and sigaction is given a valid pointer to it and a null
+        // old-action pointer.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = kick_handler as *const () as libc::sighandler_t;
+            // No flags are needed. SA_RESTART is the one worth saying
+            // something about, and it would make no difference either
+            // way: KVM returns -EINTR from KVM_RUN when a signal is
+            // pending, rather than the ERESTARTSYS that asks the kernel
+            // to restart the call, so the ioctl always comes back to the
+            // run loop. (poll(2), which the test for this blocks in, is
+            // never restarted either, so no test can tell the flag's
+            // setting apart.)
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(KICK_SIGNAL, &action, std::ptr::null_mut()) == 0
+        };
+        KICK_ARMED.store(installed, Ordering::SeqCst);
+    });
+    KICK_ARMED.load(Ordering::SeqCst)
+}
+
+/// A failure the I/O thread has no other way to report.
+///
+/// `VirtioBlockDevice::process_queue` completes a request it cannot
+/// *service* with an error status, which the guest sees. A virtqueue it
+/// cannot *read* -- a malformed descriptor chain, or a descriptor naming
+/// an address outside guest memory -- is different: there is no status
+/// descriptor it can trust, so nothing is written to the used ring and
+/// the guest's wait for that request never ends. Since the guest's wait
+/// became unbounded that is a hang rather than a bogus timeout, and the
+/// I/O thread cannot fail the run by itself (issue #932).
+///
+/// So the failure is carried here instead. The I/O thread records it and
+/// kicks the vCPU out of `KVM_RUN`; the run loop sees the interrupt,
+/// finds the message and fails the run with it. That also makes the two
+/// queue-service paths agree, where before the behaviour depended on
+/// whether `IoEvent::register` had succeeded: the vCPU-exit fallback
+/// propagated the same error and did fail the run.
+///
+/// Every trigger is an instar bug rather than anything a hostile image
+/// can ask for -- the guest builds its own descriptor chains, and their
+/// addresses come from its own fixed DMA pool -- so this is about
+/// failing honestly rather than about defence.
+pub struct FatalIoError {
+    /// The first failure recorded. Later ones are dropped: the first is
+    /// the one that explains the run, and the queue may well fail again
+    /// in the same way before the vCPU gets out of `KVM_RUN`.
+    message: Mutex<Option<String>>,
+    /// The thread to kick, captured when the I/O thread is created,
+    /// which every operation does on the thread that then runs the vCPU.
+    vcpu_thread: libc::pthread_t,
+    /// Whether the kick signal has a handler, so sending it ends a wait
+    /// rather than killing the process.
+    kick_armed: bool,
+}
+
+impl FatalIoError {
+    /// Capture the calling thread as the one to kick.
+    fn for_this_thread() -> Self {
+        Self {
+            message: Mutex::new(None),
+            // SAFETY: pthread_self takes no arguments and cannot fail.
+            vcpu_thread: unsafe { libc::pthread_self() },
+            kick_armed: arm_kick_signal(),
+        }
+    }
+
+    /// Record a failure and kick the vCPU thread.
+    fn record(&self, message: String) {
+        if let Ok(mut slot) = self.message.lock() {
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        }
+        self.kick();
+    }
+
+    /// Take the vCPU out of `KVM_RUN`, if there is a failure to see.
+    ///
+    /// Sent repeatedly rather than once: a signal that arrives in the
+    /// moment before the vCPU enters `KVM_RUN` is simply lost, and the
+    /// guest would then spin on a request that will never complete. The
+    /// I/O loop calls this on every wake while a failure is recorded, so
+    /// the next one lands.
+    fn kick(&self) {
+        if !self.kick_armed {
+            return;
+        }
+        // SAFETY: `vcpu_thread` is the id of the thread that created
+        // this I/O thread, which outlives it: the run loop owns the
+        // `IoThread` and joins it before returning. The signal has a
+        // handler (`kick_armed`).
+        unsafe {
+            libc::pthread_kill(self.vcpu_thread, KICK_SIGNAL);
+        }
+    }
+
+    /// Whether a failure has been recorded.
+    fn is_set(&self) -> bool {
+        self.message.lock().map(|m| m.is_some()).unwrap_or(false)
+    }
+
+    /// The recorded failure, if any.
+    pub fn message(&self) -> Option<String> {
+        self.message.lock().ok().and_then(|m| m.clone())
+    }
+}
 
 /// Role of a virtio-block device in an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +210,7 @@ pub struct IoDevice {
 pub struct IoThread {
     handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    fatal: Arc<FatalIoError>,
 }
 
 /// Shared state for a virtio device that can be accessed from multiple threads.
@@ -99,14 +232,29 @@ impl IoThread {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
+        // Captured here, on the caller's thread, because every operation
+        // creates its I/O thread on the thread that then runs the vCPU.
+        let fatal = Arc::new(FatalIoError::for_this_thread());
+        let fatal_clone = Arc::clone(&fatal);
+
         let handle = thread::spawn(move || {
-            Self::io_loop(running_clone, devices, guest_mem, stats);
+            Self::io_loop(running_clone, devices, guest_mem, stats, fatal_clone);
         });
 
         Self {
             handle: Some(handle),
             running,
+            fatal,
         }
+    }
+
+    /// The failure the I/O thread could not report any other way.
+    ///
+    /// The run loop reads this when its vCPU comes out of `KVM_RUN`
+    /// without a reason of its own, which is how a recorded failure
+    /// reaches the user instead of hanging the run.
+    pub fn fatal_error(&self) -> Option<String> {
+        self.fatal.message()
     }
 
     /// The main I/O processing loop.
@@ -115,6 +263,7 @@ impl IoThread {
         devices: Vec<IoDevice>,
         guest_mem: Arc<GuestMemoryMmap>,
         stats: SharedStats,
+        fatal: Arc<FatalIoError>,
     ) {
         if devices.is_empty() {
             eprintln!("IoThread: no devices configured");
@@ -142,6 +291,16 @@ impl IoThread {
             vec![libc::epoll_event { events: 0, u64: 0 }; max_events];
 
         while running.load(Ordering::Acquire) {
+            // Keep kicking while a failure is recorded and the run loop
+            // has not acted on it yet. The vCPU may have been between
+            // two `KVM_RUN` entries when the first kick was sent, in
+            // which case the signal was lost and the guest is spinning
+            // on a request that will never complete; the next kick, one
+            // epoll timeout later, lands.
+            if fatal.is_set() {
+                fatal.kick();
+            }
+
             // Wait for events with a timeout (so we can check `running`)
             // SAFETY: epoll_fd is a valid epoll FD from epoll_create1().
             // events has capacity for max_events epoll_event structs.
@@ -191,17 +350,15 @@ impl IoThread {
                             // the device could not read: a malformed
                             // descriptor chain or an unmapped guest
                             // address. Nothing was written to the used
-                            // ring, so the guest's wait for this
-                            // request will not end, and this thread
-                            // cannot fail the run. Say so on stderr --
-                            // as the epoll failures above do -- rather
-                            // than let the run look like a stall with no
-                            // cause.
+                            // ring, so the guest's wait for this request
+                            // will not end on its own. Hand the failure
+                            // to the run loop, which is the only place
+                            // that can fail the run, and take the vCPU
+                            // out of `KVM_RUN` so it gets there.
                             Err(e) => {
-                                eprintln!(
-                                    "IoThread: device {dev_idx} could not process its \
-                                     virtqueue: {e}"
-                                );
+                                fatal.record(format!(
+                                    "the host could not read device {dev_idx}'s virtqueue: {e}"
+                                ));
                             }
                         }
                     }
@@ -262,5 +419,96 @@ impl IoThread {
 impl Drop for IoThread {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The first failure is the one that explains the run. The queue may
+    /// fail again in the same way before the vCPU is out of `KVM_RUN`,
+    /// and those later failures must not overwrite it.
+    #[test]
+    fn only_the_first_failure_is_kept() {
+        let fatal = FatalIoError::for_this_thread();
+        assert!(!fatal.is_set());
+        assert!(fatal.message().is_none());
+
+        fatal.record("the host could not read device 0's virtqueue".to_string());
+        fatal.record("a second, later failure".to_string());
+
+        assert!(fatal.is_set());
+        assert_eq!(
+            fatal.message().as_deref(),
+            Some("the host could not read device 0's virtqueue")
+        );
+    }
+
+    /// Recording a failure must take the recorded thread out of the
+    /// syscall it is blocked in -- which for the real vCPU thread is
+    /// `KVM_RUN`, and here is a `poll` with nothing to report.
+    ///
+    /// Without the kick the guest spins on a request that will never
+    /// complete and the run hangs, which is the whole of issue #932, so
+    /// this asserts the interruption rather than only the bookkeeping.
+    /// The wait is bounded so a kick that stops working fails the test
+    /// instead of hanging the suite.
+    #[test]
+    fn recording_a_failure_interrupts_the_waiting_thread() {
+        let fatal = Arc::new(FatalIoError::for_this_thread());
+        assert!(
+            fatal.kick_armed,
+            "the kick signal has no handler, so sending it would kill the \
+             process rather than end a wait"
+        );
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe is given a pointer to two writable ints.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let recorder = {
+            let fatal = Arc::clone(&fatal);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                fatal.record("the host could not read the virtqueue".to_string());
+            })
+        };
+
+        // Nothing is ever written to the pipe, so this poll can only end
+        // by being interrupted or by timing out.
+        let mut pollfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd, count 1, millisecond timeout.
+        let polled = unsafe { libc::poll(&mut pollfd, 1, 2_000) };
+        let errno = std::io::Error::last_os_error();
+
+        recorder.join().expect("recording thread panicked");
+        // SAFETY: both ends were opened by the pipe call above and are
+        // closed exactly once here.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        assert_eq!(
+            polled, -1,
+            "the wait ended with {polled} rather than being interrupted: a \
+             kick that no longer interrupts the vCPU leaves the guest \
+             spinning on a request that will never complete"
+        );
+        assert_eq!(
+            errno.kind(),
+            std::io::ErrorKind::Interrupted,
+            "the wait failed with {errno} rather than EINTR"
+        );
+        assert_eq!(
+            fatal.message().as_deref(),
+            Some("the host could not read the virtqueue")
+        );
     }
 }
