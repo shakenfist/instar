@@ -1836,15 +1836,14 @@ rust_case 'qcow2-data-device-read-by-a-subcluster-descent' "${QCOW2_LIB}" \
     qcow2 'sc_issue_792_unallocated_subcluster_runs_descend_past_the_data_device' \
     --features "${QCOW2_FEATURES}"
 
-# The extent walk back to its old bound, the end of the device array:
-# a read past a descriptor's last extent takes the next device -- under
-# `compare`, the other input's top image -- as one more extent.
+# The extent walk back to its old bound, the whole extent table rather
+# than the device's own run of it: a read past a descriptor's last
+# extent takes the entry after it -- under `compare`, the first extent
+# of the other input's descriptor -- as one more extent of this one.
 rust_case 'vmdk-descriptor-extent-walk-unbounded' "${QCOW2_LIB}" \
-    '                while (d as usize) < chain_config.device_count as usize
-                    && chain_config.devices[d as usize].is_data_device()
-                {' \
-    '                while (d as usize) < chain_config.device_count as usize // MUTATED
-                {' \
+    '    let extents = chain_config.device_extents(dev_idx);' \
+    '    let extents = &chain_config.extents // MUTATED
+        [..(chain_config.extent_count as usize).min(shared::MAX_CHAIN_EXTENTS)];' \
     qcow2 'vmdk_descriptor_extent_walk_stops_at_its_last_extent' \
     --features "${QCOW2_FEATURES}"
 
@@ -1853,7 +1852,9 @@ rust_case 'vmdk-descriptor-extent-walk-unbounded' "${QCOW2_LIB}" \
 # qcow2 crate. Each named test holds a config that breaks only the
 # clause its case removes, so no clause can be deleted behind another.
 # The fourth narrows "the slot after the owner" to "any slot after the
-# owner", which is the looser reading of where a data device may sit.
+# owner", which is the looser reading of where a data device may sit,
+# and the last lets one owner claim a run of marked devices rather than
+# the single slot a qcow2's data file takes.
 SHARED_LIB='src/shared/src/lib.rs'
 
 rust_case 'chain-config-data-device-at-a-chain-top-accepted' "${SHARED_LIB}" \
@@ -1863,22 +1864,20 @@ rust_case 'chain-config-data-device-at-a-chain-top-accepted' "${SHARED_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-on-any-device-accepted' "${SHARED_LIB}" \
-    '                (false, ImageFormat::VmdkDescriptor) => true,
-                _ => return false,' \
-    '                (false, ImageFormat::VmdkDescriptor) => true,
-                _ => false, // MUTATED' \
+    '            if info.is_data_device() || !matches!(info.detected_format(), ImageFormat::Qcow2) {' \
+    '            if false { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-not-checked' "${SHARED_LIB}" \
-    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
+    '            if data != owner + 1 || data >= device_count || !devices[data].is_data_device() {' \
     '            if false { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-any-later-slot' "${SHARED_LIB}" \
-    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
-    '            if first <= owner || first >= device_count || !devices[first].is_data_device() { // MUTATED' \
+    '            if data != owner + 1 || data >= device_count || !devices[data].is_data_device() {' \
+    '            if data <= owner || data >= device_count || !devices[data].is_data_device() { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
     --features "${QCOW2_FEATURES}"
 
@@ -1889,8 +1888,12 @@ rust_case 'chain-config-unclaimed-data-device-accepted' "${SHARED_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-qcow2-claims-a-run' "${SHARED_LIB}" \
-    '                (false, ImageFormat::Qcow2) => false,' \
-    '                (false, ImageFormat::Qcow2) => true, // MUTATED' \
+    '            claimed[data] = true;' \
+    '            let mut d = data; // MUTATED
+            while d < device_count && devices[d].is_data_device() {
+                claimed[d] = true;
+                d += 1;
+            }' \
     qcow2 'init_chain_states_refuses_a_second_data_device_after_a_qcow2' \
     --features "${QCOW2_FEATURES}"
 

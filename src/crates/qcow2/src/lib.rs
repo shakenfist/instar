@@ -16011,8 +16011,10 @@ mod tests {
     #[test]
     fn init_chain_states_refuses_a_second_data_device_after_a_qcow2() {
         use ImageFormat::{Qcow2, Raw};
-        // A qcow2 has one data file. A marked device after it is claimed
-        // by nobody, unlike a descriptor's second extent.
+        // A qcow2 has one data file, so a second marked device after it
+        // is claimed by nobody. Nothing claims a run of them: a
+        // descriptor's extents share its own device and are named by
+        // the extent table.
         assert_data_device_layout_refused(
             &[owner(Qcow2, 1), data_dev(), data_dev()],
             &[(0, 3)],
