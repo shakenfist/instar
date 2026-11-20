@@ -141,6 +141,29 @@ so a 100-byte source converts to 512 bytes.
 describe a window of the source rather than the whole of it; see
 [dd.md](dd.md).
 
+## Malformed block tables
+
+`convert` refuses a VHD or VHDX block whose table entry names a byte
+range that is the image's own structure, rather than reading the
+image's metadata out as disk content. For VHD that is a BAT entry whose
+block overlaps a region the image declares, which at an entry of zero
+is the footer copy and the dynamic header:
+
+```
+convert: source block table names a block inside the image's own
+structure, at host offset 0 (0x0); the format is recognised, the image
+is malformed
+```
+
+Exit 1, and the output file is removed if nothing was written to it.
+The wording matches what `map` and `measure` say about the same image,
+so one image gets one answer whichever operation is asked, with the
+host offset added because only the chain reader knows it. qemu reads
+such a block out instead -- measured: `qemu-img convert` of a crafted
+fixture yields the image's own `cxsparse` header as payload -- so
+instar is deliberately stricter here. See `docs/map.md` for the walk
+side and `docs/format-internals.md` for the predicate they share.
+
 ## What a failed conversion leaves behind
 
 `convert` creates its output file before launching the guest, so a

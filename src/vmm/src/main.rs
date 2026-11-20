@@ -1009,12 +1009,41 @@ struct SerialDecoder {
     /// alike for the input chain and the output. `status` carries
     /// nothing for this marker and is not kept.
     last_io_failure: Option<(String, u64)>,
+    /// The host byte offset of a VHD block the reader refused because
+    /// its BAT entry places it on the image's own structure: an `error`
+    /// message whose `operation` is
+    /// `shared::VhdBlockPlacementRefusal::OPERATION` (issue #909). A
+    /// chain read has no result struct to carry the reason, so without
+    /// this the refusal reached the user as a read failure at an offset
+    /// with nothing said about the rule.
+    last_vhd_block_placement: Option<u64>,
     /// Whether `info` refused a VHD whose footer copy at offset 0 fails
     /// its checksum: an `error` message whose `operation` is
     /// `shared::VhdFooterChecksumRefusal::OPERATION` (issue #583). `info`
     /// sends no result for an image it will not read, so this is what
     /// [`info_without_a_result`] renders in place of the generic text.
     vhd_footer_checksum_refused: bool,
+}
+
+/// qemu's wording for a VHD whose footer copy at offset 0 fails its
+/// checksum, or `None` if that is not what the guest refused.
+///
+/// Every operation that reads a VHD can reach this refusal, because
+/// `VhdState::init` raises it, and every one of them should say the same
+/// thing: qemu-img prints `Could not open 'X': Incorrect header
+/// checksum` for `info`, `map`, `measure` and `convert` alike. Before
+/// this, only `info` and chain discovery said so, while `map` reported
+/// an unrecognised format and `measure` an unsupported one -- for an
+/// image whose format was recognised and then refused (issue #909).
+fn vhd_footer_checksum_error(decoder: &SerialDecoder, input: &str) -> Option<String> {
+    if !decoder.vhd_footer_checksum_refused {
+        return None;
+    }
+    let path = escape::terminal_safe_path(Path::new(input));
+    Some(format!(
+        "Could not open '{path}': Incorrect header checksum \
+         (the VHD footer copy at offset 0 does not match its checksum)"
+    ))
 }
 
 /// The error for an `info` run that ended without a result.
@@ -1024,15 +1053,8 @@ struct SerialDecoder {
 /// with generic text, and `instar info` itself printed nothing and
 /// exited 0. Both now fail, and name the reason when the guest gave one.
 fn info_without_a_result(decoder: &SerialDecoder, input: &str) -> String {
-    if decoder.vhd_footer_checksum_refused {
-        // qemu-img's wording: `Could not open 'X': Incorrect header checksum`.
-        format!(
-            "Could not open '{input}': Incorrect header checksum \
-             (the VHD footer copy at offset 0 does not match its checksum)"
-        )
-    } else {
-        "No info result received from guest".to_string()
-    }
+    vhd_footer_checksum_error(decoder, input)
+        .unwrap_or_else(|| "No info result received from guest".to_string())
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -1049,6 +1071,7 @@ impl SerialDecoder {
             last_data_file_entry: None,
             last_malformed_l2_entry: None,
             last_io_failure: None,
+            last_vhd_block_placement: None,
             vhd_footer_checksum_refused: false,
         }
     }
@@ -1078,6 +1101,32 @@ impl SerialDecoder {
             self.data_file_entry_error(op)
         } else {
             self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Whether the reader refused a VHD block for its placement.
+    fn vhd_block_placement_refused(&self) -> bool {
+        self.last_vhd_block_placement.is_some()
+    }
+
+    /// Format the terminal error for a read the reader refused because
+    /// a VHD BAT entry places its block on the image's own structure.
+    ///
+    /// The wording matches what `map` and `measure` say for the same
+    /// image, so one image gets one answer whichever operation is asked
+    /// -- and it adds the host offset, which only the chain reader
+    /// knows. qemu reads such a block out (measured: `qemu-img convert`
+    /// of a crafted fixture yields the image's own `cxsparse` header as
+    /// payload), so there is no qemu wording to match and instar is
+    /// deliberately stricter.
+    fn vhd_block_placement_refusal_error(&self, op: &str) -> String {
+        match self.last_vhd_block_placement {
+            Some(offset) => format!(
+                "{op}: source block table names a block inside the image's own \
+                 structure, at host offset {offset} ({offset:#x}); the format is \
+                 recognised, the image is malformed"
+            ),
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -1354,6 +1403,9 @@ impl SerialDecoder {
                     self.last_differencing_refusal = Some(err.status);
                 } else if err.operation == shared::VhdFooterChecksumRefusal::OPERATION {
                     self.vhd_footer_checksum_refused = true;
+                } else if err.operation == shared::VhdBlockPlacementRefusal::OPERATION {
+                    // `sector` is the refused block's host byte offset.
+                    self.last_vhd_block_placement = Some(err.sector);
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
@@ -1678,6 +1730,47 @@ mod guest_exception_tests {
         assert_eq!(decoder.last_malformed_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    /// The refusal reaches `map` and `measure` too, which have a result
+    /// code of their own to override, so the renderer is theirs as much
+    /// as `info`'s -- and it escapes the path it quotes, because the
+    /// name came off the command line and reaches a terminal.
+    #[test]
+    fn the_footer_checksum_refusal_renders_for_any_operation() {
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            super::vhd_footer_checksum_error(&decoder, "x.vhd"),
+            None,
+            "a run with no refusal captured must not claim a bad checksum"
+        );
+
+        let msg = guest_protocol::error_message(
+            shared::VhdFooterChecksumRefusal::OPERATION,
+            "input",
+            0,
+            0,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        for &b in &framed[..n] {
+            decoder.add_byte(b);
+        }
+
+        let text = super::vhd_footer_checksum_error(&decoder, "x.vhd")
+            .expect("a captured refusal renders");
+        assert!(
+            text.starts_with("Could not open 'x.vhd': Incorrect header checksum"),
+            "{text}"
+        );
+
+        let escaped = super::vhd_footer_checksum_error(&decoder, "a\x1b[2Jb.vhd")
+            .expect("a captured refusal renders");
+        assert!(
+            escaped.contains("a\\u{1b}[2Jb.vhd"),
+            "the quoted path reached the terminal unescaped: {escaped}"
+        );
     }
 
     #[test]
@@ -7217,6 +7310,14 @@ fn run_bench_guest(
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("bench").into());
     }
+    // Likewise a VHD block whose BAT entry places it on the image's own
+    // structure: refused inside the chain reader, which has no result
+    // struct to carry the reason either, so it travels by name.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(serial_decoder
+            .vhd_block_placement_refusal_error("bench")
+            .into());
+    }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
     }
@@ -12130,6 +12231,14 @@ fn run_rebase_guest(
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("rebase").into());
     }
+    // Likewise a VHD block whose BAT entry places it on the image's own
+    // structure: refused inside the chain reader, which has no result
+    // struct to carry the reason either, so it travels by name.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(serial_decoder
+            .vhd_block_placement_refusal_error("rebase")
+            .into());
+    }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
     }
@@ -14936,6 +15045,13 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
             serial_decoder.l2_entry_refusal_error("compare"),
         )));
     }
+    // And for a VHD block whose BAT entry places it on the image's own
+    // structure, which the chain reader refuses for the same reason.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(Box::new(CompareReadError(
+            serial_decoder.vhd_block_placement_refusal_error("compare"),
+        )));
+    }
 
     // Any other failure the guest flagged on its result.
     if let Some((flags, offset)) = compare_failure {
@@ -16280,6 +16396,18 @@ fn execute_convert(
                 "convert"
             };
             return Err(serial_decoder.l2_entry_refusal_error(op).into());
+        }
+        // Likewise a VHD block whose BAT entry places it on the image's
+        // own structure. Without this the refusal arrived as a read
+        // failure at an offset with nothing said about the rule, while
+        // `map` and `measure` named it for the same image (issue #909).
+        if serial_decoder.vhd_block_placement_refused() {
+            let op = if exec.window.is_some() {
+                "dd"
+            } else {
+                "convert"
+            };
+            return Err(serial_decoder.vhd_block_placement_refusal_error(op).into());
         }
         // Last: a request against one of the devices failed. The chain
         // reader raises this for a failed request and for a structural
@@ -17695,9 +17823,12 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // true but not the reason. The tail prints
                                 // the captured reason instead.
                                 // Likewise a corrupt qcow2 L2 entry refused
-                                // by the allocation scan.
+                                // by the allocation scan, and a VHD whose
+                                // footer copy fails its checksum, refused
+                                // before the scan.
                                 if serial_decoder.last_differencing_refusal.is_none()
                                     && !serial_decoder.l2_entry_refused()
+                                    && !serial_decoder.vhd_footer_checksum_refused
                                 {
                                     print_measure_result(
                                         &msg,
@@ -17811,6 +17942,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if measure_error != MEASURE_RESULT_ERROR_OK {
+        // A VHD refused for its footer checksum reports no usable code
+        // -- the scan never ran -- so the generic detail would say the
+        // format is unsupported. Prefer what qemu says about the image.
+        let source = args.input.as_deref().unwrap_or_default();
+        if let Some(refusal) = vhd_footer_checksum_error(&serial_decoder, source) {
+            return Err(refusal.into());
+        }
         return Err(format!("measure failed: {}", measure_error_detail(measure_error)).into());
     }
 
@@ -18201,6 +18339,14 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     // stay on stdout.
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("map").into());
+    }
+
+    // A VHD whose footer copy at offset 0 fails its checksum is refused
+    // before the walk starts, so the result carries only
+    // `ERROR_INVALID_SOURCE` -- "source format unrecognised", when the
+    // format was recognised and then refused. Prefer what qemu says.
+    if let Some(refusal) = vhd_footer_checksum_error(&serial_decoder, &args.input) {
+        return Err(refusal.into());
     }
 
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;

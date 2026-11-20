@@ -429,6 +429,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`map` and `measure` say why they refused a VHD.** Two VHD refusals
+  were correct and arrived with no reason in them. A BAT entry placing a
+  block on the image's own structure -- the footer copy and the dynamic
+  header, at an entry of zero -- was reported by `map` as `I/O failure
+  walking the source` and by `measure` as `source image is unsupported
+  format`, naming the two things that had not gone wrong: nothing failed
+  to read, and the format was understood well enough to find the
+  contradiction. Both now report a malformed block table, as they
+  already did for VHDX, and `convert`, `dd`, `compare`, `bench` and
+  `rebase` name the rule and the host offset instead of reporting a read
+  failure at an offset. A footer copy at offset 0 that fails its
+  checksum was refused as an unrecognised or unsupported format; the
+  reader now raises that refusal by name, so `info`, `map`, `measure`
+  and `convert` all print `Could not open 'X': Incorrect header
+  checksum`, which is what qemu-img prints for each of them
+  ([#909](https://github.com/shakenfist/instar/issues/909)). The
+  integration tests now assert the messages rather than the exit code
+  alone. See `docs/convert.md`, `docs/map.md`, `docs/measure.md` and
+  `docs/quirks.md`.
+
 - **A virtqueue the host cannot read fails the run instead of hanging
   it.** A malformed descriptor chain, or a descriptor naming an address
   outside guest memory, leaves the device with no status byte it can

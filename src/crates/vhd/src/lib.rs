@@ -1495,6 +1495,32 @@ pub struct VhdState {
     /// [`Self::block_overlaps_a_declared_region`].
     pub header_offset: u64,
     pub current_size: u64,
+    /// Set when a whole-BAT walk -- [`Self::scan_allocation`] or
+    /// [`Self::map_extents`] -- refused the image because an allocated
+    /// BAT entry places a block on the image's own structure: a byte
+    /// range overlapping a region the image itself declares, which at
+    /// an entry of zero is the footer copy and the dynamic header.
+    /// That is the condition [`Self::block_lookup`] refuses a single
+    /// read on, and the walks apply it too.
+    ///
+    /// Both walks answer every failure with `None`, and an I/O failure
+    /// and a malformed block table are not the same news for the user:
+    /// one is a bad device or a truncated file, the other is an image
+    /// whose own metadata contradicts itself. The flag is how a caller
+    /// tells them apart without either walk growing a second return
+    /// channel, so `map` and `measure` can report a malformed block
+    /// table instead of the "I/O failure" or "unsupported format" their
+    /// generic `None` paths render -- both of which send a user hunting
+    /// a problem that is not there (issue #909). The VHDX reader
+    /// carries the same flag for the same reason, and the two formats
+    /// answer alike.
+    ///
+    /// Only the two whole-BAT walks set it. [`Self::block_lookup`] and
+    /// [`Self::differencing_block_lookup`] refuse the same condition,
+    /// but their callers compose a chain read and report a read failure
+    /// with its own diagnosis, so nothing downstream of them would read
+    /// this.
+    pub block_table_malformed: bool,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
     pub bat_cache_buf: *mut u8,
@@ -1550,7 +1576,22 @@ impl VhdState {
         // no footer copy at 0 at all, and letting a bad copy fall through
         // to a sound trailing footer opens an image qemu will not touch,
         // with the two footers disagreeing about the disk's own geometry.
+        //
+        // The refusal is raised by name as well as returned, because
+        // `None` from here is indistinguishable from an unreadable or
+        // unrecognised image and every caller rendered it as one: `map`
+        // said "source format unrecognised" and `measure` "source image
+        // is unsupported format" for an image whose format was
+        // recognised and refused (issue #909). With the marker sent, the
+        // host says what qemu says. `info` raises the same marker from
+        // its own detection, which runs before this.
         if footer.is_none() && VhdFooter::has_cookie(&first_sector) {
+            (call_table.send_error)(
+                shared::VhdFooterChecksumRefusal::OPERATION_C.as_ptr(),
+                c"input".to_bytes_with_nul().as_ptr(),
+                0,
+                0,
+            );
             return None;
         }
 
@@ -1697,6 +1738,7 @@ impl VhdState {
             table_offset: dyn_header.table_offset,
             header_offset: footer.data_offset,
             current_size: footer.current_size,
+            block_table_malformed: false,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -1728,6 +1770,7 @@ impl VhdState {
             // protects.
             header_offset: 0,
             current_size: footer.current_size,
+            block_table_malformed: false,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -1870,6 +1913,16 @@ impl VhdState {
         let block_host_offset = (bat_entry as u64).checked_mul(512)?;
         let (extent_start, extent_len) = self.block_extent(block_host_offset);
         if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            // Raised by name as well as returned. A chain read has no
+            // result struct to carry a reason, so `None` alone reached
+            // the user as a read failure at an offset with nothing said
+            // about the rule that refused it (issue #909).
+            (call_table.send_error)(
+                shared::VhdBlockPlacementRefusal::OPERATION_C.as_ptr(),
+                c"input".to_bytes_with_nul().as_ptr(),
+                block_host_offset,
+                0,
+            );
             return None;
         }
         let data_start = block_host_offset.checked_add(self.block_data_offset as u64)?;
@@ -1954,6 +2007,13 @@ impl VhdState {
         let bitmap_host_offset = (bat_entry as u64).checked_mul(512)?;
         let (extent_start, extent_len) = self.block_extent(bitmap_host_offset);
         if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            // By name as well, as in `block_lookup` above.
+            (call_table.send_error)(
+                shared::VhdBlockPlacementRefusal::OPERATION_C.as_ptr(),
+                c"input".to_bytes_with_nul().as_ptr(),
+                bitmap_host_offset,
+                0,
+            );
             return None;
         }
         let data_start = bitmap_host_offset.checked_add(self.block_data_offset as u64)?;
@@ -2144,6 +2204,7 @@ impl VhdState {
                 let block_host_offset = (entry as u64).saturating_mul(512);
                 let (extent_start, extent_len) = self.block_extent(block_host_offset);
                 if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                    self.block_table_malformed = true;
                     return None;
                 }
                 allocated_blocks += 1;
@@ -2290,6 +2351,7 @@ impl VhdState {
                     let block_host_offset = (entry as u64).saturating_mul(512);
                     let (extent_start, extent_len) = self.block_extent(block_host_offset);
                     if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                        self.block_table_malformed = true;
                         return None;
                     }
                 }
@@ -5079,6 +5141,7 @@ mod tests {
             // dynamic header at 512, BAT at 1536.
             header_offset: 512,
             current_size: 4 * block_size as u64,
+            block_table_malformed: false,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),
             data_cached_sector: u64::MAX,

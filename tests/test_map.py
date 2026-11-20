@@ -1089,12 +1089,14 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
     footer copy and the payload on the dynamic header, and instar
     served the image's own structure to the guest as data (#662).
 
-    This covers the two whole-BAT walks rather than the chain reader:
-    with the guard on the reader alone, `map` would report a block
-    inside the dynamic header as data at that offset and `measure`
-    would count its bytes, while `convert` refused to read the same
-    block -- three answers to one question about one image, which is
-    the trap issue #634 recorded on the VHDX side.
+    This covers the two whole-BAT walks and the chain reader: with the
+    guard on the reader alone, `map` would report a block inside the
+    dynamic header as data at that offset and `measure` would count its
+    bytes, while `convert` refused to read the same block -- three
+    answers to one question about one image, which is the trap issue
+    #634 recorded on the VHDX side. All three now refuse it, and all
+    three say why (#909); the chain reader's message adds the host
+    offset, which only it knows.
 
     qemu reads such a block out (measured: `qemu-img convert` of this
     fixture yields the image's own `cxsparse` header as payload), so
@@ -1141,6 +1143,18 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
                 rc, 0,
                 f'map reported a block placed on the image\'s own metadata; '
                 f'stdout={stdout[:400]!r}')
+            # The exit code alone left the message unpinned, and the
+            # message was wrong: a refusal of the image's own metadata
+            # was rendered as "I/O failure walking the source", which
+            # sends the user looking at their disk (#909).
+            self.assertIn(
+                'block table names a block inside the image\'s own structure',
+                stderr,
+                f'map did not say why it refused the image; stderr={stderr!r}')
+            self.assertNotIn(
+                'I/O failure', stderr,
+                f'map blamed I/O for an image whose metadata contradicts '
+                f'itself; stderr={stderr!r}')
 
     def test_measure_refuses_a_block_on_the_images_own_metadata(self):
         self._require_qemu_tools()
@@ -1154,6 +1168,49 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
                 r.returncode, 0,
                 f'measure counted a block placed on the image\'s own '
                 f'metadata; stdout={r.stdout[:400]!r}')
+            self.assertIn(
+                'block table names a block inside the image\'s own structure',
+                r.stderr,
+                f'measure did not say why it refused the image; '
+                f'stderr={r.stderr!r}')
+            self.assertNotIn(
+                'unsupported format', r.stderr,
+                f'measure called a recognised format unsupported; '
+                f'stderr={r.stderr!r}')
+
+    def test_convert_says_why_it_refused_the_block(self):
+        """convert names the rule, not just the offset it stopped at.
+
+        The chain reader has no result struct to carry a reason, so the
+        refusal used to arrive as `convert: reading the input image,
+        placement.vhd, failed at offset 0 (0x0)` -- an I/O failure, for
+        an image that read fine and contradicts itself (#909).
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            image = self._crafted_vhd(td, 0)
+            out = Path(td) / 'out.raw'
+            instar = self.get_instar_binary()
+            r = subprocess.run(
+                [str(instar), 'convert', '-O', 'raw', str(image), str(out)],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(
+                r.returncode, 0,
+                f'convert read a block placed on the image\'s own metadata; '
+                f'stdout={r.stdout[:400]!r}')
+            self.assertIn(
+                'block table names a block inside the image\'s own structure',
+                r.stderr,
+                f'convert did not say why it refused the image; '
+                f'stderr={r.stderr!r}')
+            self.assertIn(
+                'host offset 0', r.stderr,
+                f'convert did not name the block it refused; '
+                f'stderr={r.stderr!r}')
+            self.assertNotIn(
+                'failed at offset', r.stderr,
+                f'convert still reports the refusal as a read failure; '
+                f'stderr={r.stderr!r}')
 
     def test_a_sound_dynamic_vhd_still_maps(self):
         """The control: an untouched image from the same builder maps.
@@ -1171,3 +1228,91 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
             self.assertEqual(
                 [(e['start'], e['length']) for e in data], [(0, 2 * 1024 * 1024)],
                 f'expected one 2 MiB data extent at 0; stdout={stdout[:400]!r}')
+
+
+class TestVhdFooterChecksumRefusal(TestMapSmoke):
+    """Every operation says what qemu says about a bad footer copy.
+
+    A dynamic VHD's footer copy at offset 0 is the authoritative one,
+    and qemu's vpc driver refuses the file outright when it does not
+    verify, for `info`, `map`, `measure` and `convert` alike:
+
+        qemu-img: Could not open 'X': Incorrect header checksum
+
+    instar's reader refuses the same image, but only `info` and chain
+    discovery said why. `map` reported "source format unrecognised" and
+    `measure` "source image is unsupported format" -- for an image whose
+    format was recognised and then refused, which sends the reader
+    looking for a format problem that is not there (#909).
+    """
+
+    # Where a VHD footer keeps its checksum, which is over the footer's
+    # own 512 bytes with this field zeroed.
+    CHECKSUM_OFFSET = 64
+
+    def _bad_checksum_vhd(self, tmpdir):
+        """A 4 MiB dynamic VHD whose footer copy fails its checksum."""
+        path = Path(tmpdir) / 'badsum.vhd'
+        r = subprocess.run(
+            ['qemu-img', 'create', '-q', '-f', 'vpc', str(path), '4M'],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f'qemu-img create failed: {r.stderr}')
+        data = bytearray(path.read_bytes())
+        data[self.CHECKSUM_OFFSET] ^= 0x01
+        path.write_bytes(bytes(data))
+        # qemu's own refusal is the oracle for the fixture: if qemu-img
+        # opens this file, the bit flip did not land on the checksum and
+        # the tests below would be measuring something else.
+        r = subprocess.run(
+            ['qemu-img', 'info', str(path)],
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(
+            r.returncode, 0,
+            'qemu-img opened the image this fixture means to corrupt')
+        self.assertIn('Incorrect header checksum', r.stderr,
+                      f'qemu refused the fixture for another reason: {r.stderr!r}')
+        return path
+
+    def test_map_names_the_checksum(self):
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            image = self._bad_checksum_vhd(td)
+            stdout, stderr, rc = self.run_instar_map(image)
+            self.assertNotEqual(rc, 0, f'map read a refused image: {stdout[:400]!r}')
+            self.assertIn('Incorrect header checksum', stderr,
+                          f'map did not say why it refused: {stderr!r}')
+            self.assertNotIn(
+                'format unrecognised', stderr,
+                f'map called a recognised format unrecognised: {stderr!r}')
+
+    def test_measure_names_the_checksum(self):
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            image = self._bad_checksum_vhd(td)
+            instar = self.get_instar_binary()
+            r = subprocess.run(
+                [str(instar), 'measure', '-O', 'raw', str(image)],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(
+                r.returncode, 0, f'measure sized a refused image: {r.stdout[:400]!r}')
+            self.assertIn('Incorrect header checksum', r.stderr,
+                          f'measure did not say why it refused: {r.stderr!r}')
+            self.assertNotIn(
+                'unsupported format', r.stderr,
+                f'measure called a recognised format unsupported: {r.stderr!r}')
+
+    def test_a_sound_dynamic_vhd_is_still_read(self):
+        """The control: the same builder's untouched image is read.
+
+        Without this, a reader that refused every dynamic VHD would pass
+        the two tests above.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'sound.vhd'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-q', '-f', 'vpc', str(path), '4M'],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, f'qemu-img create failed: {r.stderr}')
+            _stdout, stderr, rc = self.run_instar_map(path)
+            self.assertEqual(rc, 0, f'a sound dynamic VHD was refused: {stderr}')

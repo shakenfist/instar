@@ -492,8 +492,18 @@ unsafe fn detect_and_scan(
             // calculator reads.
             let unit = target_unit_size_for(config, state.current_size);
             let summary =
-                state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)?;
-            Some((summary, unit))
+                state.scan_allocation(call_table, sector_size, input_capacity, bytes_read);
+            // The BAT walk refuses an image whose allocated block lands
+            // on the image's own structure, which is the condition the
+            // chain readers refuse a read on. Say which failure it was,
+            // as the VHDX arm below does: the default
+            // `ERROR_INVALID_SIZE` tells the user their format is
+            // unsupported when it was understood well enough to have
+            // found the contradiction (issue #909).
+            if summary.is_none() && state.block_table_malformed {
+                *scan_error = MeasureResult::ERROR_MALFORMED_BLOCK_TABLE;
+            }
+            Some((summary?, unit))
         }
         ImageFormat::Vhdx => {
             let mut state = vhdx::VhdxState::init(

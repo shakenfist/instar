@@ -492,6 +492,15 @@ pub unsafe extern "C" fn _start() -> u64 {
                 &mut emit,
             ) {
                 Some(()) => MapResult::ERROR_OK,
+                // The walker answers every failure with `None`, so it
+                // reports which kind through the state it walked with,
+                // exactly as the VHDX arm below does. Without this a BAT
+                // entry placing a block on the image's own structure --
+                // the condition the chain readers refuse a read on -- is
+                // rendered as "I/O failure walking the source", which
+                // sends the user looking at their disk instead of at
+                // their image (issue #909).
+                None if state.block_table_malformed => MapResult::ERROR_MALFORMED_BLOCK_TABLE,
                 None => MapResult::ERROR_IO,
             };
             return finish(
