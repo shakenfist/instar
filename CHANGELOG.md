@@ -429,6 +429,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`instar copy` fails when a read or a write fails.** It used to
+  report success for a run that failed: every failure path in the
+  operation reported and returned, and the host inferred success from
+  the guest reaching HLT, which those paths reach too. An ordinary
+  `EIO` on the source therefore gave exit 0, nothing on stderr, and an
+  output file holding only the sectors copied before the failure. The
+  operation now sends a completion on every exit, the host requires a
+  successful one, and a failed host read is reported like `convert`'s:
+  `copy: reading the input image, source.raw, failed at offset 327680
+  (0x50000): Input/output error; the data was not copied`, at exit 1
+  ([#930](https://github.com/shakenfist/instar/issues/930)).
+
 - **A warning or an error the host logs now reaches stderr without
   `--verbose`.** The logger was installed only when `--verbose` was
   passed, so by default there was no logger at all and every record was

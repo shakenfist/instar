@@ -1221,8 +1221,11 @@ impl SerialDecoder {
         let offset = sector.saturating_mul(side.sector_size as u64);
 
         // `dd` and `convert` share this run loop and this renderer, and
-        // each has to say what it did not do.
-        let outcome = if op == "dd" {
+        // each has to say what it did not do. `copy` has its own run
+        // loop and the same thing to say as `dd`: it writes sectors
+        // through to the output without interpreting a format, so there
+        // is no image it could have failed to produce.
+        let outcome = if op == "dd" || op == "copy" {
             "the data was not copied"
         } else {
             "the image was not converted"
@@ -1797,6 +1800,25 @@ mod guest_exception_tests {
             msg,
             "convert: reading the input image, src.qcow2, failed at offset 2621440 \
              (0x280000); the image was not converted"
+        );
+    }
+
+    /// `copy` renders through the same formatter, and says what it did
+    /// not do in its own terms: it writes sectors through without
+    /// interpreting a format, so there is no image it failed to produce.
+    #[test]
+    fn io_failure_error_says_copy_did_not_copy_the_data() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("input".to_string(), 5120));
+        let msg = decoder.io_failure_error("copy", &io_failure_context(Some("Input/output error")));
+        assert_eq!(
+            msg,
+            "copy: reading the input image, src.qcow2, failed at offset 2621440 \
+             (0x280000): Input/output error; the data was not copied"
+        );
+        assert!(
+            !msg.contains("converted"),
+            "copy converts nothing, so it must not claim an image was not converted: {msg}"
         );
     }
 
@@ -13313,12 +13335,19 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
 
+    // The guest's verdict on the copy, which is the completion's success
+    // flag. `None` until a completion arrives, because an absent
+    // completion is a failure too: the operation sends one on every exit
+    // from `_start`, so nothing at all means the guest died before it
+    // could report.
+    let mut copy_completion: Option<bool> = None;
+
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
-                debug!("Copy operation completed successfully!");
+                debug!("Copy operation reached HLT");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
@@ -13326,6 +13355,13 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::Complete(comp)) =
+                                &msg.payload
+                            {
+                                if comp.operation == "copy" {
+                                    copy_completion = Some(comp.success);
+                                }
+                            }
                             debug!("{}", format_message(&msg));
                         }
                     }
@@ -13440,6 +13476,37 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+
+    // A copy is a success only if the guest said so. The operation sends
+    // a completion on every exit, carrying false for a failure, so
+    // anything other than a successful completion -- a failed one, or
+    // none at all -- is a failed run. This used to be inferred from the
+    // guest reaching HLT, which every failure path also does, so a
+    // failed read gave exit 0, nothing on stderr, and an output file
+    // holding only the sectors copied before it (issue #930). The guest
+    // reports a failed host read as `IoFailure` as well, so the message
+    // can name the image, the offset and the errno the way `convert`'s
+    // does; a failure the guest raised for its own reasons renders the
+    // generic text.
+    if copy_completion != Some(true) {
+        return Err(serial_decoder
+            .io_failure_error(
+                "copy",
+                &IoFailureContext {
+                    input: IoFailureSide {
+                        path: &args.input,
+                        sector_size: args.input_sector_size,
+                        reason: device_set.io_error_for(true),
+                    },
+                    output: IoFailureSide {
+                        path: &args.output,
+                        sector_size: args.output_sector_size,
+                        reason: device_set.io_error_for(false),
+                    },
+                },
+            )
+            .into());
     }
 
     Ok(())

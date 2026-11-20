@@ -3,6 +3,17 @@
 //! This operation reads sectors from the input virtio-block device
 //! and writes them to the output device, translating sector sizes
 //! as needed.
+//!
+//! Every exit from `_start` sends exactly one completion, and its
+//! success flag is the operation's verdict: the host requires one and
+//! fails the run when it is absent or false. A failure path that
+//! returned without sending one used to leave the host with nothing to
+//! distinguish it from a finished copy, so a failed read gave exit 0,
+//! no message, and an output file holding only the sectors written
+//! before it (issue #930). A host read failure additionally reports the
+//! shared [`shared::IoFailure`] marker, which is what lets the host
+//! name the image, the offset and the errno rather than print generic
+//! text.
 
 #![no_std]
 #![no_main]
@@ -61,10 +72,12 @@ pub unsafe extern "C" fn _start() -> u64 {
         && output_sector_size.is_power_of_two();
     if !input_ss_ok {
         (call_table.send_error)(b"copy\0".as_ptr(), b"input\0".as_ptr(), 0, 1);
+        (call_table.send_complete)(b"copy\0".as_ptr(), 0, false);
         return 0;
     }
     if !output_ss_ok {
         (call_table.send_error)(b"copy\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_complete)(b"copy\0".as_ptr(), 0, false);
         return 0;
     }
 
@@ -125,7 +138,13 @@ pub unsafe extern "C" fn _start() -> u64 {
                 buffer.as_mut_ptr(),
                 input_sector_size,
             ) {
-                (call_table.send_error)(b"copy\0".as_ptr(), b"input\0".as_ptr(), input_sector, 1);
+                (call_table.send_error)(
+                    shared::IoFailure::OPERATION_C.as_ptr(),
+                    b"input\0".as_ptr(),
+                    input_sector,
+                    0,
+                );
+                (call_table.send_complete)(b"copy\0".as_ptr(), bytes_copied, false);
                 return bytes_copied;
             }
 
@@ -162,11 +181,12 @@ pub unsafe extern "C" fn _start() -> u64 {
                     output_sector_size,
                 ) {
                     (call_table.send_error)(
-                        b"copy\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"output\0".as_ptr(),
                         output_sector,
-                        2,
+                        0,
                     );
+                    (call_table.send_complete)(b"copy\0".as_ptr(), bytes_copied, false);
                     return bytes_copied;
                 }
             }
@@ -216,11 +236,12 @@ pub unsafe extern "C" fn _start() -> u64 {
                     input_sector_size,
                 ) {
                     (call_table.send_error)(
-                        b"copy\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"input\0".as_ptr(),
                         input_sector,
-                        1,
+                        0,
                     );
+                    (call_table.send_complete)(b"copy\0".as_ptr(), bytes_copied, false);
                     return bytes_copied;
                 }
             }
@@ -245,7 +266,13 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Write one output sector
             if !(call_table.write_output_sector)(output_sector, buffer.as_ptr(), output_sector_size)
             {
-                (call_table.send_error)(b"copy\0".as_ptr(), b"output\0".as_ptr(), output_sector, 2);
+                (call_table.send_error)(
+                    shared::IoFailure::OPERATION_C.as_ptr(),
+                    b"output\0".as_ptr(),
+                    output_sector,
+                    0,
+                );
+                (call_table.send_complete)(b"copy\0".as_ptr(), bytes_copied, false);
                 return bytes_copied;
             }
 

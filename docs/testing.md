@@ -499,9 +499,9 @@ failure from the behavioural assertion -- a delayed conversion that
 exited non-zero, or a failed probe read that converted anyway -- is
 the defect these tests exist for, and re-running it is not.
 
-### Failed Host Read Tests (`test_luks_probe_read_failure.py`)
+### Failed Host Read Tests (`test_luks_probe_read_failure.py`, `test_copy_read_failure.py`)
 
-The sibling of the test above, and the same machinery pointed the
+The siblings of the test above, and the same machinery pointed the
 other way: `strace -e inject=read:error=EIO:when=N` fails one host
 read instead of delaying it. What it guards is `convert`'s choice
 between a LUKS container's two payload shapes, which it makes by
@@ -525,6 +525,17 @@ flat payload path re-reads the sector the probe read, and treats a
 failure there as fatal, so a hard error on every read of that offset
 is reported correctly and proves nothing. `when=N` failing exactly one
 invocation is what reproduces the transient failure the defect needed.
+
+`test_copy_read_failure.py` points the same injection at `copy`, whose
+defect was the whole verdict rather than one decision inside it: the
+host inferred success from the guest reaching HLT, which every failure
+path also reaches, so a failed read gave exit 0 and an output file
+holding only the sectors written before it. It needs no fixture -- the
+input is generated, since nothing about the test depends on a format --
+and it fails a read in the middle of the copy rather than the first
+one, so the half-written file the defect leaves behind is part of what
+is asserted. Its index is derived the same way, from a trace of the
+very copy it is about to inject into.
 
 ## Running Tests
 
@@ -3830,8 +3841,12 @@ and this section has never named all of them.
   first payload sector must fail the conversion rather than read as
   "no inner format" (`strace -e inject=read:error=EIO`); see "Failed
   Host Read Tests" above
+- `tests/test_copy_read_failure.py` - A failed read of the input must
+  fail `copy` rather than give exit 0 and a short output file
+  (`strace -e inject=read:error=EIO`); see "Failed Host Read Tests"
+  above
 - `tests/strace_injection.py` - The shared syscall-injection rig for
-  the two modules above: the capability probe, the per-thread index
+  the three modules above: the capability probe, the per-thread index
   derivation and the did-it-land parsers
 - `tests/test_bench.py` - Integration tests for the `instar bench`
   subcommand (62 tests): read/write request scheduling, host-side
