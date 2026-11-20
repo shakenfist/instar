@@ -141,6 +141,36 @@ so a 100-byte source converts to 512 bytes.
 describe a window of the source rather than the whole of it; see
 [dd.md](dd.md).
 
+## What a failed conversion leaves behind
+
+`convert` creates its output file before launching the guest, so a
+conversion the guest fails has already created the target. What is left
+there depends on how far the run got:
+
+| The run | The output file |
+|---|---|
+| wrote nothing | removed |
+| wrote some of the image | kept, holding what was written |
+| was given the target with `--no-create` | kept, whatever it holds |
+
+An output holding bytes is kept because `qemu-img convert` keeps its
+own, and those bytes are the only record of how far the run got. An
+empty one is removed because qemu-img never leaves one -- it diagnoses
+the failures that would produce it before creating the target at all --
+and because a file that holds nothing still tells a caller testing for
+the file's existence that the conversion ran.
+
+Under `--no-create` the target is an image the user supplied to be
+written into, which is never instar's to delete. The same applies to
+the `monolithicFlat` extent file, which is removed on the same terms as
+the descriptor.
+
+Two cases produce an output that is sized up front rather than grown as
+it is written, and such a file is never empty and so is always kept:
+`dd`, and `convert -S 0` or `--preallocation` on a raw target.
+
+`instar copy` follows the same rule.
+
 ## Differencing images
 
 A differencing VHD (footer disk type 4) or VHDX (`HasParent` set) stores

@@ -13473,6 +13473,13 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         vmm_stats.lock().expect("lock poisoned").display();
     }
 
+    // Whatever failed, an output file this run left empty is removed:
+    // `copy` always creates or truncates its output, so the file is
+    // always this run's to remove. See `remove_empty_output`.
+    if vm_error.is_some() || copy_completion != Some(true) {
+        remove_empty_output(Path::new(&args.output));
+    }
+
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
@@ -15452,6 +15459,38 @@ fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
     text
 }
 
+/// Remove an output file a failed run left empty, if it is this run's
+/// to remove.
+///
+/// Where qemu-img and instar can differ at all is in what a *failed*
+/// run leaves on disk, and the answer has two halves.
+///
+/// A partially written output stays. `qemu-img convert` keeps its own
+/// after "Invalid cluster entry found", and matching that is
+/// deliberate: the bytes are the only record of how far the run got,
+/// and a caller that wants them gone can remove the file itself. An
+/// instar that deleted them would be destroying data qemu-img keeps.
+///
+/// An *empty* output is removed. qemu-img never leaves one, because
+/// the failures that produce it -- a source it refuses, a geometry it
+/// will not write -- are diagnosed before it creates the target at
+/// all. instar creates the output before launching the guest, so the
+/// guest's refusals and a read that fails on the first sector leave a
+/// zero-length file behind. It holds nothing, so removing it loses
+/// nothing; leaving it behind gives a caller that tests for the
+/// file's existence a reason to believe the operation ran (issue
+/// #849).
+///
+/// A failure to remove it is not reported. The run has already failed
+/// and its own error is the one worth printing; a leftover empty file
+/// is not worth replacing that message with a second one about the
+/// cleanup.
+fn remove_empty_output(path: &Path) {
+    if matches!(std::fs::metadata(path), Ok(meta) if meta.len() == 0) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Launch the convert guest, run the vCPU loop, and finalise the output.
 /// Shared by `run_convert` (window `None`) and `run_dd` (window `Some`).
 /// Behaviour for convert is identical to the previous inline body.
@@ -16154,6 +16193,16 @@ fn execute_convert(
     }
 
     if !convert_success {
+        // Whatever failed, an output file this run owns and left empty
+        // is removed. See `remove_empty_output` for why that is the
+        // line, and why the file is not removed once it holds bytes.
+        if !exec.no_create {
+            remove_empty_output(Path::new(&exec.output));
+            if let Some((ref flat_path, _)) = flat_extent_path {
+                remove_empty_output(flat_path);
+            }
+        }
+
         // A differencing source is refused inside `init_chain_states`,
         // before a single output sector is written, and `convert` has no
         // result struct to carry the reason -- so it travels on

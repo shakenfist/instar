@@ -537,6 +537,15 @@ one, so the half-written file the defect leaves behind is part of what
 is asserted. Its index is derived the same way, from a trace of the
 very copy it is about to inject into.
 
+`test_failed_output_file.py` is the one of these that injects into
+`write` rather than `read`, because which write fails is what selects
+the behaviour under test: the first write failing leaves the output
+empty and the second leaves one sector in it, which are the two halves
+of the rule about what a failed run leaves on disk. It needs no index
+derivation for that reason, and asserts instead that exactly one write
+was injected -- an uninjected run writes the whole output and exits 0,
+so without that assertion the test would be measuring a successful run.
+
 ## Running Tests
 
 ### Make Targets
@@ -3845,8 +3854,12 @@ and this section has never named all of them.
   fail `copy` rather than give exit 0 and a short output file
   (`strace -e inject=read:error=EIO`); see "Failed Host Read Tests"
   above
+- `tests/test_failed_output_file.py` - A failed run must remove an
+  output file it left empty and keep one holding bytes
+  (`strace -e inject=write:error=ENOSPC`); see "Failed Host Read Tests"
+  above
 - `tests/strace_injection.py` - The shared syscall-injection rig for
-  the three modules above: the capability probe, the per-thread index
+  the four modules above: the capability probe, the per-thread index
   derivation and the did-it-land parsers
 - `tests/test_bench.py` - Integration tests for the `instar bench`
   subcommand (62 tests): read/write request scheduling, host-side

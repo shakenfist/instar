@@ -429,6 +429,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A failed `convert`, `dd` or `copy` no longer leaves an empty output
+  file behind.** instar creates its output before launching the guest,
+  so a run the guest fails has already created the target; for most
+  failures that file was empty, and a caller that tests for the file's
+  existence read it as an operation that ran. An output this run created
+  and left with no bytes in it is now removed. An output holding bytes
+  is kept, as `qemu-img convert` keeps its own after "Invalid cluster
+  entry found" -- those bytes are the only record of how far the run got
+  -- and a target supplied with `--no-create` is never instar's to
+  delete ([#849](https://github.com/shakenfist/instar/issues/849)). `dd`
+  and a preallocated raw target size their output up front, so it is
+  never empty and is always kept. See `docs/convert.md`.
+
 - **`instar copy` fails when a read or a write fails.** It used to
   report success for a run that failed: every failure path in the
   operation reported and returned, and the host inferred success from
