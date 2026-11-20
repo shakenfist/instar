@@ -254,10 +254,18 @@ def parse_makefile_list(makefile_text, target):
 # same consequence if it skips: the outcome it guards against is a
 # conversion that exits 0, so a skipped run and a passing run look
 # alike twice over.
+#
+# The copy read-failure and failed-output-file tests are the same shape
+# again, and each guards a defect whose symptom is a *successful-looking*
+# run: a copy that exits 0 having written part of the input, and an empty
+# output file left where a caller testing for the file's existence reads
+# it as success. A skip and a pass are indistinguishable for both.
 ENV_REQUIRED_BY = (
     ('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),
     ('TestSlowHostRead', 'INSTAR_REQUIRE_STRACE'),
     ('TestLuksInnerFormatProbeReadFailure', 'INSTAR_REQUIRE_STRACE'),
+    ('TestCopyReadFailure', 'INSTAR_REQUIRE_STRACE'),
+    ('TestFailedOutputFile', 'INSTAR_REQUIRE_STRACE'),
 )
 
 
