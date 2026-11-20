@@ -121,6 +121,18 @@ LINT_IMAGE := instar-rust-lint
 INSTAR_BUILD_IMAGE := instar-release
 INSTAR_DEV_IMAGE := instar-build
 
+# How many stestr workers the host-side test targets run. Every worker
+# forks an instar and a qemu-img of its own, both CPU- and IO-heavy on
+# multi-GB images, so the default of one worker per core puts about
+# three times nproc of those on the machine at once: a 16-core host
+# reached a load average of 69 and an IO pressure of 68%, which made it
+# unusable for everything else sharing the disk. The containerised
+# targets have pinned 4 for this reason since they were written; these
+# run on the host, where there is no cgroup to contain them, and had
+# nothing. Override on the command line for a machine with room:
+# `make test-integration STESTR_CONCURRENCY=8`.
+STESTR_CONCURRENCY ?= 4
+
 # Paths
 SRC_DIR := src
 PROTO_DIR := prototypes
@@ -658,7 +670,9 @@ snapshot-harnesses: instar-devcontainer
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)
 test-integration: instar test-venv
 	@echo "Running Python integration tests..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--exclude-regex test_info_malicious \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
@@ -975,14 +989,17 @@ test-container-matrix-nightly: instar-devcontainer instar
 # Runs all test files except malicious image tests
 test-ci: instar test-venv
 	@echo "Running CI tests (safe images)..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--exclude-regex test_info_malicious \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run all tests including malicious (explicit opt-in)
 test-malicious: instar test-venv
 	@echo "WARNING: Running tests including malicious images"
 	@echo "This will process known malicious disk images."
 	@echo ""
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run tests and show output (useful for seeing diffs during development)
 test-report: instar test-venv

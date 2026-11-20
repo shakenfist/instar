@@ -553,17 +553,39 @@ make test-report
 make clean-tests
 ```
 
+Each of these that runs the Python suite runs four stestr workers, from
+`STESTR_CONCURRENCY` in the `Makefile`; `make test-report` is the
+exception and runs serially. (`make test` is the Rust unit tests and
+then the Python suite, so the cap applies to its second half.) Four
+rather than one per core
+because each worker forks an `instar` and a `qemu-img` of its own, both
+working on multi-GB images: a run at stestr's default of one worker per
+core took a sixteen-core host to a load average of 69 and an IO
+pressure of 68%, which made the machine unusable for anything else
+sharing its disk. The containerised targets have pinned the same four
+since they were written. Raise it on a machine with room:
+
+```bash
+make test-integration STESTR_CONCURRENCY=8
+```
+
+The temporaries still go to `TMPDIR`, which is usually `/tmp`; on a
+host whose root filesystem is short of space or shared with anything
+else that matters, point it elsewhere.
+
 ### Direct stestr Usage
 
 ```bash
 cd tests
 source .venv/bin/activate
 
-# Run all tests
-stestr run
+# Run all tests. Note the concurrency: by hand there is no Makefile to
+# supply it, and the default is one worker per core, which is what made
+# a sixteen-core host unusable.
+stestr run --concurrency 4
 
 # Run specific test module
-stestr run test_info_safe
+stestr run --concurrency 4 test_info_safe
 
 # Run with verbose output
 stestr run --serial -- --verbose
