@@ -23,15 +23,20 @@ trap 'rm -rf -- "${WORK}"' EXIT
 
 # The fake fails with FAKE_MESSAGE for its first FAKE_FAILS resolving
 # calls (forever if negative), then behaves as FAKE_RESULT says. A
-# `clean` always succeeds and is not counted as an attempt, so the
-# assertions below can tell the two apart. Each call appends its
-# arguments to calls.txt.
+# `clean` succeeds unless FAKE_CLEAN_FAILS is set, and is not counted as
+# an attempt, so the assertions below can tell the two apart. Each call
+# appends its arguments to calls.txt, the same arguments bracketed one
+# by one to argv.txt (so a split or a join shows), and the LC_ALL it
+# was given to lc_all.txt.
 FAKE="${WORK}/fake-dnf"
 cat >"${FAKE}" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE_DIR}/calls.txt"
+printf '[%s]' "$@" >>"${FAKE_DIR}/argv.txt"
+echo >>"${FAKE_DIR}/argv.txt"
+echo "${LC_ALL:-unset}" >>"${FAKE_DIR}/lc_all.txt"
 if [ "${1:-}" = clean ]; then
-    exit 0
+    exit "${FAKE_CLEAN_FAILS:-0}"
 fi
 attempts=$(grep -cv '^clean' "${FAKE_DIR}/calls.txt")
 if [ "${FAKE_FAILS}" -lt 0 ] || [ "${attempts}" -le "${FAKE_FAILS}" ]; then
@@ -45,13 +50,21 @@ esac
 EOF
 chmod +x "${FAKE}"
 
-# The three wordings a metadata failure arrives in: dnf4, dnf5, and the
-# mirror line, which comes from librepo rather than from dnf at all.
+# The wordings a metadata failure arrives in: dnf4, dnf5 (two of them),
+# and the mirror line, which comes from librepo rather than from dnf at
+# all and is capitalised differently for repomd.xml than for the rest of
+# the repodata. The repomd one is matched by nothing but that line,
+# which is what pins the match as case-blind. The dnf5 and repomd
+# wordings are as rockylinux:9 and fedora:latest printed them in
+# 2026-11 for a repository answering 404.
 DNF4_MESSAGE="Error: Failed to download metadata for repo 'appstream':"
 DNF4_MESSAGE="${DNF4_MESSAGE} Yum repo downloading error"
 DNF5_MESSAGE="Failed to synchronize cache for repo 'appstream'"
+DNF5_URL_MESSAGE='Failed to download metadata (baseurl: "https://example/")'
+DNF5_URL_MESSAGE="${DNF5_URL_MESSAGE} for repository \"appstream\": Usable URL not found"
 MIRROR_MESSAGE='repodata/8dad4ae7-primary.xml.gz - Cannot download,'
 MIRROR_MESSAGE="${MIRROR_MESSAGE} all mirrors were already tried without success"
+REPOMD_MESSAGE='Cannot download repodata/repomd.xml: All mirrors were tried'
 
 FAILURES=0
 
@@ -67,10 +80,12 @@ run() {
     # failed assertion (exit 124) rather than a hung CI step.
     local fails="$1" result="$2" timeout="$3" message="$4"
     shift 4
-    rm -f "${WORK}/calls.txt"
+    # RUN_DNF and FAKE_CLEAN_FAILS, when set by the caller, pass through.
+    rm -f "${WORK}/calls.txt" "${WORK}/argv.txt" "${WORK}/lc_all.txt"
     touch "${WORK}/calls.txt"
     OUTPUT="$(FAKE_DIR="${WORK}" FAKE_FAILS="${fails}" \
-        FAKE_RESULT="${result}" FAKE_MESSAGE="${message}" DNF="${FAKE}" \
+        FAKE_RESULT="${result}" FAKE_MESSAGE="${message}" \
+        DNF="${RUN_DNF:-${FAKE}}" \
         DNF_RETRY_TIMEOUT="${timeout}" DNF_RETRY_INTERVAL=1 \
         timeout 20 "${SCRIPT}" "$@" 2>&1)"
     STATUS=$?
@@ -94,7 +109,8 @@ WANTED='install -y --setopt=install_weak_deps=False /pkg/instar.rpm'
 # A metadata failure is retried until the mirrors agree again, and the
 # stale copy is discarded before each retry rather than being asked
 # the same question twice.
-for message in "${DNF4_MESSAGE}" "${DNF5_MESSAGE}" "${MIRROR_MESSAGE}"; do
+for message in "${DNF4_MESSAGE}" "${DNF5_MESSAGE}" "${DNF5_URL_MESSAGE}" \
+        "${MIRROR_MESSAGE}" "${REPOMD_MESSAGE}"; do
     run 2 ok 300 "${message}" install -y qemu-img
     [ "${STATUS}" -eq 0 ] || fail "retried (${message:0:40}): exit ${STATUS}, wanted 0"
     [ "${ATTEMPTS}" -eq 3 ] \
@@ -104,6 +120,29 @@ for message in "${DNF4_MESSAGE}" "${DNF5_MESSAGE}" "${MIRROR_MESSAGE}"; do
     [ "$(sed -n 2p "${WORK}/calls.txt")" = 'clean metadata' ] \
         || fail "retried (${message:0:40}): the retry reused the metadata that failed"
 done
+
+# A clean that fails does not stop the retries: the next attempt may
+# still reach a mirror that has what the metadata names.
+FAKE_CLEAN_FAILS=1 run 2 ok 300 "${MIRROR_MESSAGE}" install -y qemu-img
+[ "${STATUS}" -eq 0 ] || fail "failed clean: exit ${STATUS}, wanted 0"
+[ "${ATTEMPTS}" -eq 3 ] || fail "failed clean: ${ATTEMPTS} attempts, wanted 3"
+
+# A DNF of more than one word -- DNF='sudo dnf' is how
+# validate-published-release.sh calls it -- is split into a command and
+# its arguments, while the caller's arguments arrive one for one, an
+# argument holding a space included.
+RUN_DNF="env ${FAKE}" run 0 ok 300 "${DNF4_MESSAGE}" install -y 'two words'
+[ "${STATUS}" -eq 0 ] || fail "multi-word DNF: exit ${STATUS}, wanted 0"
+[ "$(cat "${WORK}/argv.txt")" = '[install][-y][two words]' ] \
+    || fail "multi-word DNF: dnf got $(cat "${WORK}/argv.txt")"
+
+# dnf runs with LC_ALL=C whatever the caller's locale, retry and clean
+# alike: the failure match is against dnf's English messages.
+LC_ALL=de_DE.UTF-8 run 1 ok 300 "${DNF4_MESSAGE}" install -y qemu-img
+[ "$(sort -u "${WORK}/lc_all.txt")" = 'C' ] \
+    || fail "locale: dnf ran with LC_ALL $(sort -u "${WORK}/lc_all.txt" | tr '\n' ' ')"
+[ "$(wc -l <"${WORK}/lc_all.txt")" -eq 3 ] \
+    || fail 'locale: wanted two attempts and a clean'
 
 # Any other failure is returned at once, with its own status: an
 # unknown package is an answer, not weather.

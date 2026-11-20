@@ -17,6 +17,13 @@
 #   ./validate-published-release.sh deb 0.3.0
 #   ./validate-published-release.sh rpm 0.3.0
 #
+# Run from a clone if you can. On rpm systems the script installs
+# through tools/ci/dnf.sh, which retries a distro mirror that is part
+# way through rotating its metadata. A copy of this file on its own
+# still works, but calls dnf directly and says so, and then a mirror
+# mid-rotation reads as a failed install: rerun before you blame the
+# artifact.
+#
 # Requires on the VM: /dev/kvm accessible to your user (kvm group),
 # curl, sudo, and qemu-utils (for the fixture; installed if missing on
 # apt/dnf systems).
@@ -76,9 +83,20 @@ else
     # Through the dnf wrapper: a mirror serving metadata that names
     # repodata it has already rotated away would otherwise read as a
     # broken release artifact, which is the one thing this script is
-    # meant to be able to tell you.
-    DNF='sudo dnf' "${REPO_ROOT}/tools/ci/dnf.sh" install -y qemu-img
-    DNF='sudo dnf' "${REPO_ROOT}/tools/ci/dnf.sh" install -y "./${ASSET}"
+    # meant to be able to tell you. The wrapper is only there when
+    # this runs from a clone (see the header), so without it this
+    # falls back to plain dnf rather than failing the rpm path.
+    DNF_WRAPPER="${REPO_ROOT}/tools/ci/dnf.sh"
+    if [ -f "$DNF_WRAPPER" ]; then
+        dnf_install() { DNF='sudo dnf' bash "$DNF_WRAPPER" install -y "$@"; }
+    else
+        echo "note: $DNF_WRAPPER not found, so calling dnf directly." >&2
+        echo "      A mirror mid-rotation will fail the install below;" \
+            "rerun before blaming the artifact." >&2
+        dnf_install() { sudo dnf install -y "$@"; }
+    fi
+    dnf_install qemu-img
+    dnf_install "./${ASSET}"
 fi
 
 echo ""

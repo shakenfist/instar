@@ -34,6 +34,11 @@
 # rotation and short enough that a repository which is genuinely gone
 # still fails the step.
 #
+# A package payload that a rotation has deleted fails with the same
+# mirror line, and is retried the same way. That is safe because dnf
+# downloads the whole transaction before it installs any of it, so a
+# failed download leaves nothing half done for the retry to trip over.
+#
 # Any other failure is returned at once, unretried: an unknown package
 # or an unsatisfied dependency is an answer about the package, and
 # retrying it would only turn a clear failure into a slow one.
@@ -53,10 +58,15 @@ timeout="${DNF_RETRY_TIMEOUT:-300}"
 interval="${DNF_RETRY_INTERVAL:-15}"
 
 # dnf4 and dnf5 word this differently, and the mirror line comes from
-# librepo rather than from dnf at all, so all three are matched.
+# librepo rather than from dnf at all, so all of them are matched, and
+# without regard to case: librepo says "all mirrors were already tried"
+# for a file in the repodata but "All mirrors were tried" for
+# repomd.xml itself. Matching too much costs at most one deadline on a
+# failure that would have failed anyway; matching too little turns the
+# wrapper back into plain dnf without anyone noticing.
 metadata_failure='Failed to download metadata'
 metadata_failure="${metadata_failure}|Failed to synchronize cache"
-metadata_failure="${metadata_failure}|all mirrors were already tried"
+metadata_failure="${metadata_failure}|all mirrors were (already )?tried"
 
 log="$(mktemp)"
 trap 'rm -f -- "${log}"' EXIT
@@ -66,7 +76,7 @@ while true; do
     "${dnf[@]}" "$@" 2>&1 | tee "${log}" && exit 0
     status=$?
 
-    if ! grep -qE "${metadata_failure}" "${log}"; then
+    if ! grep -qiE "${metadata_failure}" "${log}"; then
         exit "${status}"
     fi
     if [ "${SECONDS}" -ge "${deadline}" ]; then

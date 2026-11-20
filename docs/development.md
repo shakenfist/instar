@@ -767,13 +767,27 @@ failure slow. `tools/ci/test-dnf.sh` checks all of that against a fake
 dnf, including that the wrapper adds nothing to the arguments it is
 given.
 
-Inside a container the wrapper has to be mounted to be callable, which
-is what `-v "$REPO_ROOT/tools/ci/dnf.sh:/dnf.sh:ro"` in
-`tools/test-package-install.sh` is for;
-`tools/test-package-functional.sh` already mounts the repository at
-`/workspace` and calls it from there. Only the first dnf in a container
-needs it: dnf loads every enabled repository's metadata on the first
-transaction, so the calls after it reuse what that one fetched.
+It has four callers:
+
+- `tools/test-package-install.sh` and `tools/probe-qemu-versions.sh` run
+  dnf inside a container, where the wrapper has to be mounted to be
+  callable; that is what `-v "$REPO_ROOT/tools/ci/dnf.sh:/dnf.sh:ro"`
+  is for.
+- `tools/test-package-functional.sh` already mounts the repository at
+  `/workspace` and calls it from there. dnf loads every enabled
+  repository's metadata on its first transaction, so later calls reuse
+  that, but they still download packages from the mirrors, which a
+  rotation deletes too. So the wrapper covers the first dnf and every
+  later one that can fail the leg; the best-effort installs that end in
+  `|| true` call dnf directly.
+- `tools/validate-published-release.sh`, the manual release check, finds
+  the wrapper relative to itself, so it only has it when run from a
+  clone. A lone copy of the script falls back to plain dnf and prints a
+  note saying so, because there a mirror mid-rotation looks like a
+  broken artifact.
+
+The wrapper needs bash, `mktemp`, `tee` and `grep` wherever it runs,
+which every image in the matrix has.
 
 ### Self-hosted runners and the GitHub CLI
 
