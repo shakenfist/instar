@@ -156,6 +156,26 @@ pub struct ExternalDataFile {
     /// kind unsaid, so a VMDK extent reaching the host with `None`
     /// here is a bug rather than a default.
     pub vmdk_extent_kind: Option<VmdkExtentKind>,
+    /// The file's length when the chain was discovered, or the error
+    /// that measuring it gave.
+    ///
+    /// A VMDK descriptor's extents are laid out into one device twice
+    /// over -- once to tell the guest where each file begins in it, and
+    /// once to open the files as that device -- and the two have to
+    /// describe the same bytes. Measuring the file in each pass does
+    /// not give that: a file that grows between them moves every later
+    /// extent's base in one pass and not the other, and the guest then
+    /// reads one extent's offset inside another extent's bytes and is
+    /// told it succeeded. So the length is taken once, here, and both
+    /// passes lay the device out from this number. A file that changes
+    /// afterwards is harmless: the device still says what the guest was
+    /// told it says, and a member shorter than its declared length
+    /// reads as zeros past its end (`BackingStore::open_concatenated`).
+    ///
+    /// For a QCOW2 external data file this is the file size, the same
+    /// figure as `extent_size`; nothing lays that device out, because it
+    /// is a device of its own.
+    pub file_length: Result<u64, String>,
 }
 
 /// Information about a single image in the backing chain.
@@ -1037,14 +1057,33 @@ pub fn descriptor_cluster_size<'a>(
 /// cluster size is as close as an `info` that still describes the
 /// descriptor can come, and the guest's reader refuses the same extent
 /// when something tries to read it.
+///
+/// Only a regular file is opened. The path is one the descriptor named,
+/// and the allowlist constrains where it may point but not what it may
+/// point at: a FIFO beside the image would block the host inside
+/// `open` until something wrote to it, with no timeout, hanging a
+/// command as ordinary as `instar info` on an image someone uploaded.
+/// `O_NONBLOCK` closes the window between the check and the open, where
+/// the regular file could be replaced by a FIFO; on a regular file it
+/// does nothing.
 fn extent_cluster_size(path: &Path, kind: VmdkExtentKind) -> Option<u64> {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
 
     if kind != VmdkExtentKind::Sparse {
         return None;
     }
+    if !std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let mut header = [0u8; vmdk::HEADER_FULL_SIZE];
-    std::fs::File::open(path)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
         .and_then(|mut file| file.read_exact(&mut header))
         .ok()?;
     let magic = u32::from_le_bytes(
@@ -2386,6 +2425,42 @@ mod tests {
             });
             assert_eq!(resolved.extents[1].cluster_size, None);
             assert_eq!(resolved.cluster_size(), None);
+        }
+    }
+
+    // The allowlist says where an extent path may point, not what it
+    // may point at, so a descriptor can name a FIFO beside itself.
+    // Opening one blocks until something writes to it, with no timeout:
+    // a command as ordinary as `instar info` on an uploaded image would
+    // hang rather than fail. The work runs on a thread and the answer
+    // is waited for, so a regression fails this test instead of
+    // stopping the suite (issue #936).
+    #[test]
+    fn a_fifo_extent_reports_no_cluster_size_without_blocking() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("s001.vmdk");
+        let as_c = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a call with a NUL-terminated path and a mode, whose
+        // only effect is to create the node; the return value is checked.
+        let made = unsafe { libc::mkfifo(as_c.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        assert!(!std::fs::metadata(&fifo).unwrap().is_file());
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = descriptor_cluster_size([(fifo.as_path(), VmdkExtentKind::Sparse)]);
+            let _ = tx.send(answer);
+        });
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(answer) => assert_eq!(answer, None, "a FIFO declares no grain size"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("reading a FIFO extent's cluster size blocked")
+            }
+            Err(other) => panic!("{other}"),
         }
     }
 

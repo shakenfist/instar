@@ -855,9 +855,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   length. A descriptor may name at most 64 extents, which is instar's
   own bound and not qemu's; a larger one is refused with a message
   naming the bound. `map` and `measure` still refuse every VMDK
-  descriptor, flat or sparse, and their message names `monolithicFlat`
-  whatever the descriptor is. See `docs/format-coverage.md` and
+  descriptor, flat or sparse, and now say so: the message names the
+  descriptor rather than `monolithicFlat`, which an image in either
+  split subformat is not. See `docs/format-coverage.md` and
   `docs/chain-config.md`.
+
+- **A VMDK descriptor's extent files are measured once.** Where the
+  extents sit in the one device they make up was worked out twice from
+  separate measurements, once for the table the guest reads and once to
+  open the device, so an extent file rewritten between the two passes
+  put the same extent at two different offsets and the guest read one
+  extent's data inside another's, reported as a success. The length is
+  taken once, when the chain is discovered, and both passes lay the
+  device out from it.
+
+- **A VMDK extent that is not a regular file no longer hangs the host.**
+  A descriptor may name any path the backing-file allowlist permits,
+  and a FIFO among them left the host blocked in `open` with no
+  timeout -- `instar info` on an uploaded image, in the one place the
+  host reads an extent's own header. Only a regular file is opened for
+  that read, and the extent files a descriptor's device spans are
+  opened with `O_NONBLOCK`, so a FIFO reads as the zeros any short
+  extent reads as. See `docs/security-audits.md`.
 
 - **`info --chain` reported a VMDK descriptor's own length as its size.**
   A chain member that was a descriptor had its `actual-size` taken from

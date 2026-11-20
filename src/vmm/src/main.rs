@@ -4294,6 +4294,17 @@ fn discover_backing_chain(
                         path: e.path.clone(),
                         extent_size: e.extent_size,
                         vmdk_extent_kind: Some(e.kind),
+                        // The extent is measured once, here, and every
+                        // later pass lays the device out from this
+                        // number. A failure is carried rather than
+                        // reported: resolution has already established
+                        // that the file exists, nothing that only
+                        // describes the image needs its length, and the
+                        // attachment that does names both files when it
+                        // refuses.
+                        file_length: std::fs::metadata(&e.path)
+                            .map(|m| m.len())
+                            .map_err(|err| err.to_string()),
                     })
                     .collect(),
             });
@@ -4398,6 +4409,7 @@ fn discover_backing_chain(
                     path: data_resolved,
                     extent_size: data_size,
                     vmdk_extent_kind: None,
+                    file_length: Ok(data_size),
                 });
             }
         }
@@ -4749,6 +4761,11 @@ struct DescriptorExtent {
 /// is nothing; where a file does end mid-sector, the padding reads as
 /// zeros and nothing addresses it, because a flat read stops at the
 /// extent's `file_length` and a sparse one is held inside its own file.
+/// The extent lengths are the ones chain discovery measured, so two
+/// calls for one image agree however the files change underneath. The
+/// only thing a changed file can cost is content: a member shorter than
+/// its declared length reads as zeros past its end, which is what the
+/// extent's own span says is there.
 fn layout_descriptor_extents(
     image: &ChainImage,
 ) -> Result<Vec<DescriptorExtent>, Box<dyn std::error::Error>> {
@@ -4790,15 +4807,20 @@ fn layout_descriptor_extents(
             }
         };
 
-        let file_length = std::fs::metadata(&extent.path)
-            .map_err(|e| {
-                format!(
-                    "VMDK descriptor '{}' extent '{}': {e}",
-                    terminal_safe_path(&image.path),
-                    terminal_safe_path(&extent.path)
-                )
-            })?
-            .len();
+        // The length comes from the single measurement chain discovery
+        // took, not from a fresh one: this function runs twice for one
+        // image -- once to tell the guest where each extent begins in
+        // the device, once to open the files as that device -- and two
+        // measurements of a file that changed in between would put the
+        // same extent at two different offsets. See
+        // `ExternalDataFile::file_length`.
+        let file_length = extent.file_length.clone().map_err(|e| {
+            format!(
+                "VMDK descriptor '{}' extent '{}': {e}",
+                terminal_safe_path(&image.path),
+                terminal_safe_path(&extent.path)
+            )
+        })?;
 
         let too_long = || -> Box<dyn std::error::Error> {
             format!(
@@ -4962,10 +4984,13 @@ fn write_chain_device_entries(
 
         // A VMDK descriptor and all of its extents are one device,
         // whose bytes are the extent files laid end to end. Where the
-        // files sit in it is worked out once, here, and the device is
-        // opened from the same layout by `open_chain_image_backing`,
-        // so the offsets the guest is given and the offsets the host
-        // reads at cannot drift apart.
+        // files sit in it is worked out here and again by
+        // `open_chain_image_backing`, which opens them as that device.
+        // Both read the extent lengths chain discovery recorded rather
+        // than measuring the files again, so the two cannot put an
+        // extent at different offsets -- that divergence is a read of
+        // one extent's offset inside another's bytes, reported as a
+        // success.
         let descriptor_extents = if image.is_vmdk_descriptor() {
             layout_descriptor_extents(image)?
         } else {
@@ -5053,9 +5078,10 @@ fn write_chain_device_entries(
             if idx >= MAX_CHAIN_DEVICES {
                 return Err(overflowed(idx));
             }
-            let data_size = std::fs::metadata(&data_file.path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            // The length chain discovery measured, like every other
+            // figure in this table and like the extent lengths above,
+            // rather than a second measurement of the same file.
+            let data_size = data_file.file_length.clone().unwrap_or(0);
             let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
             guest_mem.write_obj(
                 ImageFormat::Raw.to_shared_format_u32(),
@@ -5486,6 +5512,9 @@ mod chain_member_disk_size_tests {
             external_data_files: extents
                 .into_iter()
                 .map(|(path, extent_size)| ExternalDataFile {
+                    file_length: std::fs::metadata(&path)
+                        .map(|m| m.len())
+                        .map_err(|e| e.to_string()),
                     path,
                     extent_size,
                     vmdk_extent_kind: Some(crate::chain::VmdkExtentKind::Flat),
@@ -5701,6 +5730,9 @@ mod info_extent_figures_tests {
             external_data_files: extents
                 .into_iter()
                 .map(|(path, kind)| ExternalDataFile {
+                    file_length: std::fs::metadata(&path)
+                        .map(|m| m.len())
+                        .map_err(|e| e.to_string()),
                     path,
                     extent_size: 1 << 20,
                     vmdk_extent_kind: Some(kind),
@@ -5773,8 +5805,12 @@ mod info_extent_figures_tests {
             descriptor,
             vec![(sparse, crate::chain::VmdkExtentKind::Sparse)],
         );
+        let kindless = sparse_extent(&dir, "s002.vmdk", 128, 512);
         image.external_data_files.push(ExternalDataFile {
-            path: sparse_extent(&dir, "s002.vmdk", 128, 512),
+            file_length: std::fs::metadata(&kindless)
+                .map(|m| m.len())
+                .map_err(|e| e.to_string()),
+            path: kindless,
             extent_size: 1 << 20,
             vmdk_extent_kind: None,
         });
@@ -5805,6 +5841,7 @@ mod chain_config_writer_tests {
                     path: PathBuf::from("/nonexistent/data"),
                     extent_size,
                     vmdk_extent_kind: None,
+                    file_length: Ok(extent_size),
                 })
                 .collect(),
         }
@@ -5828,6 +5865,7 @@ mod chain_config_writer_tests {
                 path,
                 extent_size: *span,
                 vmdk_extent_kind: Some(*kind),
+                file_length: Ok(*file_length),
             });
         }
         ChainImage {
@@ -6168,6 +6206,156 @@ mod chain_config_writer_tests {
         let mut buf = [0u8; 8];
         store.read_at(1000, &mut buf).expect("read the padding");
         assert_eq!(buf, [0u8; 8]);
+    }
+
+    // The layout runs twice for one image -- once for the guest's table,
+    // once to open the device -- and a file measured in each pass would
+    // put the same extent at two offsets. The lengths come from chain
+    // discovery instead, so a file that changes afterwards moves
+    // nothing: the guest's entry still names the byte the device serves
+    // there. Measured per pass, the second extent's base would move with
+    // the first file's growth and this read would land in the first
+    // extent's zero padding, reported as a successful read of the
+    // second extent.
+    #[test]
+    fn a_descriptors_layout_ignores_a_file_that_changed_after_discovery() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let image = descriptor(tmp.path(), &[(1024, 1 << 20, Flat), (512, 1 << 20, Flat)]);
+        for (i, extent) in image.external_data_files.iter().enumerate() {
+            let len = std::fs::metadata(&extent.path).unwrap().len() as usize;
+            std::fs::write(&extent.path, vec![b'A' + i as u8; len]).unwrap();
+        }
+
+        // What the guest is told, before anything grows.
+        let told = layout_descriptor_extents(&image).expect("layout");
+
+        // The first extent grows by a sector, as an untrusted writer
+        // holding the file could make it between the two passes.
+        let first = &image.external_data_files[0].path;
+        std::fs::write(first, vec![b'A'; 1024 + 512]).unwrap();
+
+        let after = layout_descriptor_extents(&image).expect("layout again");
+        assert_eq!(
+            after
+                .iter()
+                .map(|e| (e.device_offset, e.device_len, e.file_length))
+                .collect::<Vec<_>>(),
+            told.iter()
+                .map(|e| (e.device_offset, e.device_len, e.file_length))
+                .collect::<Vec<_>>(),
+            "the layout is the lengths discovery recorded, not the files as they are now"
+        );
+
+        let (mut store, capacity) = open_chain_image_backing(&image).expect("device");
+        assert_eq!(capacity, 1024 + 512);
+        let mut buf = [0u8; 4];
+        store
+            .read_at(told[1].device_offset, &mut buf)
+            .expect("read the second extent");
+        assert_eq!(
+            buf, [b'B'; 4],
+            "the second extent is still where the guest was told it is"
+        );
+    }
+
+    // An extent reaches attachment with no kind only through a host bug,
+    // and the refusal names both files rather than leaving the guest to
+    // fail on a zero kind with nothing to say which file it was.
+    #[test]
+    fn layout_descriptor_extents_refuses_an_extent_whose_kind_did_not_arrive() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let mut image = descriptor(tmp.path(), &[(512, 1 << 20, Flat), (512, 1 << 20, Flat)]);
+        image.external_data_files[1].vmdk_extent_kind = None;
+
+        let err = layout_descriptor_extents(&image)
+            .expect_err("an extent with no kind is refused")
+            .to_string();
+        assert!(err.contains("internal error"), "{err}");
+        assert!(
+            err.contains(&image.path.display().to_string()),
+            "names the descriptor: {err}"
+        );
+        assert!(
+            err.contains(&image.external_data_files[1].path.display().to_string()),
+            "names the extent: {err}"
+        );
+    }
+
+    // A length discovery could not take is carried to attachment rather
+    // than reported as a zero-length extent, which would hand the guest
+    // a device whose extents all sit at offset zero.
+    #[test]
+    fn layout_descriptor_extents_refuses_an_extent_it_could_not_measure() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let mut image = descriptor(tmp.path(), &[(512, 1 << 20, Flat)]);
+        image.external_data_files[0].file_length = Err("No such file or directory".to_string());
+
+        let err = layout_descriptor_extents(&image)
+            .expect_err("an unmeasured extent is refused")
+            .to_string();
+        assert!(err.contains("No such file or directory"), "{err}");
+        assert!(
+            err.contains(&image.external_data_files[0].path.display().to_string()),
+            "names the extent: {err}"
+        );
+    }
+
+    // A descriptor's device spans several files, so a write across it
+    // cannot be routed to one of them. The refusal is here rather than
+    // inside the backing store, which would report the same thing
+    // without naming the image.
+    #[test]
+    fn open_chain_devices_rw_refuses_a_vmdk_descriptor_in_a_writable_slot() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let descriptor_image = descriptor(tmp.path(), &[(512, 1 << 20, Flat)]);
+        let expected_path = descriptor_image.path.display().to_string();
+        let one = chain(vec![descriptor_image]);
+        let mut device_set = DeviceSet::new();
+        let mut io_events: Vec<IoEvent> = Vec::new();
+
+        let err = open_chain_devices_rw(
+            &one,
+            512,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "bench",
+            &[0],
+            None,
+        )
+        .expect_err("a descriptor cannot be attached for writing")
+        .to_string();
+        assert!(err.contains("cannot be attached for writing"), "{err}");
+        assert!(err.contains(&expected_path), "names the image: {err}");
+        assert!(
+            err.contains("extent files"),
+            "says where the content is: {err}"
+        );
+
+        // The same descriptor in a read-only slot opens, so the refusal
+        // is the write, not the format.
+        assert_eq!(
+            open_chain_devices_rw(
+                &one,
+                512,
+                &mut device_set,
+                &mut io_events,
+                0,
+                "bench",
+                &[],
+                None,
+            )
+            .expect("read-only is fine"),
+            1
+        );
     }
 
     // `compare` and `rebase` write two chains into one table, and the
@@ -18428,12 +18616,15 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         check_vhdx_virtual_size("measure", virtual_size_override)?;
     }
 
-    // --- VMDK monolithicFlat source rejection (FILENAME mode only) -------
+    // --- VMDK descriptor source rejection (FILENAME mode only) ----------
+    // Every descriptor-driven source is refused, monolithicFlat and both
+    // twoGbMaxExtent subformats, so the message names the descriptor
+    // rather than one of the subformats it may be.
     if let Some(ref input_str) = args.input {
         let input_path = Path::new(input_str);
         if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
             return Err(
-                "measure: monolithicFlat source images are not yet supported \
+                "measure: VMDK descriptor source images are not yet supported \
                  (use convert -f / qemu-img instead)"
                     .into(),
             );
@@ -18896,14 +19087,19 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
         .into());
     }
 
-    // --- VMDK monolithicFlat source rejection ----------------------------
-    // The guest's VmdkState::init naturally fails the VMDK4 binary header
-    // parse for descriptor-driven layouts, but the resulting
-    // ERROR_INVALID_SOURCE is less helpful than this host-side pre-check
-    // pointing at qemu-img as an escape hatch.
+    // --- VMDK descriptor source rejection --------------------------------
+    // A policy refusal, and the only thing standing between `map` and a
+    // descriptor it would otherwise read: the guest learned to read one
+    // through the chain config's extent table, so `VmdkState::init` no
+    // longer fails the VMDK4 header parse for these layouts. `map` has
+    // its own walk of the image's allocation, which has not been taught
+    // the extent table, so the source is refused here with qemu-img
+    // named as the escape hatch. Every descriptor-driven source is
+    // refused, monolithicFlat and both twoGbMaxExtent subformats, so the
+    // message names the descriptor rather than one of the subformats.
     let input_path = Path::new(&args.input);
     if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
-        return Err("map: monolithicFlat source images are not yet supported \
+        return Err("map: VMDK descriptor source images are not yet supported \
              (use qemu-img map instead)"
             .into());
     }

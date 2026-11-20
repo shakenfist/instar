@@ -1160,10 +1160,15 @@ reads the VMDK descriptor and walks the multi-extent layout.
 instar's `map` and `measure` refuse a descriptor-driven source
 (monolithicFlat or either `twoGbMaxExtent` subformat) in a
 host-side pre-check, `peek_is_vmdk_descriptor`, before launching
-the guest, pointing the user at `qemu-img` as the workaround;
-the guest's own map walker would fail the VMDK4 binary header
-parse on a descriptor anyway. The message names monolithicFlat
-whatever the descriptor is. Other commands do read these images:
+the guest, pointing the user at `qemu-img` as the workaround. The
+refusal is policy, not inability: the guest reads a descriptor
+through the chain config's extent table for the commands that do
+support it, and what these two would need is the walk each of them
+uses instead -- `map`'s allocation walk and `measure`'s source
+scanner -- neither of which has been taught that table. The
+message names the descriptor rather than a subformat, because
+every descriptor-driven source is refused. Other commands do read
+these images:
 `info`, `check`, `compare` and `convert` attach the descriptor
 and its extents as one device and read through the extent table
 in the chain config.

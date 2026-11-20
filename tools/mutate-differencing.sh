@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=165
+EXPECTED_CASES=171
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1916,6 +1916,100 @@ rust_case 'vmm-image-flags-keep-the-data-device-mark' "${VMM_MAIN_LIB}" \
     '            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,' \
     '            image.flags, // MUTATED' \
     instar 'write_chain_device_entries_marks_every_data_device_and_nothing_else'
+
+# A VMDK descriptor's extents are laid out into one device twice over,
+# once for the table the guest reads and once to open the files as that
+# device. The first two cases measure the files per pass again, which is
+# what let the two passes put one extent at two offsets: a file that
+# grew between them moved every later extent's base in one pass only,
+# and the guest then read inside the wrong extent and was told it
+# succeeded. The third reads a length the host never got as zero, which
+# stacks every later extent on top of it. The fourth guesses FLAT for an
+# extent that arrived with no kind, which reads a sparse extent's header
+# as data. The fifth attaches a descriptor for writing, where a write
+# across the member boundary cannot be routed to a file.
+
+rust_case 'vmm-descriptor-layout-measured-per-pass' "${VMM_MAIN_LIB}" \
+    '        let file_length = extent.file_length.clone().map_err(|e| {
+            format!(
+                "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                terminal_safe_path(&image.path),
+                terminal_safe_path(&extent.path)
+            )
+        })?;' \
+    '        let file_length = std::fs::metadata(&extent.path) // MUTATED
+            .map_err(|e| {
+                format!(
+                    "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+            })?
+            .len();' \
+    instar 'a_descriptors_layout_ignores_a_file_that_changed_after_discovery'
+
+rust_case 'vmm-descriptor-layout-unmeasured-extent-is-zero' "${VMM_MAIN_LIB}" \
+    '        let file_length = extent.file_length.clone().map_err(|e| {
+            format!(
+                "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                terminal_safe_path(&image.path),
+                terminal_safe_path(&extent.path)
+            )
+        })?;' \
+    '        let file_length = extent.file_length.clone().unwrap_or(0); // MUTATED' \
+    instar 'layout_descriptor_extents_refuses_an_extent_it_could_not_measure'
+
+rust_case 'vmm-descriptor-extent-with-no-kind-read-as-flat' "${VMM_MAIN_LIB}" \
+    '            None => {
+                return Err(format!(
+                    "internal error: VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"' reached device \
+                     attachment without the kind its descriptor line declared",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+                .into());
+            }
+        };' \
+    '            None => shared::ChainExtent::KIND_FLAT, // MUTATED
+        };' \
+    instar 'layout_descriptor_extents_refuses_an_extent_whose_kind_did_not_arrive'
+
+rust_case 'vmm-descriptor-attached-for-writing' "${VMM_MAIN_LIB}" \
+    '        if is_rw && image.is_vmdk_descriptor() {' \
+    '        if false { // MUTATED' \
+    instar 'open_chain_devices_rw_refuses_a_vmdk_descriptor_in_a_writable_slot'
+
+# The backing-file allowlist says where an extent path may point, not
+# what kind of file it may point at, and opening a FIFO blocks with no
+# timeout. Both cases restore the unguarded open: the first in the one
+# place the host reads an extent's own header, which `instar info`
+# reaches, and the second in the device a descriptor's extents make up.
+CHAIN_LIB='src/vmm/src/chain.rs'
+BACKING_LIB='src/vmm/src/backing.rs'
+
+rust_case 'vmm-extent-header-read-opens-anything' "${CHAIN_LIB}" \
+    '    if !std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut header = [0u8; vmdk::HEADER_FULL_SIZE];
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)' \
+    '    let mut header = [0u8; vmdk::HEADER_FULL_SIZE]; // MUTATED
+    std::fs::File::open(path)' \
+    instar 'chain::tests::a_fifo_extent_reports_no_cluster_size_without_blocking'
+
+rust_case 'vmm-concatenated-member-opens-anything' "${BACKING_LIB}" \
+    '            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)?;' \
+    '            let file = File::open(path)?; // MUTATED' \
+    instar 'test_concatenated_fifo_member_does_not_block'
 
 # --- qcow2 data-file entries qemu refuses (#803) ----------------------
 #

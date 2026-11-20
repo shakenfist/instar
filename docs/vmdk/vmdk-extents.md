@@ -260,10 +260,28 @@ instar recognises these VMDK input variants:
   covering the wanted offset in that table. A descriptor may name
   at most 64 extents: that is the table's size, instar's own bound,
   and qemu-img has none. See [chain-config.md](../chain-config.md).
+
+  The host also reads the first 79 bytes of each *sparse* extent,
+  for the grain size `info` reports as the image's and the extent's
+  cluster size — a descriptor is text and declares none of its own.
+  That is the one place the host parses a binary format structure
+  rather than descriptor text, so it is bounded on purpose: a
+  fixed-size stack array, `read_exact` so a short file is a failure
+  rather than a partial parse, the VMDK4 magic checked before
+  anything is decoded, a parser that is safe Rust over a slice, and
+  a result that is only ever printed — never an offset or a length
+  the host computes with. Only a regular file is opened, and with
+  `O_NONBLOCK`, so a path the descriptor named cannot block the
+  host. `extent_cluster_size` in `src/vmm/src/chain.rs` is the whole
+  of it. The record of this as a deviation from "all format parsing
+  runs inside the guest" is in
+  [security-audits.md](../security-audits.md#standing-security-properties).
 - **A flat descriptor with `parentFileNameHint=`** is followed as
   a backing chain: the hint is validated against the allowlist
   like any backing path, and chain discovery continues with the
-  parent, whose devices follow the descriptor's extents.
+  parent, whose device follows the descriptor's own. The extents
+  take no device slots of their own, so there is nothing between
+  the two.
 
 `info`, `check`, `compare` and `convert` read all three. `map` and
 `measure` refuse every descriptor-driven source; see

@@ -9,6 +9,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// One member of a concatenated backing store.
@@ -136,7 +137,18 @@ impl BackingStore {
         let mut members = Vec::with_capacity(extents.len());
         let mut start = 0u64;
         for (path, declared_len) in extents {
-            let file = File::open(path)?;
+            // The members are the extent files a VMDK descriptor named,
+            // and the allowlist says where such a path may point, not
+            // what kind of file it may point at. Opening a FIFO blocks
+            // until a writer appears, with no timeout, so the operation
+            // would hang rather than fail; `O_NONBLOCK` returns
+            // instead, and a member that then reads short is padded with
+            // zeros like any other. On a regular file the flag does
+            // nothing.
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)?;
             // A file longer than its declared span contributes only the
             // span: the bytes past it are outside this extent.
             let readable_len = file.metadata()?.len().min(*declared_len);
@@ -583,6 +595,56 @@ mod tests {
             [0xDEu8; 16],
             "the next member's first byte belongs at the boundary"
         );
+    }
+
+    // An extent path a descriptor named need not be a regular file, and
+    // the backing-file allowlist does not say that it must be. Opening a
+    // FIFO without `O_NONBLOCK` blocks until a writer appears, with no
+    // timeout, so the operation would hang instead of failing. The open
+    // runs on a thread and the answer is waited for, so a regression
+    // fails this test rather than stopping the suite (issue #936).
+    #[test]
+    fn test_concatenated_fifo_member_does_not_block() {
+        use std::ffi::CString;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("first");
+        let as_c = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; its only effect is to
+        // create the node, and the return value is checked.
+        assert_eq!(
+            unsafe { libc::mkfifo(as_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo: {}",
+            std::io::Error::last_os_error()
+        );
+        let second = extent_file(dir.path(), "second", 0xBB, 1024);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let opened = BackingStore::open_concatenated(&[(fifo, 1024), (second, 1024)], true);
+            let _ = tx.send(opened.map(|mut store| {
+                let mut buf = [0xFFu8; 16];
+                let read = store.read_at(0, &mut buf);
+                (read.is_ok(), buf)
+            }));
+        });
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok((read_ok, buf))) => {
+                assert!(read_ok, "the member reads rather than erroring");
+                assert_eq!(
+                    buf, [0u8; 16],
+                    "a FIFO offers no bytes, so its whole span is this member's padding"
+                );
+            }
+            Ok(Err(e)) => panic!("opening a store with a FIFO member failed: {e}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("opening a FIFO extent blocked")
+            }
+            Err(other) => panic!("{other}"),
+        }
     }
 
     #[test]
