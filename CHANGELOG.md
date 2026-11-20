@@ -429,6 +429,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A warning or an error the host logs now reaches stderr without
+  `--verbose`.** The logger was installed only when `--verbose` was
+  passed, so by default there was no logger at all and every record was
+  discarded before its level was considered -- a `warn!` or an `error!`
+  written for a failure path reached nobody. The logger is now installed
+  on every run, and `--verbose` chooses its level: warnings and errors
+  by default, the guest's messages and the host's trace of the run with
+  the flag
+  ([#931](https://github.com/shakenfist/instar/issues/931)). A
+  successful run still prints nothing on stderr: installing the logger
+  revealed that every run dropped its ioeventfds while they were still
+  registered with KVM, which `IoEvent::drop` reported as a warning, and
+  that condition is what an ordinary teardown does -- KVM releases the
+  registration with the VM that holds it -- so it is now reported at
+  debug level. See `docs/output-formats.md`.
+
 - **`instar convert` and `instar dd` say what failed when guest I/O
   stops them.** They used to print a bare `convert operation failed`,
   with the cause available only under `--verbose`. They now name the

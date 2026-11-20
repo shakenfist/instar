@@ -8446,11 +8446,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let verbose = cli.verbose;
 
-    // Initialize logger based on --verbose flag. Every record is escaped
-    // on its way out, since debug lines interpolate image-derived text.
-    if verbose {
-        escape::init_verbose_logger();
-    }
+    // Install the logger. Every record is escaped on its way out, since
+    // debug lines interpolate image-derived text. `--verbose` picks the
+    // level rather than deciding whether there is a logger: without it
+    // the logger still carries warnings and errors, which are written
+    // for the user to read.
+    escape::init_logger(verbose);
 
     match cli.command {
         Commands::Info(args) => run_info(args, verbose),

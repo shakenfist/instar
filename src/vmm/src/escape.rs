@@ -15,10 +15,11 @@
 //! * [`terminal_safe`] for human output on stdout and stderr.
 //! * [`json_escape`] for the contents of a JSON string literal.
 //!
-//! Log records are the exception to picking: `--verbose` installs
+//! Log records are the exception to picking: every run installs
 //! [`EscapingLogger`], which passes every record through
 //! [`terminal_safe`] on its way out, so a `debug!` call never needs to
-//! escape its own arguments.
+//! escape its own arguments. `--verbose` chooses the level that logger
+//! runs at, not whether it exists.
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -149,11 +150,37 @@ impl<L: log::Log> log::Log for EscapingLogger<L> {
     }
 }
 
-/// Install the `--verbose` logger: env_logger at debug level, with every
-/// record escaped by [`EscapingLogger`].
-pub fn init_verbose_logger() {
+/// The level the logger runs at, given whether `--verbose` was passed.
+///
+/// `--verbose` chooses the level, not whether logging happens at all.
+/// The flag's job is to turn on the running commentary -- the guest's
+/// own messages and the host's `debug!` trace -- which is far too much
+/// for an ordinary run. A warning or an error is the opposite: it is
+/// written precisely because the user needs to see it, and there is no
+/// reason it should depend on a flag the user had no way to know to
+/// pass before the thing went wrong.
+fn logger_level(verbose: bool) -> log::LevelFilter {
+    if verbose {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
+    }
+}
+
+/// Install the logger: env_logger at [`logger_level`], with every record
+/// escaped by [`EscapingLogger`].
+///
+/// Installed on every run, including one with no `--verbose`. It used to
+/// be installed only under the flag, which meant that by default there
+/// was no logger at all and every record in the binary was dropped
+/// before its level was ever considered -- so a `warn!` or an `error!`
+/// written for a failure path reached nobody, and nothing at the call
+/// site said so (issue #931). A reader of this module would reasonably
+/// assume the logger exists and the flag only raises its level, which is
+/// now what happens.
+pub fn init_logger(verbose: bool) {
     let inner = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(logger_level(verbose))
         .format_target(false)
         .format_timestamp(None)
         .build();
@@ -167,6 +194,54 @@ pub fn init_verbose_logger() {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn the_default_level_carries_warnings_and_errors() {
+        let level = logger_level(false);
+        assert_eq!(level, log::LevelFilter::Warn);
+        assert!(log::Level::Error <= level);
+        assert!(log::Level::Warn <= level);
+    }
+
+    #[test]
+    fn the_default_level_leaves_out_the_running_commentary() {
+        let level = logger_level(false);
+        assert!(log::Level::Info > level);
+        assert!(log::Level::Debug > level);
+    }
+
+    /// The logger is installed, not merely configured. Without this
+    /// there is no logger at all and `log::max_level()` is `Off`, so a
+    /// `warn!` is dropped before its level is considered -- which is
+    /// the state issue #931 was filed over. This is the only test in
+    /// the crate that installs one, because a process can install just
+    /// one; it asserts the default level rather than `--verbose`'s for
+    /// that reason.
+    #[test]
+    fn the_logger_is_installed_and_carries_warnings_by_default() {
+        init_logger(false);
+        assert!(
+            log::log_enabled!(log::Level::Warn),
+            "no installed logger accepts a warning, so every warn! record \
+             in the binary goes nowhere"
+        );
+        assert!(
+            log::log_enabled!(log::Level::Error),
+            "no installed logger accepts an error"
+        );
+        assert!(
+            !log::log_enabled!(log::Level::Debug),
+            "the default level carries the running commentary, which belongs \
+             behind --verbose"
+        );
+    }
+
+    #[test]
+    fn verbose_raises_the_level_to_debug() {
+        let level = logger_level(true);
+        assert_eq!(level, log::LevelFilter::Debug);
+        assert!(log::Level::Debug <= level);
+    }
 
     #[test]
     fn terminal_safe_borrows_plain_text() {
