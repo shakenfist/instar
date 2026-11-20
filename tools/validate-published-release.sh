@@ -47,6 +47,7 @@ case "$PKG_TYPE" in
 esac
 
 BASE_URL="https://github.com/shakenfist/instar/releases/download/v${REL_VERSION}"
+REPO_ROOT=$(realpath "$(dirname "$0")/..")
 
 if [ ! -e /dev/kvm ]; then
     echo "Error: /dev/kvm not present -- instar needs KVM to run." >&2
@@ -72,8 +73,12 @@ if [ "$PKG_TYPE" = "deb" ]; then
 else
     ASSET="instar-${REL_VERSION}-1.x86_64.rpm"
     curl -fsSL -o "$ASSET" "${BASE_URL}/${ASSET}"
-    sudo dnf install -y qemu-img
-    sudo dnf install -y "./${ASSET}"
+    # Through the dnf wrapper: a mirror serving metadata that names
+    # repodata it has already rotated away would otherwise read as a
+    # broken release artifact, which is the one thing this script is
+    # meant to be able to tell you.
+    DNF='sudo dnf' "${REPO_ROOT}/tools/ci/dnf.sh" install -y qemu-img
+    DNF='sudo dnf' "${REPO_ROOT}/tools/ci/dnf.sh" install -y "./${ASSET}"
 fi
 
 echo ""

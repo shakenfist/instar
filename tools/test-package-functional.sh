@@ -219,7 +219,10 @@ echo "    testdata: $TESTDATA_PATH (read-only)"
 # The in-container script. Values that contain regex metacharacters are
 # passed via the environment (-e) to avoid a second layer of quoting.
 # Intentionally single-quoted: these variables are expanded inside the
-# container from the -e environment, not by the host shell.
+# container from the -e environment, not by the host shell. That also
+# means an apostrophe anywhere below, in a comment included, closes the
+# string and leaves the rest of it as host shell -- `bash -n` on this
+# file is the cheap way to catch it.
 # shellcheck disable=SC2016
 INNER='
 set -euo pipefail
@@ -237,7 +240,15 @@ if [ "$PKG_KIND" = deb ]; then
     apt-get install -y -q python3 python3-venv python3-pip \
         qemu-utils qemu-system-common
 else
-    dnf install -y --setopt=install_weak_deps=False "/pkg/$PKG_FILE"
+    # Through the dnf wrapper from the mounted repository, because
+    # even a local .rpm has its Requires resolved against the
+    # repositories of the distro, and a mirror serving metadata that
+    # names repodata it has already rotated away failed a Rocky leg of
+    # this very suite from the merge queue. This is the only dnf here
+    # that needs the wrapper: the first transaction loads the metadata
+    # of every enabled repository, so the calls below reuse what it
+    # fetched. See "Distro mirrors and dnf" in docs/development.md.
+    /workspace/tools/ci/dnf.sh install -y --setopt=install_weak_deps=False "/pkg/$PKG_FILE"
     # The test deps (testtools >= 2.9.1) require Python >= 3.10, but some
     # EL streams (Rocky/RHEL 9) default python3 to 3.9. Install a newer
     # interpreter explicitly; the interpreter is selected below.

@@ -51,6 +51,8 @@ PKG_PATH=$(realpath "$PKG_PATH")
 PKG_DIR=$(dirname "$PKG_PATH")
 PKG_FILE=$(basename "$PKG_PATH")
 
+REPO_ROOT=$(realpath "$(dirname "$0")/..")
+
 case "$PKG_FILE" in
     *.deb)
         # apt-get install <abs-path> requires the leading ./ or absolute
@@ -61,7 +63,14 @@ case "$PKG_FILE" in
         # dnf install accepts an absolute path directly. -y to skip
         # confirmation, --setopt=install_weak_deps=False to avoid
         # pulling unnecessary recommends.
-        INSTALL_CMD="dnf install -y --setopt=install_weak_deps=False /pkg/${PKG_FILE}"
+        #
+        # Through /dnf.sh, the wrapper mounted below, because even a
+        # local .rpm has its Requires resolved against the distro's
+        # repositories: a mirror serving metadata that names repodata it
+        # has already rotated away fails this leg for reasons that have
+        # nothing to do with the package. See "Distro mirrors and dnf"
+        # in docs/development.md.
+        INSTALL_CMD="/dnf.sh install -y --setopt=install_weak_deps=False /pkg/${PKG_FILE}"
         ;;
     *)
         echo "Error: unsupported package extension: $PKG_FILE" >&2
@@ -71,7 +80,6 @@ esac
 
 # Derive the expected guest-binary roster from src/operations/ so the
 # check tracks the source tree: core.bin plus <op>.bin per operation.
-REPO_ROOT=$(realpath "$(dirname "$0")/..")
 if [ ! -d "$REPO_ROOT/src/operations" ]; then
     echo "Error: cannot derive operation roster: $REPO_ROOT/src/operations not found" >&2
     exit 1
@@ -94,6 +102,7 @@ docker run --rm \
     --device /dev/kvm \
     -v "$PKG_DIR:/pkg:ro" \
     -v "$WORKDIR:/work:ro" \
+    -v "$REPO_ROOT/tools/ci/dnf.sh:/dnf.sh:ro" \
     "$DISTRO_IMAGE" \
     bash -c "
         set -euo pipefail

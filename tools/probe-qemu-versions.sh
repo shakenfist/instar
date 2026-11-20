@@ -30,6 +30,8 @@ set -uo pipefail
 DEB_DISTROS="${DEB_DISTROS:-debian:12 debian:13 ubuntu:22.04 ubuntu:24.04}"
 RPM_DISTROS="${RPM_DISTROS:-fedora:latest rockylinux:9 rockylinux/rockylinux:10}"
 
+REPO_ROOT=$(realpath "$(dirname "$0")/..")
+
 RESULTS=""
 FAILED=""
 
@@ -38,7 +40,9 @@ probe_one() {
     local install_cmd="$2"
     echo "### probing $distro ..." >&2
     local out
-    if out=$(docker run --rm "$distro" bash -c "
+    if out=$(docker run --rm \
+            -v "${REPO_ROOT}/tools/ci/dnf.sh:/dnf.sh:ro" \
+            "$distro" bash -c "
             set -e
             $install_cmd >/dev/null 2>&1
             qemu-img --version | head -1
@@ -57,7 +61,9 @@ for distro in $RPM_DISTROS; do
     # EL renamed/split the qemu-img package across releases (qemu-img on
     # EL9, provided by qemu-kvm-tools on some EL10 spins). Install by the
     # binary it provides so the probe is package-name agnostic.
-    probe_one "$distro" "dnf install -y -q qemu-img || dnf install -y -q /usr/bin/qemu-img"
+    # Through /dnf.sh so that a mirror mid-rotation reads as a slow
+    # probe rather than an unsupported distro.
+    probe_one "$distro" "/dnf.sh install -y -q qemu-img || /dnf.sh install -y -q /usr/bin/qemu-img"
 done
 
 echo ""

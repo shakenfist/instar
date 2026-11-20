@@ -733,6 +733,48 @@ checks the retry logic against a fake `apt-get`.
 `apt-get` run inside a fresh container needs none of this, since nothing
 else in the container is running apt, and calls it directly.
 
+### Distro mirrors and dnf
+
+The container legs have the mirror-image problem, and it is not about
+locks. Installing a package resolves its dependencies against the
+distro's repositories -- a local `.rpm` included, since its `Requires`
+have to come from somewhere -- so those legs depend on a third party's
+metadata being self-consistent at the moment they run. A point release's
+repodata rotation breaks that: a `repomd.xml` served from a stale mirror
+or edge cache names `primary` and `filelists` files the mirrors have
+already deleted, every mirror answers 404, and dnf stops before it has
+looked at the package at all:
+
+```
+  - Status code: 404 for https://.../9.9/AppStream/x86_64/os/repodata/
+      8dad4ae7...-primary.xml.gz
+Error: Failed to download metadata for repo 'appstream': ... Cannot
+download, all mirrors were already tried without success
+```
+
+Nothing in this repository is wrong when that happens, and it is
+expensive to be told so: the matrix legs are the last to run, so a 404
+in one of them can cost most of a day of queue wait before the ejected
+pull request can go back.
+
+So every dnf that resolves against a distro repository goes through
+`tools/ci/dnf.sh`, which retries that failure with a `clean metadata` in
+between -- so the retry cannot be answered from the copy that just
+failed -- inside one five-minute deadline. Any other failure, an unknown
+package or an unsatisfied dependency, is returned at once: that is an
+answer about the package, and retrying it would only make a clear
+failure slow. `tools/ci/test-dnf.sh` checks all of that against a fake
+dnf, including that the wrapper adds nothing to the arguments it is
+given.
+
+Inside a container the wrapper has to be mounted to be callable, which
+is what `-v "$REPO_ROOT/tools/ci/dnf.sh:/dnf.sh:ro"` in
+`tools/test-package-install.sh` is for;
+`tools/test-package-functional.sh` already mounts the repository at
+`/workspace` and calls it from there. Only the first dnf in a container
+needs it: dnf loads every enabled repository's metadata on the first
+transaction, so the calls after it reuse what that one fetched.
+
 ### Self-hosted runners and the GitHub CLI
 
 The same applies to `gh`: the `[self-hosted, debian-13, ...]` runners do
@@ -1164,6 +1206,8 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/apt-get.sh` - Runs `sudo apt-get`, waiting for apt's locks rather than failing on them; every host-side `apt-get` in CI goes through it (see "apt and its locks" above)
 - `tools/ci/test-apt-get.sh` - Tests for that wrapper against a fake `apt-get`; the `ci-tooling` CI job runs it
+- `tools/ci/dnf.sh` - Runs `dnf`, retrying a repository-metadata failure rather than failing the job on it; every dnf that resolves against a distro repository goes through it (see "Distro mirrors and dnf" above)
+- `tools/ci/test-dnf.sh` - Tests for that wrapper against a fake `dnf`; the `ci-tooling` CI job runs it
 - `tools/ci/install-docker.sh` - Installs the Docker client and daemon on a self-hosted runner, plus any extra packages passed as arguments (see "Self-hosted runners and Docker" above)
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
 - `tools/propose-release.sh`, `tools/tag-release.sh` - The two release steps: open the version-bump pull request, then tag the commit that merged it (see "Releases" above)
