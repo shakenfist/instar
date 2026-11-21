@@ -5,7 +5,7 @@
 # The functional-tests workflow's main cargo-test step runs the
 # workspace with default features only, which silently skips every
 # feature-gated test target: the luks crypto tests, the qcow2 create
-# tests, the qcow2 chain-reader-arm tests (vdi/parallels/qcow1/dmg
+# tests, the qcow2 chain-reader-arm tests (vdi/parallels/qcow1/dmg/vmdk
 # input), and the create crate. The 2026-07 pre-push audit found those
 # had never run in GitHub Actions, only via local `make test-rust`
 # (the "guest code silently dropping out of CI" failure class).
@@ -33,5 +33,5 @@ docker run --rm \
   instar-build \
   bash -c 'cargo test --release -p luks --features "decrypt,encrypt" && \
     cargo test --release -p qcow2 --features create && \
-    cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input" && \
+    cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vmdk-decompress" && \
     cargo test --release -p create'

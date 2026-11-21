@@ -28,8 +28,8 @@ pub mod create;
 use shared::COMPRESSED_BUF_SIZE;
 use shared::{
     be_u32, be_u64, l1_cache_addr, l2_cache_addr, AllocationSummary, BackingFormat, CallTable,
-    ChainConfig, ImageFormat, MapExtent, MapExtentCoalescer, MapExtentState, MAX_CHAIN_DEVICES,
-    MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    ChainConfig, ChainExtent, ImageFormat, MapExtent, MapExtentCoalescer, MapExtentState,
+    MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 #[cfg(feature = "vhd-input")]
 use vhd::{BlockLookup, VhdState};
@@ -15522,6 +15522,18 @@ mod tests {
         segment_count: u32,
         segments: &[(u32, u32)],
     ) -> (bool, u32, std::string::String) {
+        run_chain_init_with(devices, segment_count, segments, |_| {})
+    }
+
+    /// As `run_chain_init`, with `adjust` given the config to finish
+    /// before chain init sees it: the extent table, which `InitDev`
+    /// does not describe.
+    fn run_chain_init_with(
+        devices: &[InitDev],
+        segment_count: u32,
+        segments: &[(u32, u32)],
+        adjust: impl FnOnce(&mut ChainConfig),
+    ) -> (bool, u32, std::string::String) {
         let _guard = SEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let call_table = shared::CallTable {
             send_error: seg_send_err,
@@ -15549,6 +15561,7 @@ mod tests {
             }
             info.data_device_idx = data_device_idx;
         }
+        adjust(&mut chain_config);
 
         let mut chain_states = ChainStates::default();
         let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES];
@@ -15674,7 +15687,7 @@ mod tests {
 
     #[test]
     fn init_chain_states_accepts_every_data_device_layout_the_host_writes() {
-        use ImageFormat::{Qcow2, Raw, VmdkDescriptor};
+        use ImageFormat::{Qcow2, Raw};
         for (devices, segments, label) in [
             (
                 &[owner(Qcow2, 1), data_dev()][..],
@@ -15692,21 +15705,6 @@ mod tests {
                 "a data-file image over a qcow2 backing file",
             ),
             (
-                &[owner(VmdkDescriptor, 1), data_dev(), data_dev()][..],
-                &[(0, 3)][..],
-                "a flat descriptor with two extents",
-            ),
-            (
-                &[
-                    owner(Qcow2, 1),
-                    data_dev(),
-                    owner(VmdkDescriptor, 3),
-                    data_dev(),
-                ][..],
-                &[(0, 4)][..],
-                "a data-file image over a flat descriptor",
-            ),
-            (
                 &[
                     owner(Qcow2, 1),
                     data_dev(),
@@ -15717,21 +15715,211 @@ mod tests {
                 &[(0, 3), (3, 2)][..],
                 "compare of two data-file images",
             ),
-            (
-                &[
-                    owner(VmdkDescriptor, 1),
-                    data_dev(),
-                    owner(Qcow2, 3),
-                    data_dev(),
-                ][..],
-                &[(0, 2), (2, 2)][..],
-                "compare of a flat descriptor and a data-file image",
-            ),
         ] {
             let (ok, calls, msg) = run_chain_init(devices, segments.len() as u32, segments);
             assert!(ok, "{label} must initialise, said {msg:?}");
             assert_eq!(calls, 0, "{label} must raise nothing");
         }
+    }
+
+    /// Give the descriptor at `dev` in `config` the next `count` entries
+    /// of the extent table, each a 4096-byte flat file covering 4096
+    /// bytes, laid end to end from the start of the device.
+    fn give_flat_extents(config: &mut ChainConfig, dev: usize, count: u32) {
+        let first = config.extent_count;
+        config.devices[dev].first_extent = first;
+        config.devices[dev].extent_count = count;
+        for i in 0..count {
+            config.extents[(first + i) as usize] = ChainExtent {
+                device_offset: i as u64 * 4096,
+                file_length: 4096,
+                virtual_span: 4096,
+                kind: ChainExtent::KIND_FLAT,
+                _reserved: 0,
+            };
+        }
+        config.extent_count = first + count;
+    }
+
+    #[test]
+    fn init_chain_states_accepts_a_descriptor_attached_with_its_extents() {
+        use ImageFormat::{Qcow2, Raw, VmdkDescriptor};
+        // A descriptor is one device however many extents it has, so
+        // none of these has a slot per extent.
+        for (devices, segments, descriptors, label) in [
+            (
+                &[layer(VmdkDescriptor)][..],
+                &[(0u32, 1u32)][..],
+                &[(0usize, 2u32)][..],
+                "a descriptor with two extents",
+            ),
+            (
+                &[layer(VmdkDescriptor), layer(Raw)][..],
+                &[(0, 2)][..],
+                &[(0, 3)][..],
+                "a descriptor over a parent",
+            ),
+            (
+                &[owner(Qcow2, 1), data_dev(), layer(VmdkDescriptor)][..],
+                &[(0, 3)][..],
+                &[(2, 1)][..],
+                "a data-file image over a descriptor",
+            ),
+            (
+                &[layer(VmdkDescriptor), owner(Qcow2, 2), data_dev()][..],
+                &[(0, 1), (1, 2)][..],
+                &[(0, 2)][..],
+                "compare of a descriptor and a data-file image",
+            ),
+            (
+                &[layer(VmdkDescriptor), layer(VmdkDescriptor)][..],
+                &[(0, 1), (1, 1)][..],
+                &[(0, 2), (1, 3)][..],
+                "compare of two descriptors",
+            ),
+        ] {
+            let (ok, calls, msg) =
+                run_chain_init_with(devices, segments.len() as u32, segments, |config| {
+                    for &(dev, count) in descriptors {
+                        give_flat_extents(config, dev, count);
+                    }
+                });
+            assert!(ok, "{label} must initialise, said {msg:?}");
+            assert_eq!(calls, 0, "{label} must raise nothing");
+        }
+    }
+
+    /// Assert chain init refuses the config `adjust` finishes, says the
+    /// extent table is why, and raises no typed refusal.
+    fn assert_extent_table_refused(
+        devices: &[InitDev],
+        segments: &[(u32, u32)],
+        adjust: impl FnOnce(&mut ChainConfig),
+        label: &str,
+    ) {
+        let (ok, calls, msg) =
+            run_chain_init_with(devices, segments.len() as u32, segments, adjust);
+        assert!(!ok, "{label} must not initialise");
+        assert!(
+            msg.contains("extent table is not what the host lays out"),
+            "{label} must say why, said {msg:?}"
+        );
+        // Not a typed refusal, for the reason the data device layout is
+        // not one: the host writes the table.
+        assert_eq!(calls, 0, "{label} must not raise a typed refusal");
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_descriptor_attached_without_its_extents() {
+        use ImageFormat::{Raw, VmdkDescriptor};
+        // The reader finds a descriptor's content through the extent
+        // table and nowhere else, so a descriptor the table gives no
+        // entry has nothing of its content to read: its own bytes are
+        // its text, and serving them would hand the descriptor's source
+        // over as the disk.
+        for (devices, segments, label) in [
+            (
+                &[layer(VmdkDescriptor)][..],
+                &[(0u32, 1u32)][..],
+                "a descriptor on its own",
+            ),
+            (
+                &[layer(VmdkDescriptor), layer(Raw)][..],
+                &[(0, 2)][..],
+                "a descriptor with nothing but a parent",
+            ),
+        ] {
+            assert_extent_table_refused(devices, segments, |_| {}, label);
+        }
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_descriptor_that_owns_data_devices() {
+        use ImageFormat::{Qcow2, VmdkDescriptor};
+        // A descriptor's extents share its own device, so a descriptor
+        // naming a data device is the host and the guest disagreeing
+        // about how the image was attached. Only a qcow2's external
+        // data file is a device of its own.
+        for (devices, segments, label) in [
+            (
+                &[owner(VmdkDescriptor, 1), data_dev(), data_dev()][..],
+                &[(0u32, 3u32)][..],
+                "a descriptor with an extent per data device",
+            ),
+            (
+                &[
+                    owner(Qcow2, 1),
+                    data_dev(),
+                    owner(VmdkDescriptor, 3),
+                    data_dev(),
+                ][..],
+                &[(0, 4)][..],
+                "a data-file image over such a descriptor",
+            ),
+        ] {
+            assert_data_device_layout_refused(devices, segments, label);
+        }
+    }
+
+    #[test]
+    fn init_chain_states_refuses_an_extent_table_the_host_would_not_write() {
+        use ImageFormat::{Raw, VmdkDescriptor};
+        // One config for each way a table can send a read to the wrong
+        // bytes. `ChainConfig::extents_are_sound` has a test per clause;
+        // these show chain init asks it.
+        assert_extent_table_refused(
+            &[layer(VmdkDescriptor), layer(VmdkDescriptor)],
+            &[(0, 1), (1, 1)],
+            |config| {
+                give_flat_extents(config, 0, 2);
+                give_flat_extents(config, 1, 2);
+                config.devices[1].first_extent = 0;
+            },
+            "two descriptors naming the same extents",
+        );
+        assert_extent_table_refused(
+            &[layer(VmdkDescriptor)],
+            &[(0, 1)],
+            |config| {
+                give_flat_extents(config, 0, 2);
+                config.extents[1].kind = 0;
+            },
+            "an extent that does not say whether it is flat or sparse",
+        );
+        assert_extent_table_refused(
+            &[layer(VmdkDescriptor)],
+            &[(0, 1)],
+            |config| {
+                give_flat_extents(config, 0, 2);
+                config.extents[1].device_offset = 2048;
+            },
+            "an extent whose file starts inside the one before",
+        );
+        assert_extent_table_refused(
+            &[layer(Raw)],
+            &[(0, 1)],
+            |config| give_flat_extents(config, 0, 1),
+            "a raw image with extents",
+        );
+    }
+
+    #[cfg(not(feature = "vmdk-input"))]
+    #[test]
+    fn init_chain_states_refuses_a_sparse_extent_it_cannot_read() {
+        use ImageFormat::VmdkDescriptor;
+        // An operation built without sparse VMDK input says so at init,
+        // rather than starting and failing its first read.
+        let (ok, calls, msg) =
+            run_chain_init_with(&[layer(VmdkDescriptor)], 1, &[(0, 1)], |config| {
+                give_flat_extents(config, 0, 2);
+                config.extents[1].kind = ChainExtent::KIND_SPARSE;
+            });
+        assert!(!ok);
+        assert!(
+            msg.contains("sparse VMDK extent refused"),
+            "must say why, said {msg:?}"
+        );
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -15759,8 +15947,10 @@ mod tests {
     #[test]
     fn init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one() {
         use ImageFormat::{Qcow2, Raw};
-        // Only a qcow2's header names a data file, and only a VMDK
-        // descriptor names extents.
+        // Only a qcow2's header names a data file. A VMDK descriptor's
+        // extents are not devices -- they share the descriptor's own
+        // and are named by the extent table -- so a descriptor naming a
+        // data device is refused here too.
         assert_data_device_layout_refused(
             &[owner(Raw, 1), data_dev()],
             &[(0, 2)],
@@ -15823,8 +16013,10 @@ mod tests {
     #[test]
     fn init_chain_states_refuses_a_second_data_device_after_a_qcow2() {
         use ImageFormat::{Qcow2, Raw};
-        // A qcow2 has one data file. A marked device after it is claimed
-        // by nobody, unlike a descriptor's second extent.
+        // A qcow2 has one data file, so a second marked device after it
+        // is claimed by nobody. Nothing claims a run of them: a
+        // descriptor's extents share its own device and are named by
+        // the extent table.
         assert_data_device_layout_refused(
             &[owner(Qcow2, 1), data_dev(), data_dev()],
             &[(0, 3)],
@@ -15838,13 +16030,16 @@ mod tests {
     }
 
     // ========================================================================
-    // The VMDK flat descriptor's extent walk
+    // A VMDK descriptor's extents
     //
-    // A descriptor's content is its extents, on the data devices the host
-    // attaches after it. A read past the last extent must stop there and
-    // read zeros, as qemu does, rather than take the next device -- the
-    // descriptor's parent, or under `compare` the other input's top
-    // image -- as one more extent.
+    // A descriptor's content is its extents. The host attaches the
+    // descriptor and all of them as one device, the extent files laid one
+    // after another, and the config's extent table says where each file
+    // begins, how long it is, how much of the virtual disk it covers and
+    // whether it is flat or sparse. A read past the last extent must stop
+    // there and read zeros, as qemu does, rather than take whatever comes
+    // next -- the descriptor's parent, or under `compare` the other input
+    // -- as one more extent.
     // ========================================================================
 
     /// Bytes for a test extent or image: `tag` in the high nibble, the
@@ -15854,147 +16049,1151 @@ mod tests {
         (0..len).map(|i| tag | ((i / 512) % 16) as u8).collect()
     }
 
-    /// Read `len` bytes at `virt_off` through a VMDK flat descriptor at
-    /// device 0, whose extents start at device 1. `devices` are devices
-    /// 1 and 2: whether the host marked each as a data device, and its
-    /// bytes. The descriptor's chain is `segments[0]`.
-    fn desc_read(
-        devices: &[(bool, &[u8])],
-        segments: &[(u32, u32)],
-        virt_off: u64,
-        len: u64,
-    ) -> (bool, std::vec::Vec<u8>) {
-        assert!(devices.len() < SC_MAX_DEVS);
-        let device_count = 1 + devices.len();
-        // The descriptor's own bytes are text the reader never reads.
-        let descriptor = std::vec![b'#'; 512];
+    /// What the harness fills a descriptor's device with around its
+    /// extents' files. No extent holds it and it is not zero, so a read
+    /// that strays outside the file it should be in shows.
+    const DESC_PAD: u8 = 0xEE;
 
-        let mut chain_config = ChainConfig::new();
-        chain_config.device_count = device_count as u32;
-        chain_config.segment_count = segments.len() as u32;
-        for (i, &(first, count)) in segments.iter().enumerate() {
-            chain_config.segments[i] = shared::ChainSegment { first, count };
+    /// One extent of a descriptor under test.
+    struct DescExtent {
+        kind: u32,
+        /// The span the descriptor declares for the extent.
+        span: u64,
+        /// The extent's file.
+        file: std::vec::Vec<u8>,
+        /// Where the file begins in the device. `None` puts it where the
+        /// file before it ended, as a host that does not pad would.
+        at: Option<u64>,
+        /// What the extent's span reads as, with `None` for a byte the
+        /// extent does not hold and leaves to the chain behind it.
+        content: std::vec::Vec<Option<u8>>,
+    }
+
+    /// A flat extent whose file is exactly its span.
+    fn flat(file: &[u8]) -> DescExtent {
+        flat_spanning(file, file.len() as u64)
+    }
+
+    /// A flat extent declaring `span` bytes over a file that need not
+    /// be that long: what the file does not hold reads as zeros, and
+    /// what it holds past the span is not the extent's.
+    fn flat_spanning(file: &[u8], span: u64) -> DescExtent {
+        let mut content: std::vec::Vec<Option<u8>> =
+            file.iter().take(span as usize).map(|&b| Some(b)).collect();
+        content.resize(span as usize, Some(0));
+        DescExtent {
+            kind: ChainExtent::KIND_FLAT,
+            span,
+            file: file.to_vec(),
+            at: None,
+            content,
         }
-        chain_config.devices[0].format = ImageFormat::VmdkDescriptor as u32;
-        chain_config.devices[0].data_device_idx = 1;
-        let mut extents = 0u64;
-        for (i, &(marked, bytes)) in devices.iter().enumerate() {
-            let info = &mut chain_config.devices[1 + i];
-            info.format = ImageFormat::Raw as u32;
-            info.virtual_size = bytes.len() as u64;
-            if marked {
-                info.flags = shared::ChainDeviceInfo::FLAG_DATA_DEVICE;
-                extents += bytes.len() as u64;
+    }
+
+    /// One device of a test chain.
+    enum DescDev<'a> {
+        /// A VMDK descriptor attached with these extents.
+        Descriptor(&'a [DescExtent]),
+        /// A raw image.
+        Raw(&'a [u8]),
+    }
+
+    /// Test devices laid out and described as the host does it, and
+    /// what the chain that starts at device 0 should read as.
+    struct DescImage {
+        config: ChainConfig,
+        /// Each device's bytes. A descriptor's are its extents' files at
+        /// their offsets, with `DESC_PAD` everywhere else.
+        devices: std::vec::Vec<std::vec::Vec<u8>>,
+        /// The content of device 0 through its chain, as far as device
+        /// 0's own size.
+        model: std::vec::Vec<u8>,
+    }
+
+    impl DescImage {
+        /// What `len` bytes at `virt_off` should read as: the model,
+        /// and zeros past the end of it.
+        fn expect(&self, virt_off: u64, len: u64) -> std::vec::Vec<u8> {
+            (virt_off..virt_off + len)
+                .map(|v| self.model.get(v as usize).copied().unwrap_or(0))
+                .collect()
+        }
+    }
+
+    /// Lay `devices` out and describe them in a config: descriptors get
+    /// their slice of the extent table in device order, and `segments`
+    /// are the chains.
+    fn desc_image(devices: &[DescDev], segments: &[(u32, u32)]) -> DescImage {
+        assert!(devices.len() <= SC_MAX_DEVS);
+        let mut config = ChainConfig::new();
+        config.device_count = devices.len() as u32;
+        config.segment_count = segments.len() as u32;
+        for (i, &(first, count)) in segments.iter().enumerate() {
+            config.segments[i] = shared::ChainSegment { first, count };
+        }
+
+        let mut images = std::vec::Vec::new();
+        // What each device holds of its own content, `None` where it
+        // leaves a byte to the device behind it.
+        let mut contents: std::vec::Vec<std::vec::Vec<Option<u8>>> = std::vec::Vec::new();
+        for (dev, device) in devices.iter().enumerate() {
+            let info = &mut config.devices[dev];
+            match device {
+                DescDev::Raw(bytes) => {
+                    info.format = ImageFormat::Raw as u32;
+                    info.virtual_size = bytes.len() as u64;
+                    images.push(bytes.to_vec());
+                    contents.push(bytes.iter().map(|&b| Some(b)).collect());
+                }
+                DescDev::Descriptor(extents) => {
+                    info.format = ImageFormat::VmdkDescriptor as u32;
+                    info.first_extent = config.extent_count;
+                    info.extent_count = extents.len() as u32;
+                    let mut image = std::vec::Vec::new();
+                    let mut content = std::vec::Vec::new();
+                    for extent in extents.iter() {
+                        let at = extent.at.unwrap_or(image.len() as u64) as usize;
+                        assert!(at >= image.len(), "extent files must not overlap");
+                        image.resize(at, DESC_PAD);
+                        image.extend_from_slice(&extent.file);
+                        config.extents[config.extent_count as usize] = ChainExtent {
+                            device_offset: at as u64,
+                            file_length: extent.file.len() as u64,
+                            virtual_span: extent.span,
+                            kind: extent.kind,
+                            _reserved: 0,
+                        };
+                        config.extent_count += 1;
+                        assert_eq!(extent.content.len() as u64, extent.span);
+                        content.extend_from_slice(&extent.content);
+                    }
+                    config.devices[dev].virtual_size = content.len() as u64;
+                    // The mock serves whole sectors only, whatever the
+                    // sector size, and a spare sector of padding after
+                    // the last file gives a read that runs off the end
+                    // of it something to find.
+                    let padded = (image.len() / MAX_SECTOR_SIZE + 2) * MAX_SECTOR_SIZE;
+                    image.resize(padded, DESC_PAD);
+                    images.push(image);
+                    contents.push(content);
+                }
             }
         }
-        chain_config.devices[0].virtual_size = extents;
-        assert!(
-            chain_config.segmentation_covers(device_count)
-                && chain_config.data_devices_are_owned(device_count),
-            "the harness must build a config chain init accepts"
-        );
 
-        let _guard = SC_LOCK.lock().unwrap();
+        // Device 0 through its chain: each byte from the first device
+        // of the chain that holds it, zeros if none does, and nothing
+        // past the end of device 0.
+        let chain = &contents[..segments[0].1 as usize];
+        let model = (0..chain[0].len())
+            .map(|v| {
+                chain
+                    .iter()
+                    .find_map(|content| content.get(v).copied().unwrap_or(Some(0)))
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        DescImage {
+            config,
+            devices: images,
+            model,
+        }
+    }
+
+    /// Test devices attached and initialised, for a run of reads
+    /// through one set of chain states, as an operation makes them.
+    struct DescSession<'a> {
+        call_table: shared::CallTable,
+        config: &'a ChainConfig,
+        chain_states: ChainStates,
+        /// Whether chain init accepted the config and the images.
+        init_ok: bool,
+        sector_size: usize,
+        compressed_buf: std::vec::Vec<u8>,
+        staging_buf: std::vec::Vec<u8>,
+        staging_cluster_offset: u64,
+        /// Bytes read from the devices so far, chain init's included.
+        bytes_read: u64,
+        /// The devices' cache slots, which the chain states point into.
+        _cache: std::vec::Vec<u8>,
+    }
+
+    impl DescSession<'_> {
+        /// Read `len` bytes at `virt_off` through the chain that starts
+        /// at device 0. The buffer starts as 0x33, a byte no device
+        /// serves, so a byte the reader never wrote shows, and it is
+        /// longer than `len`, so one written past the end does too.
+        fn read(&mut self, virt_off: u64, len: u64) -> (bool, std::vec::Vec<u8>) {
+            const GUARD: usize = 4096;
+            let mut buf = std::vec![0x33u8; len as usize + GUARD];
+            let ok = unsafe {
+                read_chain_virtual_cluster(
+                    &self.call_table,
+                    0,
+                    self.config.segments[0].count as usize,
+                    virt_off,
+                    buf.as_mut_ptr(),
+                    len,
+                    self.sector_size,
+                    self.config,
+                    &mut self.chain_states,
+                    self.compressed_buf.as_mut_ptr(),
+                    self.staging_buf.as_mut_ptr(),
+                    &mut self.staging_cluster_offset,
+                    None,
+                    None,
+                    0,
+                    &mut self.bytes_read,
+                )
+            };
+            assert!(
+                buf[len as usize..].iter().all(|&b| b == 0x33),
+                "a read of {len} bytes at {virt_off} wrote past its buffer"
+            );
+            buf.truncate(len as usize);
+            (ok, buf)
+        }
+
+        /// The bytes a successful read of `len` at `virt_off` took from
+        /// the devices.
+        #[cfg(feature = "vmdk-input")]
+        fn cost_of(&mut self, virt_off: u64, len: u64) -> u64 {
+            let before = self.bytes_read;
+            let (ok, _) = self.read(virt_off, len);
+            assert!(ok, "a read of {len} bytes at {virt_off} must succeed");
+            self.bytes_read - before
+        }
+    }
+
+    /// Attach `image`'s devices with `sector_size` sectors, run chain
+    /// init over them, and hand `body` the session.
+    fn desc_run<R>(
+        image: &DescImage,
+        sector_size: usize,
+        body: impl FnOnce(&mut DescSession) -> R,
+    ) -> R {
+        let _guard = SC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
             let lens = core::ptr::addr_of_mut!(SC_LENS) as *mut usize;
-            *imgs = descriptor.as_ptr();
-            *lens = descriptor.len();
-            for (i, &(_, bytes)) in devices.iter().enumerate() {
-                *imgs.add(1 + i) = bytes.as_ptr();
-                *lens.add(1 + i) = bytes.len();
+            for i in 0..SC_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+                *lens.add(i) = 0;
             }
-            SC_SSZ = 512;
+            for (i, bytes) in image.devices.iter().enumerate() {
+                assert_eq!(
+                    bytes.len() % sector_size,
+                    0,
+                    "the mock serves whole sectors"
+                );
+                *imgs.add(i) = bytes.as_ptr();
+                *lens.add(i) = bytes.len();
+            }
+            SC_SSZ = sector_size;
         }
         let call_table = sc_call_table();
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES];
         let mut chain_states = ChainStates::default();
-        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut staging_cluster_offset = u64::MAX;
-        let mut buf = std::vec![0x33u8; len as usize];
         let mut bytes_read = 0u64;
-        let ok = unsafe {
-            read_chain_virtual_cluster(
+        let init_ok = unsafe {
+            init_chain_states(
                 &call_table,
-                0,
-                segments[0].1 as usize,
-                virt_off,
-                buf.as_mut_ptr(),
-                len,
-                512,
-                &chain_config,
+                &image.config,
                 &mut chain_states,
-                compressed_buf.as_mut_ptr(),
-                staging_buf.as_mut_ptr(),
-                &mut staging_cluster_offset,
-                None,
-                None,
+                image.config.device_count as usize,
+                sector_size,
+                cache.as_mut_ptr() as usize,
+                0,
                 0,
                 &mut bytes_read,
             )
         };
+        let mut session = DescSession {
+            call_table,
+            config: &image.config,
+            chain_states,
+            init_ok,
+            sector_size,
+            compressed_buf: std::vec![0u8; MAX_SECTOR_SIZE],
+            staging_buf: std::vec![0u8; MAX_SECTOR_SIZE],
+            staging_cluster_offset: u64::MAX,
+            bytes_read,
+            _cache: cache,
+        };
+        let out = body(&mut session);
         unsafe { sc_detach() };
-        (ok, buf)
+        out
     }
+
+    /// Read the whole of device 0's chain, and a little past it, in
+    /// pieces of several sizes from every 1536th byte, and check each
+    /// against the model. The step is three 512-byte sectors, so the
+    /// reads start on and off every boundary a larger sector, a grain or
+    /// an extent has.
+    fn desc_sweep(image: &DescImage, sector_size: usize, label: &str) {
+        desc_run(image, sector_size, |session| {
+            assert!(session.init_ok, "{label}: chain init must accept the image");
+            let end = image.model.len() as u64 + 8192;
+            for virt_off in (0..end).step_by(1536) {
+                for len in [1u64, 512, 4096, 6000, 20000] {
+                    let (ok, got) = session.read(virt_off, len);
+                    assert!(
+                        ok,
+                        "{label}: {len} bytes at {virt_off} with {sector_size}-byte sectors"
+                    );
+                    assert!(
+                        got == image.expect(virt_off, len),
+                        "{label}: {len} bytes at {virt_off} with {sector_size}-byte sectors \
+                         read the wrong bytes"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The sector sizes the read tests run at: the VMDK sector, one a
+    /// test extent's file is a multiple of, and the default.
+    const DESC_SECTOR_SIZES: [usize; 3] = [512, 4096, MAX_SECTOR_SIZE];
 
     #[test]
     fn vmdk_descriptor_extent_walk_stops_at_its_last_extent() {
         let extent = desc_bytes(0xA0, 65536);
         let next = desc_bytes(0x50, 131072);
-        for (segments, label) in [
-            // compare's layout: the descriptor and its extent are one
-            // input's chain and the next device is the other input's top
-            // image. A qcow2 overlay larger than the descriptor it sits
-            // on reads here, so `compare` said the two inputs differed in
-            // one argument order and were identical in the other.
+        let extents = [flat(&extent)];
+        let next_extents = [flat(&next)];
+        for (devices, segments, label) in [
+            // compare's layout: the descriptor is one input's chain and
+            // the next device is the other input's top image. A qcow2
+            // overlay larger than the descriptor it sits on reads here,
+            // so `compare` said the two inputs differed in one argument
+            // order and were identical in the other.
             (
-                &[(0u32, 2u32), (2, 1)][..],
+                [DescDev::Descriptor(&extents), DescDev::Raw(&next)],
+                &[(0u32, 1u32), (1, 1)][..],
                 "the next device in another chain",
+            ),
+            // The same with the other input a descriptor too, so that
+            // what follows the descriptor's last extent in the table is
+            // an entry as well, the other input's.
+            (
+                [
+                    DescDev::Descriptor(&extents),
+                    DescDev::Descriptor(&next_extents),
+                ],
+                &[(0, 1), (1, 1)][..],
+                "the next descriptor's extent in another chain",
             ),
             // The descriptor's parent, which the host follows a parent
             // hint to.
-            (&[(0, 3)][..], "the descriptor's parent"),
+            (
+                [DescDev::Descriptor(&extents), DescDev::Raw(&next)],
+                &[(0, 2)][..],
+                "the descriptor's parent",
+            ),
         ] {
-            let (ok, got) = desc_read(
-                &[(true, &extent[..]), (false, &next[..])],
-                segments,
-                0,
-                4096,
-            );
-            assert!(ok, "{label}: a read inside the extent must succeed");
-            assert_eq!(got, extent[..4096], "{label}: inside the extent");
+            let image = desc_image(&devices, segments);
+            desc_run(&image, 512, |session| {
+                assert!(session.init_ok, "{label}: chain init must accept the image");
 
-            let (ok, got) = desc_read(
-                &[(true, &extent[..]), (false, &next[..])],
-                segments,
-                65536,
-                4096,
-            );
-            assert!(ok, "{label}: a read past the last extent must succeed");
-            assert!(
-                got.iter().all(|&b| b == 0),
-                "{label}: past the last extent is zeros, not the next device's bytes"
-            );
+                let (ok, got) = session.read(0, 4096);
+                assert!(ok, "{label}: a read inside the extent must succeed");
+                assert_eq!(got, extent[..4096], "{label}: inside the extent");
+
+                let (ok, got) = session.read(65536, 4096);
+                assert!(ok, "{label}: a read past the last extent must succeed");
+                assert!(
+                    got.iter().all(|&b| b == 0),
+                    "{label}: past the last extent is zeros, not the bytes of what follows"
+                );
+
+                // A chunk that starts inside the extent and runs off
+                // the end of it stops there too.
+                let (ok, got) = session.read(65536 - 2048, 4096);
+                assert!(ok, "{label}: a read across the end must succeed");
+                assert_eq!(
+                    got[..2048],
+                    extent[65536 - 2048..],
+                    "{label}: up to the end"
+                );
+                assert!(
+                    got[2048..].iter().all(|&b| b == 0),
+                    "{label}: and zeros after it"
+                );
+            });
         }
     }
 
     #[test]
     fn vmdk_descriptor_reads_each_of_its_extents() {
-        // Two extents: the walk crosses the first into the second, at the
-        // second's own offset, and stops after it.
+        // Two extents of different spans: the walk crosses the first
+        // into the second, at the second's own offset, and stops after
+        // it.
         let first = desc_bytes(0xA0, 16384);
-        let second = desc_bytes(0xB0, 16384);
-        let devices = [(true, &first[..]), (true, &second[..])];
-        let segments = [(0u32, 3u32)];
-        let (ok, got) = desc_read(&devices, &segments, 4096, 4096);
-        assert!(ok);
-        assert_eq!(got, first[4096..8192], "inside the first extent");
-        let (ok, got) = desc_read(&devices, &segments, 16384 + 1024, 2048);
-        assert!(ok);
-        assert_eq!(got, second[1024..3072], "inside the second extent");
-        let (ok, got) = desc_read(&devices, &segments, 32768, 4096);
-        assert!(ok);
-        assert!(got.iter().all(|&b| b == 0), "past both extents");
+        let second = desc_bytes(0xB0, 8192);
+        let extents = [flat(&first), flat(&second)];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(4096, 4096);
+            assert!(ok);
+            assert_eq!(got, first[4096..8192], "inside the first extent");
+            let (ok, got) = session.read(16384 + 1024, 2048);
+            assert!(ok);
+            assert_eq!(got, second[1024..3072], "inside the second extent");
+            let (ok, got) = session.read(24576, 4096);
+            assert!(ok);
+            assert!(got.iter().all(|&b| b == 0), "past both extents");
+
+            // One chunk over the boundary between them is read from
+            // both, each part from its own extent.
+            let (ok, got) = session.read(16384 - 1024, 2048);
+            assert!(ok);
+            assert_eq!(
+                got[..1024],
+                first[16384 - 1024..],
+                "the first extent's tail"
+            );
+            assert_eq!(got[1024..], second[..1024], "the second extent's head");
+
+            // And one chunk over everything: both extents, then zeros.
+            let (ok, got) = session.read(0, 32768);
+            assert!(ok);
+            assert_eq!(got[..16384], first[..]);
+            assert_eq!(got[16384..24576], second[..]);
+            assert!(got[24576..].iter().all(|&b| b == 0));
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "two flat extents");
+        }
+    }
+
+    #[test]
+    fn vmdk_descriptor_honours_the_span_each_extent_declares() {
+        // An extent covers what its descriptor line says, which is not
+        // the length of its file and not the same for every extent.
+        //
+        // The first file stops halfway through its span. The rest of
+        // the span is zeros, though what the device holds at that
+        // offset is the second extent's file.
+        let short = desc_bytes(0xA0, 8192);
+        let second = desc_bytes(0xB0, 8192);
+        let extents = [flat_spanning(&short, 16384), flat(&second)];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(8192, 4096);
+            assert!(ok);
+            assert!(
+                got.iter().all(|&b| b == 0),
+                "past the end of a short file is zeros, not the next extent's file"
+            );
+            let (ok, got) = session.read(6144, 4096);
+            assert!(ok);
+            assert_eq!(got[..2048], short[6144..], "what the file holds");
+            assert!(got[2048..].iter().all(|&b| b == 0), "then zeros");
+            let (ok, got) = session.read(16384, 4096);
+            assert!(ok);
+            assert_eq!(
+                got,
+                second[..4096],
+                "the second extent starts after the span"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "a file shorter than its span");
+        }
+
+        // The first file runs on past its span. The second extent
+        // starts where the span ends, not where the file does.
+        let long = desc_bytes(0xA0, 8192);
+        let extents = [flat_spanning(&long, 4096), flat(&second)];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(4096, 4096);
+            assert!(ok);
+            assert_eq!(
+                got,
+                second[..4096],
+                "the second extent, not the first file's tail"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "a file longer than its span");
+        }
+    }
+
+    #[test]
+    fn vmdk_descriptor_reads_each_extents_file_where_the_table_puts_it() {
+        // The host says where each file begins. Files need not touch,
+        // and need not start on a device sector.
+        let first = desc_bytes(0xA0, 1536);
+        let second = desc_bytes(0xB0, 8192);
+        let third = desc_bytes(0xC0, 4096);
+        let extents = [
+            flat(&first),
+            DescExtent {
+                at: Some(32768 + 512),
+                ..flat(&second)
+            },
+            flat(&third),
+        ];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(1536, 4096);
+            assert!(ok);
+            assert_eq!(
+                got,
+                second[..4096],
+                "from the second file, not the gap before it"
+            );
+            let (ok, got) = session.read(1536 + 8192, 4096);
+            assert!(ok);
+            assert_eq!(got, third[..], "the third file follows the second");
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "files with a gap between them");
+        }
+    }
+
+    #[test]
+    fn vmdk_descriptor_is_read_wherever_it_sits_in_its_chain() {
+        // A descriptor behind another image is read through its own
+        // slice of the extent table, at its own device.
+        let top = desc_bytes(0xA0, 4096);
+        let lower_first = desc_bytes(0xB0, 8192);
+        let lower_second = desc_bytes(0xC0, 8192);
+        let top_extents = [flat(&top)];
+        let lower_extents = [flat(&lower_first), flat(&lower_second)];
+        let image = desc_image(
+            &[
+                DescDev::Descriptor(&top_extents),
+                DescDev::Descriptor(&lower_extents),
+            ],
+            &[(0, 1), (1, 1)],
+        );
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let mut buf = std::vec![0x33u8; 4096];
+            let mut bytes_read = 0u64;
+            let ok = unsafe {
+                read_chain_virtual_cluster(
+                    &session.call_table,
+                    1,
+                    1,
+                    8192 + 512,
+                    buf.as_mut_ptr(),
+                    4096,
+                    512,
+                    session.config,
+                    &mut session.chain_states,
+                    session.compressed_buf.as_mut_ptr(),
+                    session.staging_buf.as_mut_ptr(),
+                    &mut session.staging_cluster_offset,
+                    None,
+                    None,
+                    0,
+                    &mut bytes_read,
+                )
+            };
+            assert!(ok);
+            assert_eq!(buf, lower_second[512..512 + 4096]);
+        });
+    }
+
+    #[test]
+    fn vmdk_descriptor_without_its_extents_is_not_read_at_all() {
+        // Chain init refuses these, and the reader does not lean on
+        // that: it fails the read itself rather than serve the device's
+        // own bytes, which for a descriptor are its text.
+        let extent = desc_bytes(0xA0, 8192);
+        let extents = [flat(&extent)];
+        let mut image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        image.config.devices[0].extent_count = 0;
+        desc_run(&image, 512, |session| {
+            assert!(!session.init_ok, "chain init must refuse it too");
+            let (ok, got) = session.read(0, 4096);
+            assert!(!ok, "a descriptor with no extents must not read");
+            assert!(got.iter().all(|&b| b == 0x33), "and must serve nothing");
+        });
+
+        // An extent whose kind the table's writer never stated is not
+        // guessed at either.
+        for kind in [0u32, 3] {
+            let mut image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+            image.config.extents[0].kind = kind;
+            desc_run(&image, 512, |session| {
+                assert!(
+                    !session.init_ok,
+                    "kind {kind}: chain init must refuse it too"
+                );
+                let (ok, _) = session.read(0, 4096);
+                assert!(!ok, "kind {kind} must not read");
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Sparse extents
+    //
+    // Each sparse extent is a sparse image of its own: a header, a grain
+    // directory and grain tables covering only that extent's span, with
+    // every offset in them counted from the start of the extent's file.
+    // The test extents differ in which grains they hold and in what the
+    // grains contain, so tables or data read from the wrong extent, or
+    // from the right one at the wrong base, read as the wrong bytes
+    // rather than failing.
+    // ------------------------------------------------------------------------
+
+    /// One grain of a test sparse extent.
+    #[cfg(feature = "vmdk-input")]
+    #[derive(Clone, Copy)]
+    enum Grain {
+        /// Not in the extent: the chain behind it, or zeros.
+        Hole,
+        /// A zero-grain entry: zeros, whatever is behind the extent.
+        Zero,
+        /// Allocated, holding `sx_bytes`.
+        Data,
+    }
+
+    /// 4096-byte grains, four to a grain table: small enough that a
+    /// handful of grains spans several tables.
+    #[cfg(feature = "vmdk-input")]
+    const SX_GRAIN: u64 = 4096;
+    #[cfg(feature = "vmdk-input")]
+    const SX_GTES: usize = 4;
+    /// The 512-byte sector of a test extent's file where grain data
+    /// starts: after the header, the grain directory and room for six
+    /// grain tables.
+    #[cfg(feature = "vmdk-input")]
+    const SX_DATA_SECTOR: usize = 8;
+
+    /// The bytes of data grain `grain` of the extent tagged `tag`: the
+    /// tag in the high nibble, and a low nibble that differs from grain
+    /// to grain and from sector to sector within one.
+    #[cfg(feature = "vmdk-input")]
+    fn sx_bytes(tag: u8, grain: usize) -> std::vec::Vec<u8> {
+        (0..SX_GRAIN as usize)
+            .map(|i| tag | ((grain * 5 + i / 512) % 16) as u8)
+            .collect()
+    }
+
+    /// A sparse extent of `grains`, the last of them covering `short_by`
+    /// bytes less than a whole grain. Data grains are stored one after
+    /// another in the order given, so a grain's place in the file is not
+    /// its place in the extent's span and differs between extents.
+    #[cfg(feature = "vmdk-input")]
+    fn sparse(tag: u8, grains: &[Grain], short_by: u64) -> DescExtent {
+        assert!(!grains.is_empty() && grains.len() <= 6 * SX_GTES);
+        assert!(short_by < SX_GRAIN && short_by % 512 == 0);
+        let span = grains.len() as u64 * SX_GRAIN - short_by;
+
+        let mut file = std::vec![0u8; SX_DATA_SECTOR * 512];
+        vmdk::build_sparse_header(
+            &mut file,
+            span / 512,
+            SX_GRAIN / 512,
+            SX_GTES as u32,
+            1,
+            SX_DATA_SECTOR as u64,
+        );
+        shared::write_le_u32(
+            &mut file,
+            vmdk::FLAGS_OFFSET,
+            vmdk::FLAG_VALID_NEW_LINE | vmdk::FLAG_ZERO_GRAIN,
+        );
+        for table in 0..grains.len().div_ceil(SX_GTES) {
+            shared::write_le_u32(&mut file, 512 + table * 4, 2 + table as u32);
+        }
+
+        let mut content = std::vec::Vec::new();
+        for (i, grain) in grains.iter().enumerate() {
+            let entry_at = (2 + i / SX_GTES) * 512 + (i % SX_GTES) * 4;
+            let held = content.len() + SX_GRAIN as usize;
+            match grain {
+                Grain::Hole => content.resize(held, None),
+                Grain::Zero => {
+                    shared::write_le_u32(&mut file, entry_at, vmdk::GTE_ZEROED);
+                    content.resize(held, Some(0));
+                }
+                Grain::Data => {
+                    let sector = (file.len() / 512) as u32;
+                    shared::write_le_u32(&mut file, entry_at, sector);
+                    let bytes = sx_bytes(tag, i);
+                    content.extend(bytes.iter().map(|&b| Some(b)));
+                    file.extend_from_slice(&bytes);
+                }
+            }
+        }
+        content.truncate(span as usize);
+
+        DescExtent {
+            kind: ChainExtent::KIND_SPARSE,
+            span,
+            file,
+            at: None,
+            content,
+        }
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_reads_each_sparse_extent_through_its_own_tables() {
+        use Grain::{Data, Hole, Zero};
+        // Two extents with different grains allocated, in different
+        // places in their files, across two grain tables each.
+        let extents = [
+            sparse(0xA0, &[Data, Hole, Data, Zero, Data, Data, Hole, Data], 0),
+            sparse(0xB0, &[Hole, Data, Data, Hole, Data, Zero, Data], 0),
+        ];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        let second_base = extents[0].span;
+
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            // The second extent's first data grain is its grain 1, the
+            // first grain stored in its file. The first extent's grain 1
+            // is a hole, and the first grain stored in its file is its
+            // grain 0, so neither the first extent's tables nor its data
+            // give these bytes.
+            let (ok, got) = session.read(second_base + SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xB0, 1), "the second extent's own grain");
+            // And back in the first.
+            let (ok, got) = session.read(2 * SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 2), "the first extent's own grain");
+            // A chunk over the boundary between the two is read from
+            // both, through each one's tables.
+            let (ok, got) = session.read(second_base - SX_GRAIN, 3 * SX_GRAIN);
+            assert!(ok);
+            assert_eq!(
+                got[..4096],
+                sx_bytes(0xA0, 7),
+                "the first extent's last grain"
+            );
+            assert!(got[4096..8192].iter().all(|&b| b == 0), "the second's hole");
+            assert_eq!(
+                got[8192..],
+                sx_bytes(0xB0, 1),
+                "the second's first data grain"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "two sparse extents");
+        }
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_counts_a_sparse_extents_grains_from_its_own_start() {
+        use Grain::{Data, Hole};
+        // The first extent's span is not a whole number of grains, so
+        // the second extent's grains do not start on a multiple of the
+        // grain size in the virtual disk. Each extent's grains are
+        // counted from where its own span starts.
+        let extents = [
+            sparse(0xA0, &[Data, Data, Data], 2048),
+            sparse(0xB0, &[Data, Hole, Data, Data, Data], 1024),
+            sparse(0xC0, &[Data, Data], 0),
+        ];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        let second_base = extents[0].span;
+        assert_ne!(second_base % SX_GRAIN, 0, "the harness must misalign");
+
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(second_base, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(
+                got,
+                sx_bytes(0xB0, 0),
+                "the second extent's first grain, whole"
+            );
+            // The first extent's last grain is cut short by its span.
+            let (ok, got) = session.read(2 * SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got[..2048], sx_bytes(0xA0, 2)[..2048], "half a grain");
+            assert_eq!(
+                got[2048..],
+                sx_bytes(0xB0, 0)[..2048],
+                "then the next extent"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "extents that are not whole grains");
+        }
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_reads_flat_and_sparse_extents_together() {
+        use Grain::{Data, Hole, Zero};
+        // A descriptor's extents need not be of one kind. The flat
+        // files here are whole VMDK sectors but not whole grains or
+        // device sectors, so the sparse extents after them start partway
+        // into a device sector at every size but the smallest.
+        let lead = desc_bytes(0x10, 1536);
+        let middle = desc_bytes(0x20, 2560);
+        let extents = [
+            flat(&lead),
+            sparse(0xA0, &[Hole, Data, Zero, Data, Data], 0),
+            flat_spanning(&middle, 8192),
+            sparse(0xB0, &[Data, Data, Hole], 512),
+        ];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "flat and sparse extents");
+        }
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_believes_the_table_about_what_an_extent_is() {
+        use Grain::{Data, Hole};
+        // One file, a well-formed sparse image exactly as long as the
+        // span it covers, attached once as a sparse extent and once as
+        // a flat one. The descriptor's extent line says which it is and
+        // the table carries that; nothing about the file can. Parsed
+        // when the line said flat, a guest's data that happens to look
+        // like a sparse header would be read as one; read raw when the
+        // line said sparse, the header and tables would be served as
+        // the disk.
+        let as_sparse = sparse(0xA0, &[Data, Hole, Data, Data], 0);
+        let file = as_sparse.file.clone();
+        assert_eq!(file.len() as u64, as_sparse.span, "the harness must match");
+
+        let image = desc_image(&[DescDev::Descriptor(&[as_sparse])], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(0, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 0), "sparse: the first grain's data");
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert!(got.iter().all(|&b| b == 0), "sparse: a hole");
+        });
+
+        let image = desc_image(&[DescDev::Descriptor(&[flat(&file)])], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(0, file.len() as u64);
+            assert!(ok);
+            assert_eq!(got, file, "flat: the file's own bytes, header and all");
+        });
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_holds_one_sparse_extents_state_at_a_time() {
+        use Grain::Data;
+        // The descriptor's device has one parser state and one pair of
+        // cache sectors for however many sparse extents it has. Reading
+        // from a different extent re-reads that extent's header and
+        // starts its caches cold; reading on in the same extent does
+        // not. Counted in bytes read from the device, with 512-byte
+        // sectors: a header is one sector, and so is the part of the
+        // grain directory or of a grain table a lookup reads.
+        let extents = [
+            sparse(0xA0, &[Data, Data, Data, Data, Data], 0),
+            sparse(0xB0, &[Data, Data, Data], 0),
+        ];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        let second_base = extents[0].span;
+        const SECTOR: u64 = 512;
+        const HEADER: u64 = SECTOR;
+        const TABLES: u64 = 2 * SECTOR;
+
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            assert_eq!(
+                session.bytes_read, HEADER,
+                "chain init reads the first sparse extent's header and no more"
+            );
+            assert_eq!(
+                session.cost_of(0, SX_GRAIN),
+                TABLES + SX_GRAIN,
+                "the first read in the extent chain init left loaded"
+            );
+            assert_eq!(
+                session.cost_of(SX_GRAIN, SX_GRAIN),
+                SX_GRAIN,
+                "reading on in the same extent costs the data alone"
+            );
+            assert_eq!(
+                session.cost_of(second_base, SX_GRAIN),
+                HEADER + TABLES + SX_GRAIN,
+                "moving to the next extent reads its header"
+            );
+            assert_eq!(
+                session.cost_of(second_base + SX_GRAIN, SX_GRAIN),
+                SX_GRAIN,
+                "once"
+            );
+            assert_eq!(
+                session.cost_of(0, SX_GRAIN),
+                HEADER + TABLES + SX_GRAIN,
+                "and moving back reads the first one's again"
+            );
+            // One chunk over the boundary pays for one crossing. The
+            // first extent's last grain is in its second grain table,
+            // whose sector is the only one not already cached.
+            assert_eq!(
+                session.cost_of(second_base - SX_GRAIN, 2 * SX_GRAIN),
+                SECTOR + SX_GRAIN + HEADER + TABLES + SX_GRAIN,
+                "a chunk across the boundary changes extent once"
+            );
+
+            // What the reads returned is the point of the state being
+            // the right extent's: each of these follows a read in the
+            // other extent.
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 1));
+            let (ok, got) = session.read(second_base + 2 * SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xB0, 2));
+            let (ok, got) = session.read(4 * SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 4));
+        });
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_leaves_an_unallocated_grain_to_its_own_chain() {
+        use Grain::{Data, Hole, Zero};
+        let extents = [sparse(0xA0, &[Data, Hole, Zero, Hole], 0)];
+        let end = extents[0].span;
+        let next = desc_bytes(0x50, 131072);
+        let lower = [flat(&desc_bytes(0x60, 8192))];
+
+        // Behind the descriptor in its own chain: a hole reads the
+        // parent at the same virtual offset. A zero grain does not, and
+        // nor does anything past the last extent.
+        let image = desc_image(
+            &[DescDev::Descriptor(&extents), DescDev::Raw(&next)],
+            &[(0, 2)],
+        );
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(0, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 0), "a data grain is the extent's");
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, next[4096..8192], "a hole is the parent's");
+            let (ok, got) = session.read(2 * SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert!(got.iter().all(|&b| b == 0), "a zero grain is zeros");
+            let (ok, got) = session.read(end, SX_GRAIN);
+            assert!(ok);
+            assert!(
+                got.iter().all(|&b| b == 0),
+                "past the last extent is zeros, not the parent's bytes"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "a sparse extent over a parent");
+        }
+
+        // The parent a descriptor itself, shorter than the image over
+        // it: a hole reads through to it, and to zeros past its end.
+        let image = desc_image(
+            &[DescDev::Descriptor(&extents), DescDev::Descriptor(&lower)],
+            &[(0, 2)],
+        );
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "a sparse extent over a descriptor");
+        }
+
+        // The same device after the descriptor, but in another chain,
+        // as `compare` lays its two inputs out: a hole is zeros.
+        let image = desc_image(
+            &[DescDev::Descriptor(&extents), DescDev::Raw(&next)],
+            &[(0, 1), (1, 1)],
+        );
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(ok);
+            assert!(
+                got.iter().all(|&b| b == 0),
+                "a hole with nothing behind it in its own chain is zeros"
+            );
+        });
+        for sector_size in DESC_SECTOR_SIZES {
+            desc_sweep(&image, sector_size, "a sparse extent beside another chain");
+        }
+    }
+
+    /// Chain init's verdict on a descriptor of `extents`, and whether a
+    /// read of `len` bytes at `virt_off` then succeeds.
+    #[cfg(feature = "vmdk-input")]
+    fn desc_verdict(extents: &[DescExtent], virt_off: u64, len: u64) -> (bool, bool) {
+        let image = desc_image(&[DescDev::Descriptor(extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            (session.init_ok, session.read(virt_off, len).0)
+        })
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_refuses_a_sparse_extent_that_is_not_one() {
+        use Grain::Data;
+        let good = || sparse(0xA0, &[Data, Data], 0);
+        assert_eq!(
+            desc_verdict(&[good()], 0, 4096),
+            (true, true),
+            "the control"
+        );
+
+        // Raw data where the descriptor promised a sparse image.
+        let raw = desc_bytes(0x70, 8192);
+        let not_sparse = || DescExtent {
+            kind: ChainExtent::KIND_SPARSE,
+            ..flat(&raw)
+        };
+        assert_eq!(
+            desc_verdict(&[not_sparse()], 0, 4096),
+            (false, false),
+            "the first sparse extent is read at chain init"
+        );
+
+        // Behind a sound extent, the bad one is met when a read
+        // reaches it. The reads before it succeed, the one into it
+        // fails, and the sound extent is still readable afterwards: the
+        // state held was left alone.
+        let extents = [good(), not_sparse()];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, got) = session.read(0, SX_GRAIN);
+            assert!(ok);
+            assert_eq!(got, sx_bytes(0xA0, 0));
+            let (ok, _) = session.read(extents[0].span, 4096);
+            assert!(!ok, "a read into the extent that is not sparse must fail");
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(ok, "the sound extent must still read");
+            assert_eq!(got, sx_bytes(0xA0, 1));
+        });
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_refuses_a_sparse_extent_whose_capacity_is_not_its_span() {
+        use Grain::Data;
+        // qemu takes a sparse extent's span from the extent's header
+        // and the host takes it from the descriptor. Where they differ
+        // the two would lay the later extents out differently.
+        for (span_delta, label) in [(4096i64, "a longer span"), (-4096, "a shorter span")] {
+            let mut extent = sparse(0xA0, &[Data, Data, Data], 0);
+            extent.span = (extent.span as i64 + span_delta) as u64;
+            extent.content.resize(extent.span as usize, Some(0));
+            assert_eq!(desc_verdict(&[extent], 0, 4096), (false, false), "{label}");
+        }
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_refuses_a_compressed_sparse_extent() {
+        use Grain::Data;
+        let mut extent = sparse(0xA0, &[Data, Data], 0);
+        shared::write_le_u32(
+            &mut extent.file,
+            vmdk::FLAGS_OFFSET,
+            vmdk::FLAG_VALID_NEW_LINE | vmdk::FLAG_COMPRESSED | vmdk::FLAG_MARKER,
+        );
+        assert_eq!(desc_verdict(&[extent], 0, 4096), (false, false));
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_refuses_a_sparse_extent_off_a_vmdk_sector() {
+        use Grain::Data;
+        // A flat file that is not a whole number of 512-byte sectors
+        // leaves the sparse extent after it where one cannot be read.
+        let odd = desc_bytes(0x10, 1000);
+        let extents = [flat(&odd), sparse(0xA0, &[Data, Data], 0)];
+        assert_eq!(desc_verdict(&extents, 1000, 4096), (false, false));
+        // The control: the same pair with the flat file whole sectors.
+        let even = desc_bytes(0x10, 1024);
+        let extents = [flat(&even), sparse(0xA0, &[Data, Data], 0)];
+        assert_eq!(desc_verdict(&extents, 1024, 4096), (true, true));
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_holds_a_sparse_extents_pointers_to_its_own_file() {
+        use Grain::Data;
+        // In the device, an extent's file is followed by the next
+        // extent's. An entry in the first that points past its own file
+        // points into the second, and is refused rather than served the
+        // second's bytes as the first's data.
+        let second = || sparse(0xB0, &[Data, Data], 0);
+        let entry_at = |grain: usize| (2 + grain / SX_GTES) * 512 + (grain % SX_GTES) * 4;
+
+        // A grain one sector past the last whole grain of the file.
+        let mut first = sparse(0xA0, &[Data, Data, Data], 0);
+        let last_whole = (first.file.len() as u64 - SX_GRAIN) / 512;
+        shared::write_le_u32(&mut first.file, entry_at(1), last_whole as u32 + 1);
+        let extents = [first, second()];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, _) = session.read(0, SX_GRAIN);
+            assert!(ok, "the control: a grain inside the file");
+            let (ok, got) = session.read(SX_GRAIN, SX_GRAIN);
+            assert!(
+                !ok,
+                "a grain running into the next extent's file must not read"
+            );
+            assert!(got.iter().all(|&b| b == 0x33), "and must serve nothing");
+        });
+
+        // A grain table in the sector after the file's last, which in
+        // the device is the start of the next extent's file. That file
+        // is flat here and starts with bytes that read as a grain table
+        // entry naming the first extent's own first grain, so a lookup
+        // that followed the pointer would succeed with the wrong data.
+        let mut first = sparse(0xA0, &[Data, Data, Data, Data, Data], 0);
+        let past_end = (first.file.len() / 512) as u32;
+        shared::write_le_u32(&mut first.file, 512 + 4, past_end);
+        let mut decoy = std::vec![0u8; 4096];
+        shared::write_le_u32(&mut decoy, 0, SX_DATA_SECTOR as u32);
+        let extents = [first, flat(&decoy)];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            let (ok, _) = session.read(0, SX_GRAIN);
+            assert!(ok, "the control: a grain through the first table");
+            let (ok, got) = session.read(4 * SX_GRAIN, SX_GRAIN);
+            assert!(
+                !ok,
+                "a grain table in the next extent's file must not be read"
+            );
+            assert!(got.iter().all(|&b| b == 0x33), "and must serve nothing");
+        });
+    }
+
+    #[cfg(feature = "vmdk-input")]
+    #[test]
+    fn vmdk_descriptor_sparse_read_needs_the_state_chain_init_reads() {
+        use Grain::Data;
+        // The device's cache sectors are found through the state chain
+        // init leaves. Without it there is nowhere to read tables into,
+        // and the read fails rather than using memory it was not given.
+        let extents = [sparse(0xA0, &[Data, Data], 0)];
+        let image = desc_image(&[DescDev::Descriptor(&extents)], &[(0, 1)]);
+        desc_run(&image, 512, |session| {
+            assert!(session.init_ok);
+            session.chain_states = ChainStates::default();
+            let (ok, got) = session.read(0, SX_GRAIN);
+            assert!(!ok);
+            assert!(got.iter().all(|&b| b == 0x33));
+        });
     }
 }
 
@@ -17075,6 +18274,371 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
     }
 }
 
+/// The extent of a VMDK descriptor that covers `virtual_offset`, and
+/// how far into that extent's span the offset is.
+///
+/// `extents` is the descriptor's own slice of the config's extent
+/// table, in descriptor order, which is virtual-offset order: the first
+/// extent's span starts at virtual offset zero and each later one
+/// starts where the one before it ended. An extent covers the span its
+/// descriptor line declares, which is not the length of its file and
+/// need not be the same from one extent to the next.
+///
+/// `None` when the offset is past the last extent's span. The walk is
+/// over this descriptor's slice and nothing else, so it cannot run on
+/// into whatever the table or the device array holds next. Under
+/// `compare` that is the other input, and for a descriptor with a
+/// parent it is the parent; either one taken as a further extent would
+/// be served under success where qemu reads zeros.
+fn vmdk_extent_at(extents: &[ChainExtent], virtual_offset: u64) -> Option<(&ChainExtent, u64)> {
+    let mut within = virtual_offset;
+    for extent in extents {
+        if within < extent.virtual_span {
+            return Some((extent, within));
+        }
+        within -= extent.virtual_span;
+    }
+    None
+}
+
+/// Read `len` bytes starting `within` bytes into a flat extent's span.
+///
+/// A flat extent's file is its sectors, so the bytes are `within` on
+/// from where the file begins in the device. The span is what the
+/// descriptor declares, and the file may stop short of it: what the
+/// file does not hold reads as zeros, as it does in qemu, rather than
+/// being read from the device at that offset, where the next extent's
+/// file begins.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` writable bytes, `len` must not be
+/// zero or run past the end of the extent's span, and `call_table` must
+/// be valid.
+unsafe fn read_vmdk_flat_extent(
+    call_table: &CallTable,
+    dev: u32,
+    extent: &ChainExtent,
+    within: u64,
+    buf: *mut u8,
+    len: u64,
+    sector_size: usize,
+    cap: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let in_file = extent.file_length.saturating_sub(within).min(len);
+    if in_file > 0 {
+        let device_offset = match extent.device_offset.checked_add(within) {
+            Some(offset) => offset,
+            None => return false,
+        };
+        if !read_raw_sectors(
+            call_table,
+            dev,
+            device_offset,
+            buf,
+            in_file,
+            sector_size,
+            cap,
+            bytes_read,
+        ) {
+            return false;
+        }
+    }
+    core::ptr::write_bytes(buf.add(in_file as usize), 0, (len - in_file) as usize);
+    true
+}
+
+/// Read the header of one sparse extent of a VMDK descriptor device
+/// into a parser state that uses the device's cache buffers.
+///
+/// `None` if the header is unreadable or refused, or if the capacity it
+/// states is not the span the extent table gives the extent. qemu takes
+/// a sparse extent's span from the capacity in the extent's own header
+/// and ignores the sector count on the descriptor line; the host has
+/// only the line. qemu writes the same number in both places when it
+/// creates a split image, so for those it makes no difference which is
+/// used. Where the two differ, every later extent sits at a different
+/// virtual offset for qemu than in the host's table, so the image is
+/// refused rather than read in a layout qemu does not see.
+///
+/// # Safety
+///
+/// As [`VmdkState::init_at`].
+#[cfg(feature = "vmdk-input")]
+unsafe fn open_vmdk_extent(
+    call_table: &CallTable,
+    dev: u32,
+    extent: &ChainExtent,
+    gd_cache_buf: *mut u8,
+    gt_cache_buf: *mut u8,
+    sector_size: usize,
+    cap: u64,
+    bytes_read: &mut u64,
+) -> Option<VmdkState> {
+    let state = VmdkState::init_at(
+        call_table,
+        dev,
+        sector_size,
+        cap,
+        extent.device_offset,
+        extent.file_length,
+        gd_cache_buf,
+        gt_cache_buf,
+        bytes_read,
+    )?;
+    if state.capacity_sectors.checked_mul(512) != Some(extent.virtual_span) {
+        return None;
+    }
+    Some(state)
+}
+
+/// Make the one parser state a VMDK descriptor device holds that of
+/// `extent`, and return it.
+///
+/// Format state is kept per device, and so are the grain directory and
+/// grain table caches it reads through, sized for the device slots
+/// there are. A descriptor's extents all share its device, however many
+/// of them there are, so the device holds the state of one sparse
+/// extent at a time: the one last read from. A read that lands in a
+/// different extent reads that extent's header here, and the new state
+/// takes the old one's place and its two cache buffers. That costs a
+/// header read per crossing, and a grain directory sector on the lookup
+/// that follows, so reading an image through in order pays it once per
+/// extent and a read that seeks pays it each time it changes extent.
+///
+/// `None` if the extent's header cannot be read or is refused, and then
+/// the state held is left as it was, still good for the extent it came
+/// from. `None` as well if the device holds no state at all:
+/// [`init_chain_states`] reads one for every descriptor that has a
+/// sparse extent, and that state is where the device's cache buffers
+/// are found, so without it there is nowhere to read into.
+///
+/// Never inlined: reading a header takes far more stack than the read
+/// loop that calls this, and the loop's frame is live across a descent
+/// into the rest of the chain.
+///
+/// # Safety
+///
+/// `call_table` must be valid, and a state in `held` must have been
+/// initialised with cache buffers that are still valid.
+#[cfg(feature = "vmdk-input")]
+#[inline(never)]
+unsafe fn hold_vmdk_extent_state<'a>(
+    call_table: &CallTable,
+    dev: u32,
+    extent: &ChainExtent,
+    held: &'a mut Option<VmdkState>,
+    sector_size: usize,
+    cap: u64,
+    bytes_read: &mut u64,
+) -> Option<&'a mut VmdkState> {
+    let (gd_cache_buf, gt_cache_buf) = {
+        let state = held.as_ref()?;
+        if state.is_image_at(extent.device_offset, extent.file_length) {
+            return held.as_mut();
+        }
+        (state.gd_cache_buf, state.gt_cache_buf)
+    };
+    let state = open_vmdk_extent(
+        call_table,
+        dev,
+        extent,
+        gd_cache_buf,
+        gt_cache_buf,
+        sector_size,
+        cap,
+        bytes_read,
+    )?;
+    *held = Some(state);
+    held.as_mut()
+}
+
+/// Read a chunk of a VMDK descriptor device's content from its extents.
+///
+/// The descriptor and its extents are one device, whose bytes are the
+/// extent files laid end to end, and the config's extent table says
+/// where each file begins, how long it is, how much of the virtual disk
+/// it covers and whether it is flat or sparse. The chunk is read a
+/// piece at a time, each piece inside one extent:
+///
+/// * a flat extent's piece is read straight from its file;
+/// * a sparse extent's piece is further held to one grain and looked up
+///   in that extent's own grain directory and grain tables, which cover
+///   only its span and are found relative to where its file begins. A
+///   grain the extent does not hold is read from the rest of the chain,
+///   as an unallocated grain of a single-file sparse image is, and is
+///   zeros when nothing is behind the descriptor;
+/// * past the last extent the rest of the chunk is zeros, and the read
+///   stops there: see [`vmdk_extent_at`].
+///
+/// Everything is done in this one loop, without re-entering the chain
+/// reader to split the chunk, so an extent boundary costs no reader
+/// frame however many of them a chunk crosses. The reader is entered
+/// again only to read an unallocated grain from the device behind this
+/// one, which is the descent every format's arm makes.
+///
+/// `chain_len` counts the devices of the chain from the descriptor on,
+/// the descriptor included.
+///
+/// # Safety
+///
+/// As [`read_chain_virtual_cluster`], which this is one arm of.
+#[cfg_attr(not(feature = "vmdk-input"), allow(unused_variables))]
+#[inline(never)]
+unsafe fn read_vmdk_descriptor_chunk(
+    call_table: &CallTable,
+    dev_idx: usize,
+    chain_len: usize,
+    virtual_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    cap: u64,
+    chain_config: &ChainConfig,
+    chain_states: &mut ChainStates,
+    compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    // A descriptor attached without its extents has nothing to read:
+    // its own bytes are the descriptor's text, not the disk's content.
+    let extents = chain_config.device_extents(dev_idx);
+    if extents.is_empty() {
+        return false;
+    }
+    let dev = dev_idx as u32;
+
+    let mut done = 0u64;
+    while done < chunk_size {
+        let cur = match virtual_offset.checked_add(done) {
+            Some(cur) => cur,
+            None => return false,
+        };
+        let dst = buf.add(done as usize);
+        let left = chunk_size - done;
+
+        let Some((extent, within)) = vmdk_extent_at(extents, cur) else {
+            core::ptr::write_bytes(dst, 0, left as usize);
+            return true;
+        };
+        // A piece ends where its extent's span does. What follows is
+        // the next extent's, at the start of a different file.
+        let in_extent = left.min(extent.virtual_span - within);
+
+        let served = match extent.kind {
+            ChainExtent::KIND_FLAT => {
+                if !read_vmdk_flat_extent(
+                    call_table,
+                    dev,
+                    extent,
+                    within,
+                    dst,
+                    in_extent,
+                    sector_size,
+                    cap,
+                    bytes_read,
+                ) {
+                    return false;
+                }
+                in_extent
+            }
+            #[cfg(feature = "vmdk-input")]
+            ChainExtent::KIND_SPARSE => {
+                let state = match hold_vmdk_extent_state(
+                    call_table,
+                    dev,
+                    extent,
+                    &mut chain_states.vmdk_states[dev_idx],
+                    sector_size,
+                    cap,
+                    bytes_read,
+                ) {
+                    Some(state) => state,
+                    None => return false,
+                };
+
+                // One grain at a time: a grain table entry maps one
+                // grain, and adjacent grains are not adjacent in the
+                // file. Grains are counted from the start of the
+                // extent's own span, not of the virtual disk, so the
+                // boundary is found from `within`.
+                let grain_size_bytes = state.grain_size_bytes;
+                let in_grain = within % grain_size_bytes;
+                let piece = in_extent.min(grain_size_bytes - in_grain);
+
+                match state.grain_lookup(call_table, within, sector_size, cap, bytes_read) {
+                    Some(GrainLookup::Unallocated) => {
+                        // The piece is offered to the rest of the
+                        // descriptor's own chain at its virtual offset.
+                        // `chain_len` bounds that chain, so the device
+                        // after the descriptor is read only when it is
+                        // the descriptor's parent.
+                        if chain_len > 1 {
+                            if !read_chain_virtual_cluster(
+                                call_table,
+                                dev_idx + 1,
+                                chain_len - 1,
+                                cur,
+                                dst,
+                                piece,
+                                sector_size,
+                                chain_config,
+                                chain_states,
+                                compressed_buf,
+                                staging_buf,
+                                staging_cluster_offset,
+                                aes_key,
+                                luks_key,
+                                luks_sector_size,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                        } else {
+                            core::ptr::write_bytes(dst, 0, piece as usize);
+                        }
+                    }
+                    Some(GrainLookup::Zeroed) => {
+                        core::ptr::write_bytes(dst, 0, piece as usize);
+                    }
+                    Some(GrainLookup::Standard(host_offset)) => {
+                        // `host_offset` is the grain's place in the
+                        // device, the extent's base already added, and
+                        // the lookup has held the whole grain to the
+                        // extent's own file.
+                        if !read_cluster_sectors(
+                            call_table,
+                            dev,
+                            host_offset + in_grain,
+                            dst,
+                            piece,
+                            sector_size,
+                            bytes_read,
+                        ) {
+                            return false;
+                        }
+                    }
+                    // A compressed extent is refused when its header is
+                    // read, so no lookup of one reaches here.
+                    Some(GrainLookup::Compressed(_)) | None => return false,
+                }
+                piece
+            }
+            // A kind this build cannot read: one the table's writer
+            // never stated, or a sparse extent in an operation built
+            // without sparse VMDK input.
+            _ => return false,
+        };
+        done += served;
+    }
+    true
+}
+
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
@@ -17090,6 +18654,10 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 ///   [`shared::DataFileEntryRefusal`] (#803).
 /// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
 ///   If unallocated, try next device.
+/// - VMDK descriptor: read from the extents the config's extent table
+///   gives the device, flat ones directly and (with `vmdk-input`) sparse
+///   ones through each extent's own grain tables; zeros past the last
+///   extent. See [`read_vmdk_descriptor_chunk`].
 /// - VHD (with `vhd-input` feature): perform BAT block lookup. If
 ///   unallocated, try next device. A differencing child also consults the
 ///   block's sector bitmap, and descends for the runs of 512-byte sectors
@@ -18876,57 +20444,36 @@ pub unsafe fn read_chain_virtual_cluster(
                 return true;
             }
             ImageFormat::VmdkDescriptor => {
-                // A VMDK flat descriptor holds no content of its
-                // own; the flat extent(s) live on data device(s)
-                // wired up by the VMM. Walk consecutive data
-                // devices starting at data_device_idx, using each
-                // device's virtual_size (= extent size from
-                // descriptor) to map the virtual offset to the
-                // correct extent and offset within it.
-                let first_data_dev = chain_config.devices[dev_idx].data_device_idx;
-                if first_data_dev == 0 {
-                    return false;
-                }
-
-                // Walk data devices to find which extent holds
-                // the requested virtual offset.
-                //
-                // The extents are the run of marked data devices that
-                // starts at data_device_idx, and the walk stops at the
-                // first device that is not one. The device after the
-                // last extent is the descriptor's parent, or under
-                // `compare` the other input's top image; taking it as
-                // one more extent would serve its raw bytes under
-                // success where qemu reads zeros. `init_chain_states`
-                // checks that the run is where the host put it.
-                let mut remaining = virtual_offset;
-                let mut d = first_data_dev;
-                while (d as usize) < chain_config.device_count as usize
-                    && chain_config.devices[d as usize].is_data_device()
-                {
-                    let ext_size = chain_config.devices[d as usize].virtual_size;
-                    if ext_size == 0 {
-                        break; // End of data devices
-                    }
-                    if remaining < ext_size {
-                        let data_cap = (call_table.get_input_capacity)(d);
-                        return read_raw_sectors(
-                            call_table,
-                            d,
-                            remaining,
-                            buf,
-                            chunk_size,
-                            sector_size,
-                            data_cap,
-                            bytes_read,
-                        );
-                    }
-                    remaining -= ext_size;
-                    d += 1;
-                }
-                // Offset beyond all extents: zeros
-                core::ptr::write_bytes(buf, 0, chunk_size as usize);
-                return true;
+                // A VMDK descriptor holds no content of its own. Its
+                // content is its extents, which the host attaches with
+                // it as this one device and describes in the config's
+                // extent table. The read is a call rather than more of
+                // this arm so that what it needs stays out of this
+                // function's frame, which every device in a chain can
+                // hold twice over.
+                let chain_left = match chain_len.checked_sub(dev_offset) {
+                    Some(left) => left,
+                    None => return false,
+                };
+                return read_vmdk_descriptor_chunk(
+                    call_table,
+                    dev_idx,
+                    chain_left,
+                    virtual_offset,
+                    buf,
+                    chunk_size,
+                    sector_size,
+                    cap,
+                    chain_config,
+                    chain_states,
+                    compressed_buf,
+                    staging_buf,
+                    staging_cluster_offset,
+                    aes_key,
+                    luks_key,
+                    luks_sector_size,
+                    bytes_read,
+                );
             }
             _ => {
                 return read_raw_sectors(
@@ -19043,6 +20590,10 @@ pub unsafe fn read_chain_virtual_range(
 #[derive(Default)]
 pub struct ChainStates {
     pub qcow2_states: [Option<Qcow2State>; MAX_CHAIN_DEVICES],
+    /// A sparse VMDK device's state. For a VMDK descriptor device, the
+    /// state of whichever of its sparse extents was last read from:
+    /// the extents share the device's one slot, and the reader re-reads
+    /// it as reads move between them.
     #[cfg(feature = "vmdk-input")]
     pub vmdk_states: [Option<VmdkState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "vhd-input")]
@@ -19272,6 +20823,23 @@ pub unsafe fn init_chain_states(
         );
         return false;
     }
+    // A VMDK descriptor is attached as one device with all its extents,
+    // and the reader finds each extent's file, span and kind in the
+    // config's extent table. A table that leaves a descriptor without
+    // extents, shares entries between devices, or lists files that
+    // overlap reads the wrong bytes without any read failing, so it is
+    // checked here, once, with the other two layout rules.
+    //
+    // A plain failure for the same reason as those: the host writes
+    // the table, so one that breaks the rule is instar disagreeing with
+    // itself and says nothing about the user's image.
+    if !chain_config.extents_are_sound(device_count) {
+        (call_table.debug_print)(
+            b"init_chain_states: chain config extent table is not what the host lays out\n\0"
+                .as_ptr(),
+        );
+        return false;
+    }
     for dev_idx in 0..device_count {
         let dev_info = &chain_config.devices[dev_idx];
         let format = dev_info.detected_format();
@@ -19307,6 +20875,53 @@ pub unsafe fn init_chain_states(
                 );
                 if chain_states.vmdk_states[dev_idx].is_none() {
                     return false;
+                }
+            }
+            ImageFormat::VmdkDescriptor => {
+                // A flat extent needs no state. A sparse one is a
+                // sparse image of its own, and the descriptor's device
+                // has state and cache slots for one of them at a time,
+                // which the reader re-reads as reads move between
+                // extents. The first sparse extent's is read here: it
+                // is the one a read from the start of the image wants,
+                // a broken one is refused at init as a broken
+                // single-file sparse image is, and it is where the
+                // reader finds the device's cache slots (L1→GD, L2→GT)
+                // from then on.
+                let first_sparse = chain_config
+                    .device_extents(dev_idx)
+                    .iter()
+                    .find(|extent| extent.kind == ChainExtent::KIND_SPARSE);
+                if let Some(extent) = first_sparse {
+                    #[cfg(feature = "vmdk-input")]
+                    {
+                        chain_states.vmdk_states[dev_idx] = open_vmdk_extent(
+                            call_table,
+                            dev_idx as u32,
+                            extent,
+                            l1_cache_addr(dynamic_bufs_start, dev_idx),
+                            l2_cache_addr(dynamic_bufs_start, dev_idx),
+                            sector_size,
+                            cap,
+                            bytes_read,
+                        );
+                        if chain_states.vmdk_states[dev_idx].is_none() {
+                            return false;
+                        }
+                    }
+                    // An operation built without sparse VMDK input
+                    // cannot read the extent at all. Said here rather
+                    // than left to the first read to fail without a
+                    // reason.
+                    #[cfg(not(feature = "vmdk-input"))]
+                    {
+                        let _ = extent;
+                        (call_table.debug_print)(
+                            b"init_chain_states: sparse VMDK extent refused (not readable by this operation)\n\0"
+                                .as_ptr(),
+                        );
+                        return false;
+                    }
                 }
             }
             #[cfg(feature = "vhd-input")]

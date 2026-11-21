@@ -184,6 +184,18 @@ KNOWN_FORMAT_DIVERGENCES = {
     # and 'gpt' by oslo (the file appears to be a raw disk
     # with GPT partitions despite the .vmdk extension).
     'vmdk-multi-partition': ('raw', 'gpt'),
+    # vmdk-split-sparse-5g-boundary is a text descriptor written by
+    # qemu-img convert, which NUL-pads it to 512 bytes. oslo.utils'
+    # VMDKInspector.post_process() decodes the first 512 bytes and
+    # treats the file as a text descriptor only if every character is
+    # printable or whitespace; a NUL is neither, so it raises
+    # ImageFormatError('Signature KDMV not found') and
+    # detect_file_format() falls back to RawFileInspector ('raw').
+    # instar reads the descriptor text up to the padding and reports
+    # 'vmdk', as qemu-img does. The three sibling split-sparse
+    # descriptors come from qemu-img create, which leaves no padding,
+    # so oslo agrees with instar on 'vmdk' for those.
+    'vmdk-split-sparse-5g-boundary': ('vmdk', 'raw'),
     # instar reports ISO as 'raw' (with --unsafe-quirks);
     # oslo detects as 'iso'.
     'iso-simple': ('raw', 'iso'),
@@ -261,14 +273,32 @@ VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 # VMDK descriptor extents) fails loudly and forces us to
 # re-evaluate the special case instead of silently skipping.
 #
-# VMDK monolithicFlat: the descriptor carries the extent's
-# sector count, and instar honours it. oslo.utils' VMDK
-# inspector parses only the binary sparse header and
-# reports virtual_size=0 for plain descriptor files.
+# VMDK descriptors other than monolithicSparse and streamOptimized:
+# oslo.utils' VMDKInspector.virtual_size logs 'Unsupported VMDK format'
+# and returns 0 for every other createType, because the size it reports
+# is the sector count in the binary sparse header that a descriptor file
+# does not have. instar sums what the descriptor's own extent lines
+# declare, as qemu-img does, so it reports the real virtual size for
+# monolithicFlat and twoGbMaxExtentSparse alike.
 KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-1m': (0, 1 * 1024 * 1024),
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
     'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
+    # The split-sparse descriptors: twoGbMaxExtentSparse, so oslo returns
+    # 0 for the same reason as the monolithicFlat fixtures above. instar
+    # reads them through their sparse extents and reports what each
+    # descriptor declares. vmdk-split-sparse-5g-boundary is also a
+    # KNOWN_FORMAT_DIVERGENCES entry (oslo reads its NUL-padded
+    # descriptor as 'raw'), so TestOsloVirtualSize skips it before
+    # reaching this dict and its pair is a documented reference rather
+    # than a runtime assertion: oslo reports the 512 bytes its detection
+    # loop consumed. Values captured live against oslo.utils git master
+    # (10.3.1.dev1) and instar's `info --output json`.
+    'vmdk-split-sparse-2049m': (0, 2049 * 1024 * 1024),
+    'vmdk-split-sparse-5g': (0, 5 * 1024 * 1024 * 1024),
+    'vmdk-split-sparse-5g-boundary': (512, 5 * 1024 * 1024 * 1024),
+    'vmdk-split-sparse-33g': (0, 33 * 1024 * 1024 * 1024),
+    'osboxes-vmdk-split-sparse': (0, 100 * 1024 * 1024 * 1024),
     # Paired with the KNOWN_FORMAT_DIVERGENCES entries above for formats
     # oslo has no inspector for. RawFileInspector.virtual_size returns
     # however many bytes oslo's detection loop consumed before it settled

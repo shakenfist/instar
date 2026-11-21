@@ -495,10 +495,9 @@
             "format": "vmdk",
             "safety": "safe",
             "run_in_ci": true,
-            "description": "VMDK twoGbMaxExtentSparse descriptor, 2049 MiB virtual in 2 extents, the last holding 2048 sectors",
+            "description": "VMDK twoGbMaxExtentSparse descriptor, 2049 MiB virtual in 2 extents, the last holding 2048 sectors. Read through its sparse extents: instar info reports the 2049 MiB the descriptor declares, matching qemu-img",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "format-coverage"],
-            "generated_by": "scripts/create-vmdk-split-testdata.sh",
-            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors are refused at resolution (extent 0 has kind Sparse; only FLAT extents are supported)"
+            "generated_by": "scripts/create-vmdk-split-testdata.sh"
         },
         {
             "id": "vmdk-split-sparse-5g",
@@ -506,10 +505,9 @@
             "format": "vmdk",
             "safety": "safe",
             "run_in_ci": true,
-            "description": "VMDK twoGbMaxExtentSparse descriptor, 5 GiB virtual in 3 extents, the last holding 2097152 sectors",
+            "description": "VMDK twoGbMaxExtentSparse descriptor, 5 GiB virtual in 3 extents, the last holding 2097152 sectors. Read through its sparse extents: instar info reports the 5 GiB the descriptor declares, matching qemu-img",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "format-coverage"],
-            "generated_by": "scripts/create-vmdk-split-testdata.sh",
-            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors are refused at resolution (extent 0 has kind Sparse; only FLAT extents are supported)"
+            "generated_by": "scripts/create-vmdk-split-testdata.sh"
         },
         {
             "id": "vmdk-split-sparse-5g-boundary",
@@ -517,10 +515,9 @@
             "format": "vmdk",
             "safety": "safe",
             "run_in_ci": true,
-            "description": "VMDK twoGbMaxExtentSparse descriptor, 5 GiB virtual in 3 extents, the last holding 2097152 sectors. Carries 131072 bytes of 0xAB starting at offset 2147418112 (2 GiB - 64 KiB), straddling the first extent boundary. Written by qemu-img convert rather than create, so its descriptor is padded to 512 bytes with NULs where create's is not",
+            "description": "VMDK twoGbMaxExtentSparse descriptor, 5 GiB virtual in 3 extents, the last holding 2097152 sectors. Carries 131072 bytes of 0xAB starting at offset 2147418112 (2 GiB - 64 KiB), straddling the first extent boundary. Written by qemu-img convert rather than create, so its descriptor is padded to 512 bytes with NULs where create's is not. Read through its sparse extents: instar info reports the 5 GiB the descriptor declares, matching qemu-img",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "extent-boundary", "format-coverage"],
-            "generated_by": "scripts/create-vmdk-split-testdata.sh",
-            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors are refused at resolution (extent 0 has kind Sparse; only FLAT extents are supported)"
+            "generated_by": "scripts/create-vmdk-split-testdata.sh"
         },
         {
             "id": "vmdk-split-sparse-33g",
@@ -528,10 +525,9 @@
             "format": "vmdk",
             "safety": "safe",
             "run_in_ci": true,
-            "description": "VMDK twoGbMaxExtentSparse descriptor, 33 GiB virtual in 17 extents, the last holding 2097152 sectors. Has more extents than the 15-extent ceiling allows",
+            "description": "VMDK twoGbMaxExtentSparse descriptor, 33 GiB virtual in 17 extents, the last holding 2097152 sectors. Has more extents than the 15-extent ceiling allows. It is read despite that: instar info reports the 33 GiB the descriptor declares, matching qemu-img",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "past-device-ceiling", "format-coverage"],
-            "generated_by": "scripts/create-vmdk-split-testdata.sh",
-            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors are refused at resolution (extent 0 has kind Sparse; only FLAT extents are supported)"
+            "generated_by": "scripts/create-vmdk-split-testdata.sh"
         },
         {
             "id": "vhd-fixed",
@@ -2417,10 +2413,9 @@
             "format": "vmdk",
             "safety": "safe",
             "run_in_ci": true,
-            "description": "Real VMware Workstation twoGbMaxExtentSparse VMDK: descriptor plus 26 sparse extents, 100 GiB virtual in 1.29 GiB. The only complete split-sparse chain in the corpus; custom/format-coverage/vmdk-multi-extent.vmdk is a descriptor whose extents deliberately do not exist. Extent filenames contain spaces and are kept verbatim because the descriptor references them by name",
+            "description": "Real VMware Workstation twoGbMaxExtentSparse VMDK: descriptor plus 26 sparse extents, 100 GiB virtual in 1.29 GiB. The only complete split-sparse chain in the corpus; custom/format-coverage/vmdk-multi-extent.vmdk is a descriptor whose extents deliberately do not exist. Extent filenames contain spaces and are kept verbatim because the descriptor references them by name. Read through its sparse extents: instar info reports the 100 GiB the descriptor declares, matching qemu-img",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "vmware-workstation", "real-world", "spaces-in-path"],
-            "sha256": "66494c3c6d44122bac09a4791ccf44aa63fb176835921cdbe21cf055f6e012f5",
-            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors report FLAG_NOT_SUPPORTED; only FLAT extents are resolved (docs/format-coverage.md)"
+            "sha256": "66494c3c6d44122bac09a4791ccf44aa63fb176835921cdbe21cf055f6e012f5"
         },
         {
             "id": "osboxes-vmdk-freedos-sparse",

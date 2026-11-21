@@ -844,6 +844,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A VMDK descriptor made of separate extent files is now read.** Both
+  split subformats, `twoGbMaxExtentFlat` and `twoGbMaxExtentSparse`, are
+  attached as one device whose extents are named by a table in the
+  chain config, rather than as one virtio device per extent, and
+  `info`, `check`, `compare` and `convert` read them: `convert -O raw`
+  of a 2049 MiB split-sparse image writes exactly the 2049 MiB the
+  descriptor declares. `info` agrees with qemu-img 10.2.0 field for
+  field, including the image's cluster size and each extent child's
+  length. A descriptor may name at most 64 extents, which is instar's
+  own bound and not qemu's; a larger one is refused with a message
+  naming the bound. `map` and `measure` still refuse every VMDK
+  descriptor, flat or sparse, and now say so: the message names the
+  descriptor rather than `monolithicFlat`, which an image in either
+  split subformat is not. Five shapes of extent that qemu-img reads
+  are refused -- a kind other than `FLAT` or `SPARSE`, a non-zero
+  extent start offset, more than 64 extents, a compressed sparse
+  extent, and a sparse extent whose header capacity is not the span
+  the descriptor declares -- each listed with its message in
+  `docs/quirks.md`. See also `docs/format-coverage.md` and
+  `docs/chain-config.md`.
+
+- **A VMDK descriptor's extent files are measured once.** Where the
+  extents sit in the one device they make up was worked out twice from
+  separate measurements, once for the table the guest reads and once to
+  open the device, so an extent file rewritten between the two passes
+  put the same extent at two different offsets and the guest read one
+  extent's data inside another's, reported as a success. The length is
+  taken once, when the chain is discovered, and both passes lay the
+  device out from it.
+
+- **A VMDK extent that is not a regular file is refused, not read as
+  zeros.** A descriptor may name any path the backing-file allowlist
+  permits -- it constrains where such a path may point, not what kind
+  of file it may point at -- and a FIFO among them left the host
+  blocked in `open` with no timeout, in the one place the host reads an
+  extent's own header. Only a regular file is opened for that read, and
+  the extent files a descriptor's device spans are opened with
+  `O_NONBLOCK` so that open cannot block. A member with no length of
+  its own is then refused by name: `metadata().len()` is 0 for a FIFO,
+  a block device and a character device, so such an extent would
+  otherwise have contributed its whole declared span as zero padding
+  and the read would have succeeded -- a wrong answer reported as a
+  success, where qemu-img cannot establish the node's length and errors
+  out. See `docs/security-audits.md`.
+
+- **`info --chain` reported a VMDK descriptor's own length as its size.**
+  A chain member that was a descriptor had its `actual-size` taken from
+  the descriptor file alone, omitting every extent and ignoring
+  `--ignore-quirks`: 368 bytes against qemu-img's 1052672 on a flat
+  image with a parent
+  ([#927](https://github.com/shakenfist/instar/issues/927)). The figure
+  is now the descriptor's allocation plus each extent's, and `info` and
+  `info --chain` compute it the same way. See `docs/info.md`.
+
 - **`info` reports the allocation and child order qemu-img does for a
   VMDK made of separate extent files.** This covers `monolithicFlat` as
   well as the `twoGbMaxExtent*` split subformats. The top-level

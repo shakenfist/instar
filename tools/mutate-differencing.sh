@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=165
+EXPECTED_CASES=172
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1836,15 +1836,14 @@ rust_case 'qcow2-data-device-read-by-a-subcluster-descent' "${QCOW2_LIB}" \
     qcow2 'sc_issue_792_unallocated_subcluster_runs_descend_past_the_data_device' \
     --features "${QCOW2_FEATURES}"
 
-# The extent walk back to its old bound, the end of the device array:
-# a read past a descriptor's last extent takes the next device -- under
-# `compare`, the other input's top image -- as one more extent.
+# The extent walk back to its old bound, the whole extent table rather
+# than the device's own run of it: a read past a descriptor's last
+# extent takes the entry after it -- under `compare`, the first extent
+# of the other input's descriptor -- as one more extent of this one.
 rust_case 'vmdk-descriptor-extent-walk-unbounded' "${QCOW2_LIB}" \
-    '                while (d as usize) < chain_config.device_count as usize
-                    && chain_config.devices[d as usize].is_data_device()
-                {' \
-    '                while (d as usize) < chain_config.device_count as usize // MUTATED
-                {' \
+    '    let extents = chain_config.device_extents(dev_idx);' \
+    '    let extents = &chain_config.extents // MUTATED
+        [..(chain_config.extent_count as usize).min(shared::MAX_CHAIN_EXTENTS)];' \
     qcow2 'vmdk_descriptor_extent_walk_stops_at_its_last_extent' \
     --features "${QCOW2_FEATURES}"
 
@@ -1853,7 +1852,9 @@ rust_case 'vmdk-descriptor-extent-walk-unbounded' "${QCOW2_LIB}" \
 # qcow2 crate. Each named test holds a config that breaks only the
 # clause its case removes, so no clause can be deleted behind another.
 # The fourth narrows "the slot after the owner" to "any slot after the
-# owner", which is the looser reading of where a data device may sit.
+# owner", which is the looser reading of where a data device may sit,
+# and the last lets one owner claim a run of marked devices rather than
+# the single slot a qcow2's data file takes.
 SHARED_LIB='src/shared/src/lib.rs'
 
 rust_case 'chain-config-data-device-at-a-chain-top-accepted' "${SHARED_LIB}" \
@@ -1863,22 +1864,20 @@ rust_case 'chain-config-data-device-at-a-chain-top-accepted' "${SHARED_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-on-any-device-accepted' "${SHARED_LIB}" \
-    '                (false, ImageFormat::VmdkDescriptor) => true,
-                _ => return false,' \
-    '                (false, ImageFormat::VmdkDescriptor) => true,
-                _ => false, // MUTATED' \
+    '            if info.is_data_device() || !matches!(info.detected_format(), ImageFormat::Qcow2) {' \
+    '            if false { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-not-checked' "${SHARED_LIB}" \
-    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
+    '            if data != owner + 1 || data >= device_count || !devices[data].is_data_device() {' \
     '            if false { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-data-device-index-any-later-slot' "${SHARED_LIB}" \
-    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
-    '            if first <= owner || first >= device_count || !devices[first].is_data_device() { // MUTATED' \
+    '            if data != owner + 1 || data >= device_count || !devices[data].is_data_device() {' \
+    '            if data <= owner || data >= device_count || !devices[data].is_data_device() { // MUTATED' \
     qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
     --features "${QCOW2_FEATURES}"
 
@@ -1889,8 +1888,12 @@ rust_case 'chain-config-unclaimed-data-device-accepted' "${SHARED_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'chain-config-qcow2-claims-a-run' "${SHARED_LIB}" \
-    '                (false, ImageFormat::Qcow2) => false,' \
-    '                (false, ImageFormat::Qcow2) => true, // MUTATED' \
+    '            claimed[data] = true;' \
+    '            let mut d = data; // MUTATED
+            while d < device_count && devices[d].is_data_device() {
+                claimed[d] = true;
+                d += 1;
+            }' \
     qcow2 'init_chain_states_refuses_a_second_data_device_after_a_qcow2' \
     --features "${QCOW2_FEATURES}"
 
@@ -1913,6 +1916,110 @@ rust_case 'vmm-image-flags-keep-the-data-device-mark' "${VMM_MAIN_LIB}" \
     '            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,' \
     '            image.flags, // MUTATED' \
     instar 'write_chain_device_entries_marks_every_data_device_and_nothing_else'
+
+# A VMDK descriptor's extents are laid out into one device twice over,
+# once for the table the guest reads and once to open the files as that
+# device. The first case measures the files per pass again, which is
+# what let the two passes put one extent at two offsets: a file that
+# grew between them moved every later extent's base in one pass only,
+# and the guest then read inside the wrong extent and was told it
+# succeeded. The second reads a length the host never got as zero, which
+# stacks every later extent on top of it. The third guesses FLAT for an
+# extent that arrived with no kind, which reads a sparse extent's header
+# as data. The fourth attaches a descriptor for writing, where a write
+# across the member boundary cannot be routed to a file. The fifth and
+# sixth restore an unguarded open on a path the descriptor named, and
+# the last stops requiring a member to be a regular file, which reads a
+# lengthless node's whole extent as zeros and calls it a success.
+
+rust_case 'vmm-descriptor-layout-measured-per-pass' "${VMM_MAIN_LIB}" \
+    '        let file_length = extent.file_length.clone().map_err(|e| {
+            format!(
+                "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                terminal_safe_path(&image.path),
+                terminal_safe_path(&extent.path)
+            )
+        })?;' \
+    '        let file_length = std::fs::metadata(&extent.path) // MUTATED
+            .map_err(|e| {
+                format!(
+                    "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+            })?
+            .len();' \
+    instar 'a_descriptors_layout_ignores_a_file_that_changed_after_discovery'
+
+rust_case 'vmm-descriptor-layout-unmeasured-extent-is-zero' "${VMM_MAIN_LIB}" \
+    '        let file_length = extent.file_length.clone().map_err(|e| {
+            format!(
+                "VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"': {e}",
+                terminal_safe_path(&image.path),
+                terminal_safe_path(&extent.path)
+            )
+        })?;' \
+    '        let file_length = extent.file_length.clone().unwrap_or(0); // MUTATED' \
+    instar 'layout_descriptor_extents_refuses_an_extent_it_could_not_measure'
+
+rust_case 'vmm-descriptor-extent-with-no-kind-read-as-flat' "${VMM_MAIN_LIB}" \
+    '            None => {
+                return Err(format!(
+                    "internal error: VMDK descriptor '"'"'{}'"'"' extent '"'"'{}'"'"' reached device \
+                     attachment without the kind its descriptor line declared",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+                .into());
+            }
+        };' \
+    '            None => shared::ChainExtent::KIND_FLAT, // MUTATED
+        };' \
+    instar 'layout_descriptor_extents_refuses_an_extent_whose_kind_did_not_arrive'
+
+rust_case 'vmm-descriptor-attached-for-writing' "${VMM_MAIN_LIB}" \
+    '        if is_rw && image.is_vmdk_descriptor() {' \
+    '        if false { // MUTATED' \
+    instar 'open_chain_devices_rw_refuses_a_vmdk_descriptor_in_a_writable_slot'
+
+# The backing-file allowlist says where an extent path may point, not
+# what kind of file it may point at, and opening a FIFO blocks with no
+# timeout. Both cases restore the unguarded open: the first in the one
+# place the host reads an extent's own header, which `instar info`
+# reaches, and the second in the device a descriptor's extents make up.
+CHAIN_LIB='src/vmm/src/chain.rs'
+BACKING_LIB='src/vmm/src/backing.rs'
+
+rust_case 'vmm-extent-header-read-opens-anything' "${CHAIN_LIB}" \
+    '    if !std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut header = [0u8; vmdk::HEADER_FULL_SIZE];
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)' \
+    '    let mut header = [0u8; vmdk::HEADER_FULL_SIZE]; // MUTATED
+    std::fs::File::open(path)' \
+    instar 'chain::tests::a_fifo_extent_reports_no_cluster_size_without_blocking'
+
+rust_case 'vmm-concatenated-member-opens-anything' "${BACKING_LIB}" \
+    '            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)?;' \
+    '            let file = File::open(path)?; // MUTATED' \
+    instar 'test_concatenated_fifo_member_does_not_block'
+
+rust_case 'vmm-concatenated-member-length-not-required' "${BACKING_LIB}" \
+    '            let metadata = file.metadata()?;
+            if !metadata.is_file() {' \
+    '            let metadata = file.metadata()?; // MUTATED
+            if false {' \
+    instar 'test_concatenated_refuses_a_character_device_member'
 
 # --- qcow2 data-file entries qemu refuses (#803) ----------------------
 #

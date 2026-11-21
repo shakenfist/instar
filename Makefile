@@ -121,6 +121,22 @@ LINT_IMAGE := instar-rust-lint
 INSTAR_BUILD_IMAGE := instar-release
 INSTAR_DEV_IMAGE := instar-build
 
+# How many stestr workers the test targets run, host-side and
+# containerised alike. Every worker forks an instar and a qemu-img of
+# its own, both CPU- and IO-heavy on multi-GB images, so stestr's
+# default of one worker per core puts about three times nproc of those
+# on the machine at once: a 16-core host reached a load average of 69
+# and an IO pressure of 68%, which made it unusable for everything else
+# sharing the disk. The containerised targets had 4 hardcoded for this
+# reason since they were written, and the host-side ones, where there
+# is no cgroup to contain them, had nothing. The default here is that
+# same 4, so CI is unchanged. Override on the command line for a
+# machine with room: `make test-integration STESTR_CONCURRENCY=8`. The
+# override reaches the containerised targets too, because make
+# substitutes the number into their `bash -c` string, so nothing has to
+# be passed through the container's environment.
+STESTR_CONCURRENCY ?= 4
+
 # Paths
 SRC_DIR := src
 PROTO_DIR := prototypes
@@ -558,7 +574,7 @@ test-rust: instar-devcontainer
 			--exclude bench-op && \
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
-		cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input" && \
+		cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input,vmdk-decompress" && \
 		cargo test --release -p create'
 
 # Build all coverage-guided fuzz targets via cargo-fuzz inside the
@@ -658,7 +674,9 @@ snapshot-harnesses: instar-devcontainer
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)
 test-integration: instar test-venv
 	@echo "Running Python integration tests..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--exclude-regex test_info_malicious \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
@@ -698,7 +716,7 @@ test-container: instar-devcontainer instar
 			cd tests && \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "test_info_malicious" \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 		'
 
 # Run core integration tests inside container (info, check, security, version, oslo-crossval)
@@ -770,7 +788,7 @@ test-container-core: instar-devcontainer instar
 			echo "Running core tests (excluding convert, compare, malicious)..."; \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "(test_convert\.|test_compare\.|test_info_malicious)" \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 		'
 
 # Run QCOW2/VMDK/RAW convert + compare tests inside container
@@ -806,7 +824,7 @@ test-container-convert-qcow2: instar-devcontainer instar
 			echo "Running QCOW2/VMDK/RAW convert + compare tests..."; \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "Vhd" \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 				"(test_convert\.|test_compare\.)" \
 		'
 
@@ -841,7 +859,7 @@ test-container-convert-vhd: instar-devcontainer instar
 			echo "selection contains $$(grep -c . /tmp/stestr-list.txt) tests" && \
 			echo "Running VHD/VHDX convert tests..."; \
 			/build/test-venv/bin/stestr run \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 				"test_convert\.TestConvert.*Vhd" \
 		'
 
@@ -925,7 +943,7 @@ test-container-matrix-queue: instar-devcontainer instar
 			cd tests && \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "(test_info_malicious|test_bench)" \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 				"^(?!(?:test_convert\.TestConvertVhdToQcow2Roundtrip\.test_hyperv_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToQcow2Roundtrip\.test_virtualpc_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToRaw\.test_convert_hyperv_dynamic_vhd|test_convert\.TestConvertVhdToRaw\.test_convert_virtualpc_vhd|test_convert\.TestConvertVhdCompare\.test_compare_hyperv_vhd_vs_raw|test_convert\.TestConvertVhdCompare\.test_compare_virtualpc_vhd_vs_raw)$$)" \
 		'
 
@@ -967,7 +985,7 @@ test-container-matrix-nightly: instar-devcontainer instar
 			echo "Running the nightly selection..."; \
 			cd tests && \
 			/build/test-venv/bin/stestr run \
-				--concurrency 4 \
+				--concurrency $(STESTR_CONCURRENCY) \
 				"^(?:test_convert\.TestConvertVhdToQcow2Roundtrip\.test_hyperv_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToQcow2Roundtrip\.test_virtualpc_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToRaw\.test_convert_hyperv_dynamic_vhd|test_convert\.TestConvertVhdToRaw\.test_convert_virtualpc_vhd|test_convert\.TestConvertVhdCompare\.test_compare_hyperv_vhd_vs_raw|test_convert\.TestConvertVhdCompare\.test_compare_virtualpc_vhd_vs_raw)$$" \
 		'
 
@@ -975,14 +993,17 @@ test-container-matrix-nightly: instar-devcontainer instar
 # Runs all test files except malicious image tests
 test-ci: instar test-venv
 	@echo "Running CI tests (safe images)..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--exclude-regex test_info_malicious \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run all tests including malicious (explicit opt-in)
 test-malicious: instar test-venv
 	@echo "WARNING: Running tests including malicious images"
 	@echo "This will process known malicious disk images."
 	@echo ""
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run \
+		--concurrency $(STESTR_CONCURRENCY)
 
 # Run tests and show output (useful for seeing diffs during development)
 test-report: instar test-venv

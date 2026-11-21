@@ -170,26 +170,33 @@ class TestSecurityFeatureDetection(InstarTestBase):
 
     def test_instar_handles_vmdk_descriptor_safely(self):
         """
-        Verify instar rejects VMDK descriptors with non-FLAT extents.
+        Verify instar rejects a VMDK descriptor naming an extent
+        outside the backing allowlist.
 
         VMDK descriptor files can reference arbitrary files as extents
         (e.g. /etc/passwd). instar's host side recognises the
         ``# Disk DescriptorFile`` prefix and validates the descriptor
-        before launching the guest.
-        A descriptor with a SPARSE extent (instead of FLAT) is rejected
-        outright — extent paths are never followed.
+        before launching the guest. The extent's kind is no longer what
+        refuses this one -- SPARSE extents are read -- so what has to
+        hold is that the allowlist check refuses the path and nothing
+        opens it.
         """
         image = self.get_image('vmdk-path-traversal')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
         # Descriptor has a SPARSE extent pointing to /etc/passwd.
-        # The host-side pre-flight rejects non-FLAT extents, so
-        # instar exits with an error without following any paths.
+        # The host-side pre-flight resolves every extent against the
+        # allowlist, so instar exits with an error naming the refused
+        # path without ever reading the file.
         stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertNotEqual(
             0, rc,
-            'instar should reject VMDK descriptor with non-FLAT extent'
+            'instar should reject a VMDK extent outside the allowlist'
+        )
+        self.assertIn(
+            'outside allowed paths', stdout + stderr,
+            f'the allowlist must be what refuses it: {stdout}{stderr}'
         )
 
         # No /etc/passwd content should appear in output
