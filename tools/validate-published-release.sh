@@ -17,6 +17,13 @@
 #   ./validate-published-release.sh deb 0.3.0
 #   ./validate-published-release.sh rpm 0.3.0
 #
+# Run from a clone if you can. On rpm systems the script installs
+# through tools/ci/dnf.sh, which retries a distro mirror that is part
+# way through rotating its metadata. A copy of this file on its own
+# still works, but calls dnf directly and says so, and then a mirror
+# mid-rotation reads as a failed install: rerun before you blame the
+# artifact.
+#
 # Requires on the VM: /dev/kvm accessible to your user (kvm group),
 # curl, sudo, and qemu-utils (for the fixture; installed if missing on
 # apt/dnf systems).
@@ -47,6 +54,11 @@ case "$PKG_TYPE" in
 esac
 
 BASE_URL="https://github.com/shakenfist/instar/releases/download/v${REL_VERSION}"
+# Resolved, symlinks and all, so that the clone check further down
+# compares names rather than stat'ing anything at a path it has not yet
+# decided to trust.
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+REPO_ROOT=$(realpath "${SCRIPT_DIR}/..")
 
 if [ ! -e /dev/kvm ]; then
     echo "Error: /dev/kvm not present -- instar needs KVM to run." >&2
@@ -72,8 +84,34 @@ if [ "$PKG_TYPE" = "deb" ]; then
 else
     ASSET="instar-${REL_VERSION}-1.x86_64.rpm"
     curl -fsSL -o "$ASSET" "${BASE_URL}/${ASSET}"
-    sudo dnf install -y qemu-img
-    sudo dnf install -y "./${ASSET}"
+    # Through the dnf wrapper: a mirror serving metadata that names
+    # repodata it has already rotated away would otherwise read as a
+    # broken release artifact, which is the one thing this script is
+    # meant to be able to tell you. The wrapper is only there when
+    # this runs from a clone (see the header), so without it this
+    # falls back to plain dnf rather than failing the rpm path.
+    #
+    # "From a clone" is checked as this file's own resolved directory
+    # being the enclosing tree's tools/, not as something existing at
+    # tools/ci/dnf.sh: a lone copy run from /tmp/foo/ resolves REPO_ROOT
+    # to /tmp, and /tmp/tools/ci/dnf.sh is a path any other local user
+    # can create -- which this would then run with sudo already primed.
+    # Both sides are strings derived from realpath, so nothing a local
+    # user plants can make them agree: comparing inodes instead (-ef)
+    # follows a symlink planted at /tmp/tools/validate-published-release.sh
+    # back to this file, and passes.
+    DNF_WRAPPER="${REPO_ROOT}/tools/ci/dnf.sh"
+    if [ "${SCRIPT_DIR}" = "${REPO_ROOT}/tools" ] && [ -f "$DNF_WRAPPER" ]; then
+        dnf_install() { DNF='sudo dnf' bash "$DNF_WRAPPER" install -y "$@"; }
+    else
+        echo "note: $0 is not a clone's own copy with $DNF_WRAPPER" \
+            "beside it, so calling dnf directly." >&2
+        echo "      A mirror mid-rotation will fail the install below;" \
+            "rerun before blaming the artifact." >&2
+        dnf_install() { sudo dnf install -y "$@"; }  # direct dnf: no wrapper beside a lone copy
+    fi
+    dnf_install qemu-img
+    dnf_install "./${ASSET}"
 fi
 
 echo ""

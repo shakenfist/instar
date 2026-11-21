@@ -30,6 +30,8 @@ set -uo pipefail
 DEB_DISTROS="${DEB_DISTROS:-debian:12 debian:13 ubuntu:22.04 ubuntu:24.04}"
 RPM_DISTROS="${RPM_DISTROS:-fedora:latest rockylinux:9 rockylinux/rockylinux:10}"
 
+REPO_ROOT=$(realpath "$(dirname "$0")/..")
+
 RESULTS=""
 FAILED=""
 
@@ -38,9 +40,19 @@ probe_one() {
     local install_cmd="$2"
     echo "### probing $distro ..." >&2
     local out
-    if out=$(docker run --rm "$distro" bash -c "
+    # The install is grouped before it is redirected because every
+    # install_cmd below is an `||` or `&&` list, and a redirection on a
+    # list binds to its last command alone -- leaving the first arm
+    # writing to the container's stdout, which is what `out` captures
+    # and the version table is built from. /dnf.sh merges dnf's stderr
+    # into its stdout so that it can match on it, so an unredirected
+    # arm now puts dnf's errors in the table rather than on the stderr
+    # this discards.
+    if out=$(docker run --rm \
+            -v "${REPO_ROOT}/tools/ci/dnf.sh:/dnf.sh:ro" \
+            "$distro" bash -c "
             set -e
-            $install_cmd >/dev/null 2>&1
+            { $install_cmd; } >/dev/null 2>&1
             qemu-img --version | head -1
         " 2>/dev/null); then
         RESULTS="${RESULTS}${distro}"$'\t'"${out}"$'\n'
@@ -57,7 +69,14 @@ for distro in $RPM_DISTROS; do
     # EL renamed/split the qemu-img package across releases (qemu-img on
     # EL9, provided by qemu-kvm-tools on some EL10 spins). Install by the
     # binary it provides so the probe is package-name agnostic.
-    probe_one "$distro" "dnf install -y -q qemu-img || dnf install -y -q /usr/bin/qemu-img"
+    # Through /dnf.sh so that a mirror mid-rotation reads as a slow
+    # probe rather than an unsupported distro. The fallback arm gets a
+    # short deadline of its own: the retrying is worth paying once per
+    # install, not once per arm, and by the time the second arm runs the
+    # first has already spent five minutes establishing that the
+    # mirrors are unwell.
+    probe_one "$distro" "/dnf.sh install -y -q qemu-img || \
+        DNF_RETRY_TIMEOUT=60 /dnf.sh install -y -q /usr/bin/qemu-img"
 done
 
 echo ""

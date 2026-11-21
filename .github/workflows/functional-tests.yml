@@ -242,6 +242,9 @@ jobs:
       - name: Test the apt lock wrapper
         run: tools/ci/test-apt-get.sh
 
+      - name: Test the dnf metadata retry wrapper
+        run: tools/ci/test-dnf.sh
+
       # The resparsify script runs ahead of every testdata job here, and
       # is also fetched over HTTPS and run against its own clone by
       # private-ci's testdata image build -- with one positional argument
