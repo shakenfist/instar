@@ -949,10 +949,17 @@ The I/O thread hands it over instead. It records the failure in state
 the run loop shares (`FatalIoError`) and signals the vCPU thread, whose
 `KVM_RUN` returns `EINTR`; every run loop enters the guest through
 `run_guest`, which renders the recorded failure rather than the
-interruption that delivered it. The kick is repeated on each wake of
-the I/O loop while a failure is recorded and the run loop has not acted
-on it, because a signal that arrives in the moment before `KVM_RUN` is
-entered is simply lost. The vCPU-exit fallback
+interruption that delivered it. `run_guest` checks for one on every
+exit, not only an interrupted one, so a failure recorded while the vCPU
+was already outside `KVM_RUN` cannot be lost to an exit the loop ends
+on. The kick is repeated on each wake of the I/O loop while a failure
+is recorded and the run loop has not read it, because a signal that
+arrives in the moment before `KVM_RUN` is entered is simply lost; once
+the run loop has read it the kick stops. The handler is installed with
+`SA_RESTART`, which does not stop `KVM_RUN` returning `EINTR` but does
+keep a late kick from failing an ordinary syscall the vCPU thread makes
+afterwards, and a handler that cannot be installed is reported as a
+warning, since without it the run would hang again. The vCPU-exit fallback
 (`process_queue_for_device`) propagates the same error to the run loop,
 so the two queue-service paths now agree; before, which one was active
 decided whether the run hung or failed.

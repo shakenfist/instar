@@ -3526,7 +3526,7 @@ impl VhdBlockPlacementRefusal {
     /// call table's `send_error`.
     /// `vhd_block_placement_marker_is_distinct_and_matches_its_c_string`
     /// asserts the two spellings agree.
-    pub const OPERATION_C: &'static [u8] = b"vhd-block-placement ";
+    pub const OPERATION_C: &'static [u8] = b"vhd-block-placement\0";
 }
 
 /// The `send_error` channel used to report that a request the guest

@@ -13250,6 +13250,9 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         Some(output_capacity),
         sparse_output,
     )?;
+    // `copy` always creates or truncates its output, so the file is
+    // always this run's to remove if the run fails and leaves it empty.
+    let output_cleanup = EmptyOutputCleanup::new(vec![Path::new(&args.output).to_path_buf()]);
 
     let output_mode_desc = if sparse_output {
         "sparse, grows on demand"
@@ -13582,13 +13585,6 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         vmm_stats.lock().expect("lock poisoned").display();
     }
 
-    // Whatever failed, an output file this run left empty is removed:
-    // `copy` always creates or truncates its output, so the file is
-    // always this run's to remove. See `remove_empty_output`.
-    if vm_error.is_some() || copy_completion != Some(true) {
-        remove_empty_output(Path::new(&args.output));
-    }
-
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
@@ -13625,6 +13621,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             .into());
     }
 
+    output_cleanup.succeeded();
     Ok(())
 }
 
@@ -15592,17 +15589,21 @@ fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
 /// interrupted by hand (issue #932). This also makes the two
 /// queue-service paths agree: the vCPU-exit fallback propagated the
 /// same error and always did fail the run.
+///
+/// The recorded failure is consulted on every exit, not only on an
+/// interrupted one. A failure recorded while the vCPU was already out
+/// of `KVM_RUN` is otherwise never seen if the next exit is one the
+/// loop ends on -- `HLT` -- and the run reports success over it. The
+/// check is one atomic load while nothing is recorded.
 fn run_guest<'vcpu>(
     vcpu: &'vcpu mut VcpuFd,
     io_thread: &Option<io_thread::IoThread>,
 ) -> Result<VcpuExit<'vcpu>, Box<dyn std::error::Error>> {
-    match vcpu.run() {
-        Ok(exit) => Ok(exit),
-        Err(e) => match io_thread.as_ref().and_then(|t| t.fatal_error()) {
-            Some(failure) => Err(failure.into()),
-            None => Err(e.into()),
-        },
+    let result = vcpu.run();
+    if let Some(failure) = io_thread.as_ref().and_then(|t| t.fatal_error()) {
+        return Err(failure.into());
     }
+    Ok(result?)
 }
 
 /// Remove an output file a failed run left empty, if it is this run's
@@ -15627,13 +15628,179 @@ fn run_guest<'vcpu>(
 /// file's existence a reason to believe the operation ran (issue
 /// #849).
 ///
+/// Only a regular file is ever removed. A block device, a character
+/// device such as `/dev/null`, or a FIFO reports a length of zero too,
+/// and an output path naming one is a target the user supplied rather
+/// than a file this run made: unlinking `/dev/sdb` as root destroys the
+/// node. A symlink is not followed either, so the length tested is the
+/// length of the thing `remove_file` would remove.
+///
 /// A failure to remove it is not reported. The run has already failed
 /// and its own error is the one worth printing; a leftover empty file
 /// is not worth replacing that message with a second one about the
 /// cleanup.
 fn remove_empty_output(path: &Path) {
-    if matches!(std::fs::metadata(path), Ok(meta) if meta.len() == 0) {
+    if matches!(std::fs::symlink_metadata(path), Ok(meta) if meta.is_file() && meta.len() == 0) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove an output file whatever it holds, if it is a regular file.
+///
+/// For a refusal that must leave nothing behind even when the output
+/// was sized before the guest ran (a pre-allocated raw output, a fixed
+/// VHDX). The regular-file test is the same one `remove_empty_output`
+/// makes, for the same reason: a device node or a symlink named as the
+/// output is never this run's to unlink.
+fn remove_output_file(path: &Path) {
+    if matches!(std::fs::symlink_metadata(path), Ok(meta) if meta.is_file()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Removes the output files a run left empty, unless the run succeeds.
+///
+/// Armed as soon as the output is opened and disarmed by
+/// [`EmptyOutputCleanup::succeeded`] as the run's last act, so every
+/// other way out -- an explicit `return Err`, a `?` from guest setup, a
+/// `vm_error` exit, or a fatal I/O error out of `run_guest` -- removes
+/// what was left empty. An explicit cleanup before the error returns
+/// missed the `?` exits, which are exactly where a run the I/O thread
+/// fails now leaves (issue #849).
+///
+/// Declared after the output's `BackingStore`, so it runs while that
+/// file is still open, and after the I/O thread has been joined by its
+/// own drop or `stop`.
+struct EmptyOutputCleanup {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl EmptyOutputCleanup {
+    /// Arm the cleanup for `paths`; pass none for an output that is not
+    /// this run's to remove (convert's `--no-create`).
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    /// The run succeeded: keep every output, empty or not.
+    fn succeeded(mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for EmptyOutputCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_empty_output(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_cleanup_tests {
+    //! The rule `remove_empty_output` and `EmptyOutputCleanup` apply to
+    //! a failed run's output. The integration tests in
+    //! tests/test_failed_output_file.py prove the rule end to end for a
+    //! failed write; these pin the cases no image can steer -- an
+    //! output that is not a regular file, and an exit the guard has to
+    //! catch without being called.
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn empty_file(dir: &TempDir, name: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::File::create(&path).expect("create empty file");
+        path
+    }
+
+    /// A failed run that drops the guard -- which is what every `?`
+    /// and `return Err` does -- removes the output it left empty.
+    #[test]
+    fn a_dropped_guard_removes_an_empty_output() {
+        let dir = TempDir::new().unwrap();
+        let out = empty_file(&dir, "out.raw");
+        drop(EmptyOutputCleanup::new(vec![out.clone()]));
+        assert!(
+            !out.exists(),
+            "an output a failed run left empty survived the cleanup"
+        );
+    }
+
+    /// Bytes are the record of how far a failed run got, and qemu-img
+    /// keeps its own partial output, so a non-empty output stays.
+    #[test]
+    fn a_dropped_guard_keeps_an_output_holding_bytes() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("out.raw");
+        std::fs::write(&out, b"partial").unwrap();
+        drop(EmptyOutputCleanup::new(vec![out.clone()]));
+        assert!(out.exists(), "the cleanup removed an output holding bytes");
+    }
+
+    /// A successful run keeps its output even when it is empty: a dd of
+    /// an empty window legitimately produces a zero-length file.
+    #[test]
+    fn a_successful_run_keeps_an_empty_output() {
+        let dir = TempDir::new().unwrap();
+        let out = empty_file(&dir, "out.raw");
+        EmptyOutputCleanup::new(vec![out.clone()]).succeeded();
+        assert!(out.exists(), "a successful run's empty output was removed");
+    }
+
+    /// A FIFO reports a length of zero, as a block device and
+    /// `/dev/null` do. An output path naming one is a target the user
+    /// supplied, never a file this run made, so it is not unlinked.
+    #[test]
+    fn a_non_regular_output_is_never_removed() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("out.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(std::fs::metadata(&fifo).unwrap().len(), 0);
+
+        drop(EmptyOutputCleanup::new(vec![fifo.clone()]));
+        remove_output_file(&fifo);
+        assert!(
+            std::fs::symlink_metadata(&fifo).is_ok(),
+            "the cleanup unlinked a FIFO named as the output; as root the \
+             same test unlinks a block device"
+        );
+    }
+
+    /// A symlink to an empty file is not followed: the length judged
+    /// must be the length of what `remove_file` would remove, which is
+    /// the link. Neither the link nor its target goes.
+    #[test]
+    fn a_symlinked_output_is_never_removed() {
+        let dir = TempDir::new().unwrap();
+        let target = empty_file(&dir, "target.raw");
+        let link = dir.path().join("out.raw");
+        symlink(&target, &link).unwrap();
+
+        drop(EmptyOutputCleanup::new(vec![link.clone()]));
+        remove_output_file(&link);
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the cleanup unlinked a symlink named as the output"
+        );
+        assert!(target.exists(), "the cleanup removed a symlink's target");
+    }
+
+    /// The differencing refusal removes its output whatever it holds,
+    /// because a pre-allocated output is sized before the guest runs.
+    #[test]
+    fn remove_output_file_removes_a_sized_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("out.raw");
+        std::fs::File::create(&out)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        remove_output_file(&out);
+        assert!(!out.exists(), "a refused run's pre-sized stub survived");
     }
 }
 
@@ -15849,6 +16016,24 @@ fn execute_convert(
             skip_zeros,
         )?
     };
+
+    // An output this run owns and leaves empty is removed whatever
+    // fails from here on. `!no_create` is the test for "convert owns
+    // this path": without `--no-create`, `BackingStore::open` has just
+    // created *or truncated* the target, so nothing that was in it
+    // survives either way. Under `--no-create` the target is an image
+    // the user supplied for us to write into, which is never ours to
+    // delete. See `remove_empty_output` for why an output holding bytes
+    // stays.
+    let output_cleanup = EmptyOutputCleanup::new(if exec.no_create {
+        Vec::new()
+    } else {
+        let mut paths = vec![Path::new(&exec.output).to_path_buf()];
+        if let Some((ref flat_path, _)) = flat_extent_path {
+            paths.push(flat_path.clone());
+        }
+        paths
+    });
 
     debug!(
         "Output file: {} (capacity {} bytes)",
@@ -16339,16 +16524,6 @@ fn execute_convert(
     }
 
     if !convert_success {
-        // Whatever failed, an output file this run owns and left empty
-        // is removed. See `remove_empty_output` for why that is the
-        // line, and why the file is not removed once it holds bytes.
-        if !exec.no_create {
-            remove_empty_output(Path::new(&exec.output));
-            if let Some((ref flat_path, _)) = flat_extent_path {
-                remove_empty_output(flat_path);
-            }
-        }
-
         // A differencing source is refused inside `init_chain_states`,
         // before a single output sector is written, and `convert` has no
         // result struct to carry the reason -- so it travels on
@@ -16356,24 +16531,19 @@ fn execute_convert(
         // "convert operation failed", which is what issue #547 was
         // filed over.
         if serial_decoder.last_differencing_refusal.is_some() {
-            // Remove the output path. Nothing was written to it, and
-            // leaving a zero-filled stub behind after refusing to compose
-            // is exactly the "success-shaped wrong answer" this refusal
-            // exists to prevent: a caller that tests for the file's
-            // existence would conclude the convert ran.
-            //
-            // `!no_create` is the test for "convert owns this path", not
-            // for "this run created the file": without `--no-create`,
-            // `BackingStore::open` has already created *or truncated* the
-            // target, so a pre-existing file's contents are gone by the
-            // time we get here either way and unlinking destroys nothing
-            // that survived. Under `--no-create` the target is an image
-            // the user supplied for us to write into, which is never ours
-            // to delete.
+            // Remove the output path even though it is not always
+            // empty. Nothing was written to it, but a pre-allocated raw
+            // output or a fixed VHDX was sized before the guest ran, so
+            // `output_cleanup`'s empty-only rule would keep a
+            // zero-filled stub -- exactly the "success-shaped wrong
+            // answer" this refusal exists to prevent: a caller that
+            // tests for the file's existence would conclude the convert
+            // ran. The same `--no-create` rule applies as for
+            // `output_cleanup`.
             if !exec.no_create {
-                let _ = std::fs::remove_file(&exec.output);
+                remove_output_file(Path::new(&exec.output));
                 if let Some((ref flat_path, _)) = flat_extent_path {
-                    let _ = std::fs::remove_file(flat_path);
+                    remove_output_file(flat_path);
                 }
             }
             let op = if exec.window.is_some() {
@@ -16485,6 +16655,7 @@ fn execute_convert(
         f.set_len(out_vsize)?;
     }
 
+    output_cleanup.succeeded();
     Ok(())
 }
 

@@ -475,7 +475,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   -- and a target supplied with `--no-create` is never instar's to
   delete ([#849](https://github.com/shakenfist/instar/issues/849)). `dd`
   and a preallocated raw target size their output up front, so it is
-  never empty and is always kept. See `docs/convert.md`.
+  never empty and is always kept. Only a regular file is ever removed:
+  an output path naming a block device, `/dev/null`, a FIFO or a
+  symlink is left as it was. See `docs/convert.md`.
 
 - **`instar copy` fails when a read or a write fails.** It used to
   report success for a run that failed: every failure path in the

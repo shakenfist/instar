@@ -3858,9 +3858,12 @@ and this section has never named all of them.
   output file it left empty and keep one holding bytes
   (`strace -e inject=write:error=ENOSPC`); see "Failed Host Read Tests"
   above
-- `tests/strace_injection.py` - The shared syscall-injection rig for
-  the four modules above: the capability probe, the per-thread index
-  derivation and the did-it-land parsers
+- `tests/strace_injection.py` - The shared syscall-injection rig: the
+  capability probe all four modules above use, and the read-line
+  parsers (`_READ_LINE`, `_busiest_thread`) the read-injecting modules
+  build on. Each module derives its own injection index and checks its
+  own injection landed, because each aims at a different syscall or a
+  different read
 - `tests/test_bench.py` - Integration tests for the `instar bench`
   subcommand (62 tests): read/write request scheduling, host-side
   validation matrix, the qcow2 write-envelope gates, `--output json`

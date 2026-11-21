@@ -19,6 +19,7 @@ write failing leaves nothing in the file, the second leaves one sector.
 """
 
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -88,7 +89,7 @@ class TestFailedOutputFile(StraceInjectionMixin, InstarTestBase):
         """Run one injected case; return (process, output path)."""
         binary = self.get_instar_binary()
         td = tempfile.mkdtemp()
-        self.addCleanup(subprocess.run, ['rm', '-rf', td])
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         self._require_strace_injection(td)
 
         work = Path(td)
@@ -135,10 +136,14 @@ class TestFailedOutputFile(StraceInjectionMixin, InstarTestBase):
             'had written; qemu-img keeps its own partial output and so '
             'should instar'
         )
-        self.assertEqual(
-            out.stat().st_size, self.SECTOR_SIZE,
-            'the kept output does not hold exactly the one sector written '
-            'before the second write failed'
+        # Not an exact size: the write granularity is convert's own,
+        # with no sector-size flag here to pin it. What the rule says is
+        # that the output holds some bytes and is not the whole image.
+        size = out.stat().st_size
+        self.assertTrue(
+            0 < size < self.INPUT_SECTORS * self.SECTOR_SIZE,
+            f'the kept output holds {size} bytes; a write failing part-way '
+            f'through should leave some of the image and not all of it'
         )
 
     def test_copy_removes_an_output_it_left_empty(self):
@@ -162,3 +167,33 @@ class TestFailedOutputFile(StraceInjectionMixin, InstarTestBase):
             'the kept output does not hold exactly the one sector written '
             'before the second write failed'
         )
+
+    def test_a_successful_run_is_silent_and_keeps_its_output(self):
+        """The counterpart: a run that succeeds says nothing on stderr.
+
+        The logger is installed on every run so that a warning reaches
+        the user without `--verbose`. That is only right while nothing
+        warns on the success path; a warning added there, or a
+        dependency that logs, would print on every successful run, and
+        qemu-img prints nothing. This pins it for the two operations
+        whose output rule this module tests.
+        """
+        binary = self.get_instar_binary()
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        work = Path(td)
+        source = work / 'source.raw'
+        size = self._write_input(source)
+
+        for argv_tail in (['convert', '-O', 'raw', str(source), str(work / 'converted.raw')],
+                          ['copy', str(source), str(work / 'copied.raw')]):
+            proc = subprocess.run([str(binary)] + argv_tail,
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(
+                proc.returncode, 0,
+                f'{argv_tail[0]} failed: stderr={proc.stderr!r}')
+            self.assertEqual(
+                proc.stderr, '',
+                f'a successful {argv_tail[0]} wrote to stderr without '
+                f'--verbose')
+            self.assertEqual(Path(argv_tail[-1]).stat().st_size, size)

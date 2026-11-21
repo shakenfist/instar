@@ -133,8 +133,9 @@ Per-format feature detail is in
   reports a virtqueue it could not read -- the one failure it cannot
   complete to the guest, which otherwise waits for it for ever.
   `run_guest` renders that recorded failure in place of the bare
-  `EINTR`; a loop calling `vcpu.run()` itself hangs instead, and
-  nothing in the pull-request gate starts a guest to notice. See
+  `EINTR`; a loop calling `vcpu.run()` itself fails with an
+  unexplained `EINTR` instead, and nothing in the pull-request gate
+  starts a guest to notice. See
   "A request the host cannot answer" in
   [docs/guest-architecture.md](docs/guest-architecture.md).
 

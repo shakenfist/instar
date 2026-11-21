@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
+use log::warn;
 use vm_memory::GuestMemoryMmap;
 
 use crate::ioevent::IoEvent;
@@ -66,18 +67,29 @@ fn arm_kick_signal() -> bool {
         let installed = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = kick_handler as *const () as libc::sighandler_t;
-            // No flags are needed. SA_RESTART is the one worth saying
-            // something about, and it would make no difference either
-            // way: KVM returns -EINTR from KVM_RUN when a signal is
-            // pending, rather than the ERESTARTSYS that asks the kernel
-            // to restart the call, so the ioctl always comes back to the
-            // run loop. (poll(2), which the test for this blocks in, is
-            // never restarted either, so no test can tell the flag's
-            // setting apart.)
-            action.sa_flags = 0;
+            // SA_RESTART does not stop the kick working: KVM returns
+            // -EINTR from KVM_RUN when a signal is pending, rather than
+            // the ERESTARTSYS that asks the kernel to restart the call,
+            // so the ioctl always comes back to the run loop. (Nor is
+            // poll(2), which the test for this blocks in, ever
+            // restarted.) What it does is keep a kick that lands after
+            // the vCPU has left KVM_RUN from failing whatever else that
+            // thread is doing -- a read, a close, the output cleanup --
+            // with a spurious EINTR.
+            action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(KICK_SIGNAL, &action, std::ptr::null_mut()) == 0
         };
+        if !installed {
+            // Without the handler nothing may kick, so a virtqueue the
+            // host cannot read goes back to hanging the run. Say so now,
+            // since the hang itself will say nothing.
+            warn!(
+                "could not install the vCPU kick handler: {}; a virtqueue \
+                 the host cannot read will hang the run",
+                std::io::Error::last_os_error()
+            );
+        }
         KICK_ARMED.store(installed, Ordering::SeqCst);
     });
     KICK_ARMED.load(Ordering::SeqCst)
@@ -110,6 +122,12 @@ pub struct FatalIoError {
     /// the one that explains the run, and the queue may well fail again
     /// in the same way before the vCPU gets out of `KVM_RUN`.
     message: Mutex<Option<String>>,
+    /// Whether `message` holds a failure. Kept beside it so the run
+    /// loop can ask on every vCPU exit without taking the lock.
+    recorded: AtomicBool,
+    /// Whether the run loop has read the failure. Once it has, the
+    /// kick has done its job and the I/O loop stops sending it.
+    observed: AtomicBool,
     /// The thread to kick, captured when the I/O thread is created,
     /// which every operation does on the thread that then runs the vCPU.
     vcpu_thread: libc::pthread_t,
@@ -123,6 +141,8 @@ impl FatalIoError {
     fn for_this_thread() -> Self {
         Self {
             message: Mutex::new(None),
+            recorded: AtomicBool::new(false),
+            observed: AtomicBool::new(false),
             // SAFETY: pthread_self takes no arguments and cannot fail.
             vcpu_thread: unsafe { libc::pthread_self() },
             kick_armed: arm_kick_signal(),
@@ -136,6 +156,7 @@ impl FatalIoError {
                 *slot = Some(message);
             }
         }
+        self.recorded.store(true, Ordering::Release);
         self.kick();
     }
 
@@ -161,12 +182,29 @@ impl FatalIoError {
 
     /// Whether a failure has been recorded.
     fn is_set(&self) -> bool {
-        self.message.lock().map(|m| m.is_some()).unwrap_or(false)
+        self.recorded.load(Ordering::Acquire)
+    }
+
+    /// Whether the vCPU still has to be taken out of `KVM_RUN`: a
+    /// failure is recorded and the run loop has not read it yet.
+    fn needs_kick(&self) -> bool {
+        self.is_set() && !self.observed.load(Ordering::Acquire)
     }
 
     /// The recorded failure, if any.
     pub fn message(&self) -> Option<String> {
         self.message.lock().ok().and_then(|m| m.clone())
+    }
+
+    /// The recorded failure, if any, as read by the run loop -- which
+    /// ends the kicking, since the vCPU is out of `KVM_RUN` and the
+    /// failure is in hand.
+    fn observe(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        self.observed.store(true, Ordering::Release);
+        self.message()
     }
 }
 
@@ -250,11 +288,12 @@ impl IoThread {
 
     /// The failure the I/O thread could not report any other way.
     ///
-    /// The run loop reads this when its vCPU comes out of `KVM_RUN`
-    /// without a reason of its own, which is how a recorded failure
-    /// reaches the user instead of hanging the run.
+    /// The run loop reads this every time its vCPU comes out of
+    /// `KVM_RUN`, which is how a recorded failure reaches the user
+    /// instead of hanging the run. Reading it stops the kick. Cheap
+    /// when nothing is recorded: one atomic load, no lock.
     pub fn fatal_error(&self) -> Option<String> {
-        self.fatal.message()
+        self.fatal.observe()
     }
 
     /// The main I/O processing loop.
@@ -292,12 +331,12 @@ impl IoThread {
 
         while running.load(Ordering::Acquire) {
             // Keep kicking while a failure is recorded and the run loop
-            // has not acted on it yet. The vCPU may have been between
+            // has not read it yet. The vCPU may have been between
             // two `KVM_RUN` entries when the first kick was sent, in
             // which case the signal was lost and the guest is spinning
             // on a request that will never complete; the next kick, one
             // epoll timeout later, lands.
-            if fatal.is_set() {
+            if fatal.needs_kick() {
                 fatal.kick();
             }
 
@@ -443,6 +482,36 @@ mod tests {
         assert_eq!(
             fatal.message().as_deref(),
             Some("the host could not read device 0's virtqueue")
+        );
+    }
+
+    /// The kick repeats only until the run loop has read the failure.
+    /// After that the vCPU is out of `KVM_RUN` and the message is in
+    /// hand, and a kick still arriving would only interrupt whatever
+    /// that thread does next.
+    #[test]
+    fn reading_the_failure_stops_the_kick() {
+        let fatal = FatalIoError::for_this_thread();
+        assert!(
+            !fatal.needs_kick(),
+            "a kick is wanted with nothing recorded"
+        );
+        assert!(fatal.observe().is_none());
+        assert!(
+            !fatal.needs_kick(),
+            "observing nothing must not stop a later failure being kicked"
+        );
+
+        fatal.record("the host could not read the virtqueue".to_string());
+        assert!(fatal.needs_kick(), "a recorded failure is not being kicked");
+
+        assert_eq!(
+            fatal.observe().as_deref(),
+            Some("the host could not read the virtqueue")
+        );
+        assert!(
+            !fatal.needs_kick(),
+            "the kick carries on after the run loop has read the failure"
         );
     }
 

@@ -188,6 +188,16 @@ written into, which is never instar's to delete. The same applies to
 the `monolithicFlat` extent file, which is removed on the same terms as
 the descriptor.
 
+The rule holds however the run failed: a refusal the guest reports, a
+guest that crashes, or a request the host could not read (see "A
+request the host cannot answer" in
+[guest-architecture.md](guest-architecture.md)). And only a regular
+file is ever removed. A block device, `/dev/null` or a FIFO reports a
+length of zero as well, but an output path naming one is a target the
+user supplied, so a failed `convert in.qcow2 /dev/sdb` leaves the
+device node where it was; an output path that is a symlink is left
+alone too, along with whatever it points at.
+
 Two cases produce an output that is sized up front rather than grown as
 it is written, and such a file is never empty and so is always kept:
 `dd`, and `convert -S 0` or `--preallocation` on a raw target.
