@@ -898,6 +898,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is now the descriptor's allocation plus each extent's, and `info` and
   `info --chain` compute it the same way. See `docs/info.md`.
 
+- **A distro mirror mid-rotation no longer fails the package legs.**
+  Installing a package resolves its dependencies against the
+  repositories of the distro, a local `.rpm` included, so `package-smoke`
+  and the Rocky functional legs depended on a third party keeping its
+  metadata self-consistent at the moment they ran. A `repomd.xml` served
+  from a stale mirror or edge cache names `primary` and `filelists`
+  files the mirrors have already deleted, every mirror answers 404, and
+  dnf stops before it has looked at the package at all -- and because
+  those legs are the last to run, one 404 could eject a pull request
+  after most of a day of queue wait. Every dnf that resolves against a
+  distro repository now goes through `tools/ci/dnf.sh`, which retries
+  that failure with a `clean metadata` in between, inside one
+  five-minute deadline, and returns any other failure at once. A
+  package the rotation deleted is retried the same way, matched on the
+  wording dnf wraps a failed download in rather than on the mirror line,
+  which a payload failure does not always carry
+  ([#667](https://github.com/shakenfist/instar/issues/667)). See
+  `docs/development.md`.
+
 - **`info` reports the allocation and child order qemu-img does for a
   VMDK made of separate extent files.** This covers `monolithicFlat` as
   well as the `twoGbMaxExtent*` split subformats. The top-level
