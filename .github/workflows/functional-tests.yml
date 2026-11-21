@@ -507,6 +507,9 @@ jobs:
           # would risk reading a binary that image relinked and blaming
           # the release Dockerfile for it.
           tools/ci/check-glibc-floor.sh
+          # The fetcher ships in the same packages and the same tarball, so
+          # it carries the same promise and is checked in the same window.
+          tools/ci/check-glibc-floor.sh src/target/release/instar-fetch
           make instar-devcontainer
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)

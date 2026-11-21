@@ -228,6 +228,7 @@ Reusable Rust crates for the `instar` project.
 | Document | Description |
 |----------|-------------|
 | [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |
+| [fetch-protocol](crates/fetch-protocol.md) | Fixed-header SOCK_SEQPACKET protocol between the host and an untrusted fetcher |
 
 ### Format Parsing Crates (`src/crates/`)
 

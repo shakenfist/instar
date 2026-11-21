@@ -238,6 +238,7 @@ jobs:
               fuzz_dmg_table
               fuzz_dmg_chunk
               fuzz_chain_compose
+              fuzz_fetch_protocol
             )
           fi
 

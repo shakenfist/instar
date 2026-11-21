@@ -1,0 +1,22 @@
+[package]
+name = "fetch-protocol"
+version = "0.3.0"
+edition = "2021"
+description = "Wire format for instar's privileged VMM to untrusted fetcher channel"
+license = "Apache-2.0"
+repository = "https://github.com/shakenfist/instar"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["ipc", "seqpacket", "protocol", "disk-image"]
+categories = ["os::unix-apis"]
+# Not published to crates.io: internal to instar's host side.
+publish = false
+
+# libc only, and only for the socket: std cannot create a SOCK_SEQPACKET
+# socket (its UnixStream is SOCK_STREAM and its UnixDatagram is SOCK_DGRAM,
+# both hardcoded), and this crate is linked into the process that holds
+# /dev/kvm, so it takes no third-party dependency it can avoid.
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
