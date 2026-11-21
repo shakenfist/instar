@@ -3490,6 +3490,45 @@ impl VhdFooterChecksumRefusal {
 // Host I/O failure signal
 // ============================================================================
 
+/// Marker for a VHD block whose BAT entry places it on the image's own
+/// structure (issue #662), raised on `send_error`.
+///
+/// A dynamic VHD's BAT entry is the absolute 512-byte sector number of
+/// a block's sector bitmap, with the payload just after it, and nothing
+/// in the format stops that landing on the footer copy at offset 0 or
+/// the dynamic header. instar's readers refuse such a block rather than
+/// serve the image's own metadata as data.
+///
+/// The refusal is correct and used to arrive with no reason in it. The
+/// chain readers signal it by returning `None`, which their callers
+/// cannot tell from a failed read, so `convert` reported a read failure
+/// at an offset with nothing said about the rule (issue #909). The
+/// whole-BAT walks tell their callers through
+/// `VhdState::block_table_malformed`, which is enough for `map` and
+/// `measure` because each has a result code to carry; a chain read has
+/// no result struct to put it in, which is why this travels on
+/// `send_error` the way [`MalformedL2EntryRefusal`] does.
+///
+/// `device` is the device the refused read was against, `sector`
+/// carries the block's host *byte* offset -- the thing the user needs
+/// to find it in their image -- and `status` is unused and sent as 0,
+/// because the one rule is the whole reason.
+pub struct VhdBlockPlacementRefusal;
+
+impl VhdBlockPlacementRefusal {
+    /// Reserved `send_error` operation marker for this refusal.
+    /// Distinct from every real operation name and from every other
+    /// marker, so the host's decoder can tell the `send_error` uses
+    /// apart.
+    pub const OPERATION: &'static str = "vhd-block-placement";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`.
+    /// `vhd_block_placement_marker_is_distinct_and_matches_its_c_string`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"vhd-block-placement\0";
+}
+
 /// The `send_error` channel used to report that a request the guest
 /// made of the host's virtio device completed with an error. The
 /// guest's read and write helpers return a bare `bool`, so a failure
@@ -7171,6 +7210,41 @@ mod tests {
         assert_eq!(
             &c[..c.len() - 1],
             VhdFooterChecksumRefusal::OPERATION.as_bytes()
+        );
+    }
+
+    #[test]
+    fn vhd_block_placement_marker_is_distinct_and_matches_its_c_string() {
+        // A drift between the C string the reader raises and the &str
+        // the host compares means the refusal is raised but never
+        // captured, and `convert` reverts to reporting a read failure
+        // with no rule in it.
+        for other in [
+            "cpu-exception",
+            "convert",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+            DataFileEntryRefusal::OPERATION,
+            MalformedL2EntryRefusal::OPERATION,
+            VhdFooterChecksumRefusal::OPERATION,
+            IoFailure::OPERATION,
+        ] {
+            assert_ne!(VhdBlockPlacementRefusal::OPERATION, other);
+        }
+        let c = VhdBlockPlacementRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            VhdBlockPlacementRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !VhdBlockPlacementRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
         );
     }
 
