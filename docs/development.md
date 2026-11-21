@@ -767,6 +767,29 @@ failure slow. `tools/ci/test-dnf.sh` checks all of that against a fake
 dnf, including that the wrapper adds nothing to the arguments it is
 given.
 
+A rotation deletes packages as well as repodata, and a deleted package
+is retried too -- but not on the mirror line. librepo reports running
+out of mirrors as "all mirrors were already tried", which is how a
+metadata failure ends, while a payload that has spent its allowance of
+mirror failures ends in the bare transfer error (`Status code: 404 for
+...`), naming no mirrors. So the wrapper also matches the wordings dnf
+wraps a failed payload in: `Error downloading packages:` from dnf4 and
+`Failed to download packages` from dnf5. That is deliberately broad --
+a repository with `skip_if_unavailable` turns an unreachable mirror into
+a warning and carries on, so an unrelated failure in the same run can
+carry a matching line and be retried for the whole deadline. One wasted
+deadline on a failure that would have failed anyway is the cheaper
+mistake; `tools/ci/test-dnf.sh` pins that trade rather than leaving it
+to a comment.
+
+Two things follow for callers. The wrapper merges dnf's stderr into its
+stdout, because that is what it matches on, so a caller that captures
+the wrapper's stdout captures dnf's diagnostics with it -- group an
+`||` chain before redirecting it (`{ a || b; } >/dev/null 2>&1`), since
+a redirection on a list binds to its last command alone. And where a
+fallback arm exists at all, give it a short `DNF_RETRY_TIMEOUT` so that
+the waiting is paid once per install rather than once per arm.
+
 It has four callers:
 
 - `tools/test-package-install.sh` and `tools/probe-qemu-versions.sh` run
@@ -782,9 +805,12 @@ It has four callers:
   `|| true` call dnf directly.
 - `tools/validate-published-release.sh`, the manual release check, finds
   the wrapper relative to itself, so it only has it when run from a
-  clone. A lone copy of the script falls back to plain dnf and prints a
-  note saying so, because there a mirror mid-rotation looks like a
-  broken artifact.
+  clone. "From a clone" means the enclosing tree holds this very file,
+  not merely something at `tools/ci/dnf.sh`: a lone copy run from
+  `/tmp/foo/` would otherwise resolve the probe to `/tmp/tools/ci/dnf.sh`
+  and run whatever a local user had left there with `sudo` already
+  primed. A lone copy falls back to plain dnf and prints a note saying
+  so, because there a mirror mid-rotation looks like a broken artifact.
 
 The wrapper needs bash, `mktemp`, `tee` and `grep` wherever it runs,
 which every image in the matrix has.

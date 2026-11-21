@@ -258,8 +258,10 @@ else
     dnf install -y python3.12 python3.12-pip || dnf install -y python3.11 python3.11-pip || true
     dnf install -y python3 python3-pip || true
     # The package that *provides* qemu-img differs across EL streams.
+    # The fallback arm gets a short deadline of its own, so that a
+    # mirror that stays broken costs one wait rather than one per arm.
     /workspace/tools/ci/dnf.sh install -y qemu-img || \
-        /workspace/tools/ci/dnf.sh install -y /usr/bin/qemu-img
+        DNF_RETRY_TIMEOUT=60 /workspace/tools/ci/dnf.sh install -y /usr/bin/qemu-img
     # qemu-storage-daemon is the oracle for the bitmap differential
     # tests. Fedora ships it as its own package; some EL streams do not
     # package it at all, so this is best-effort -- the tests skip

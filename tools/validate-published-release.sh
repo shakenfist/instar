@@ -86,11 +86,19 @@ else
     # meant to be able to tell you. The wrapper is only there when
     # this runs from a clone (see the header), so without it this
     # falls back to plain dnf rather than failing the rpm path.
+    #
+    # "From a clone" is checked as the enclosing tree holding this very
+    # file, not as something existing at tools/ci/dnf.sh: a lone copy
+    # run from /tmp/foo/ resolves REPO_ROOT to /tmp, and
+    # /tmp/tools/ci/dnf.sh is a path any other local user can create --
+    # which this would then run with sudo already primed.
     DNF_WRAPPER="${REPO_ROOT}/tools/ci/dnf.sh"
-    if [ -f "$DNF_WRAPPER" ]; then
+    if [ "${REPO_ROOT}/tools/validate-published-release.sh" -ef "$0" ] \
+            && [ -f "$DNF_WRAPPER" ]; then
         dnf_install() { DNF='sudo dnf' bash "$DNF_WRAPPER" install -y "$@"; }
     else
-        echo "note: $DNF_WRAPPER not found, so calling dnf directly." >&2
+        echo "note: $0 is not a clone's own copy with $DNF_WRAPPER" \
+            "beside it, so calling dnf directly." >&2
         echo "      A mirror mid-rotation will fail the install below;" \
             "rerun before blaming the artifact." >&2
         dnf_install() { sudo dnf install -y "$@"; }

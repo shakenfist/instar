@@ -910,7 +910,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   after most of a day of queue wait. Every dnf that resolves against a
   distro repository now goes through `tools/ci/dnf.sh`, which retries
   that failure with a `clean metadata` in between, inside one
-  five-minute deadline, and returns any other failure at once
+  five-minute deadline, and returns any other failure at once. A
+  package the rotation deleted is retried the same way, matched on the
+  wording dnf wraps a failed download in rather than on the mirror line,
+  which a payload failure does not always carry
   ([#667](https://github.com/shakenfist/instar/issues/667)). See
   `docs/development.md`.
 

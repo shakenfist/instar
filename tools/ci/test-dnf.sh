@@ -50,7 +50,7 @@ esac
 EOF
 chmod +x "${FAKE}"
 
-# The wordings a metadata failure arrives in: dnf4, dnf5 (two of them),
+# The wordings a mirror failure arrives in: dnf4, dnf5 (two of them),
 # and the mirror line, which comes from librepo rather than from dnf at
 # all and is capitalised differently for repomd.xml than for the rest of
 # the repodata. The repomd one is matched by nothing but that line,
@@ -66,6 +66,20 @@ MIRROR_MESSAGE='repodata/8dad4ae7-primary.xml.gz - Cannot download,'
 MIRROR_MESSAGE="${MIRROR_MESSAGE} all mirrors were already tried without success"
 REPOMD_MESSAGE='Cannot download repodata/repomd.xml: All mirrors were tried'
 
+# A payload a rotation deleted, which the mirror line does not always
+# cover: librepo reports the bare transfer error once it has spent its
+# allowance of mirror failures, so these pin the wordings dnf itself
+# wraps a failed payload in. dnf4's is from dnf/cli/cli.py and dnf5's
+# from libdnf5/repo/package_downloader.cpp; the indented line beneath
+# each is librepo's, reproduced here to show that the match does not
+# depend on it.
+DNF4_PAYLOAD_MESSAGE='Error downloading packages:'
+DNF4_PAYLOAD_MESSAGE="${DNF4_PAYLOAD_MESSAGE}
+  instar-0.3.0-1.x86_64.rpm: Status code: 404 for https://example/"
+DNF5_PAYLOAD_MESSAGE='Failed to download packages'
+DNF5_PAYLOAD_MESSAGE="${DNF5_PAYLOAD_MESSAGE}
+ Librepo error: Status code: 404 for https://example/ (IP: 192.0.2.1)"
+
 FAILURES=0
 
 fail() {
@@ -80,12 +94,19 @@ run() {
     # failed assertion (exit 124) rather than a hung CI step.
     local fails="$1" result="$2" timeout="$3" message="$4"
     shift 4
-    # RUN_DNF and FAKE_CLEAN_FAILS, when set by the caller, pass through.
+    # RUN_DNF and FAKE_CLEAN_FAILS are set as a prefix assignment on the
+    # call. Whether bash leaves such an assignment set in the shell once
+    # the function returns has varied between versions and POSIX mode,
+    # so read each one here and clear it: a later case then cannot
+    # silently inherit a knob from an earlier one whichever bash is
+    # running, and the fake is passed both explicitly below.
+    local dnf_cmd="${RUN_DNF:-${FAKE}}" clean_status="${FAKE_CLEAN_FAILS:-0}"
+    unset RUN_DNF FAKE_CLEAN_FAILS
     rm -f "${WORK}/calls.txt" "${WORK}/argv.txt" "${WORK}/lc_all.txt"
     touch "${WORK}/calls.txt"
     OUTPUT="$(FAKE_DIR="${WORK}" FAKE_FAILS="${fails}" \
         FAKE_RESULT="${result}" FAKE_MESSAGE="${message}" \
-        DNF="${RUN_DNF:-${FAKE}}" \
+        FAKE_CLEAN_FAILS="${clean_status}" DNF="${dnf_cmd}" \
         DNF_RETRY_TIMEOUT="${timeout}" DNF_RETRY_INTERVAL=1 \
         timeout 20 "${SCRIPT}" "$@" 2>&1)"
     STATUS=$?
@@ -110,7 +131,8 @@ WANTED='install -y --setopt=install_weak_deps=False /pkg/instar.rpm'
 # stale copy is discarded before each retry rather than being asked
 # the same question twice.
 for message in "${DNF4_MESSAGE}" "${DNF5_MESSAGE}" "${DNF5_URL_MESSAGE}" \
-        "${MIRROR_MESSAGE}" "${REPOMD_MESSAGE}"; do
+        "${MIRROR_MESSAGE}" "${REPOMD_MESSAGE}" \
+        "${DNF4_PAYLOAD_MESSAGE}" "${DNF5_PAYLOAD_MESSAGE}"; do
     run 2 ok 300 "${message}" install -y qemu-img
     [ "${STATUS}" -eq 0 ] || fail "retried (${message:0:40}): exit ${STATUS}, wanted 0"
     [ "${ATTEMPTS}" -eq 3 ] \
@@ -152,6 +174,24 @@ run 0 42 300 "${DNF4_MESSAGE}" install -y nonesuch
     || fail "other failure: ${ATTEMPTS} attempts, wanted 1 (it was retried)"
 [ "${CLEANS}" -eq 0 ] \
     || fail 'other failure: metadata was cleaned for an unrelated failure'
+
+# The match is deliberately broad, and this is what that costs: a
+# repository configured with skip_if_unavailable (the default on several
+# Fedora and EPEL repositories) reports an unreachable mirror as a
+# warning and carries on, so an unrelated failure in the same run still
+# has a matching line above it and is retried until the deadline. The
+# trade is one wasted deadline on a failure that would have failed
+# anyway, against a mirror rotation going unretried because dnf worded
+# it in a way the pattern did not cover.
+SKIPPED_REPO_MESSAGE='Failed to download metadata for repo "epel": [skipped]'
+SKIPPED_REPO_MESSAGE="${SKIPPED_REPO_MESSAGE}
+Error: Unable to find a match: qemu-img"
+run -1 ok 3 "${SKIPPED_REPO_MESSAGE}" install -y qemu-img
+[ "${STATUS}" -eq 1 ] || fail "skipped repo: exit ${STATUS}, wanted 1"
+[ "${ATTEMPTS}" -ge 2 ] \
+    || fail "skipped repo: ${ATTEMPTS} attempts, wanted the deadline to be spent"
+[[ "${OUTPUT}" == *'still unusable after 3s'* ]] \
+    || fail 'skipped repo: the deadline was not what ended it'
 
 # Metadata that never recovers fails the step once the deadline passes,
 # with dnf's own status and a message saying why.
