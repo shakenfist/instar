@@ -98,7 +98,6 @@ Project reference files:
 
 - [ARCHITECTURE.md](https://github.com/shakenfist/instar/blob/develop/ARCHITECTURE.md) - Design goals, the security model, and format support internals
 - [AGENTS.md](https://github.com/shakenfist/instar/blob/develop/AGENTS.md) - Guide for AI coding assistants, including the project's Claude Code skills
-- [CHANGELOG.md](https://github.com/shakenfist/instar/blob/develop/CHANGELOG.md) - Release history
 
 This project includes twelve Claude Code skills in
 [.claude/skills/](https://github.com/shakenfist/instar/tree/develop/.claude/skills)

@@ -523,8 +523,8 @@ because the following statements will be true:
   format or operation support.
 * Documentation in `docs/` has been updated to describe the new
   features.
-* `ARCHITECTURE.md`, `README.md`, `AGENTS.md`, and
-  `CHANGELOG.md` have been updated as needed.
+* `ARCHITECTURE.md`, `README.md` and `AGENTS.md` have been
+  updated as needed.
 
 ### Documentation index maintenance
 

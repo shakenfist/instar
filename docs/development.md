@@ -481,15 +481,22 @@ instar/
 │   ├── malicious/  # CVE exploit images (DANGEROUS)
 │   └── downloaded/ # External test images (CirrOS, QEMU iotests, etc.)
 ├── Makefile        # Build and development automation
-├── CHANGELOG.md    # Release history
 ├── SECURITY.md     # Vulnerability reporting and security policy
 └── README.md
 ```
 
 ## Releases
 
-See [CHANGELOG.md](https://github.com/shakenfist/instar/blob/develop/CHANGELOG.md)
-for release notes.
+Release notes live on each
+[GitHub release](https://github.com/shakenfist/instar/releases), not
+in the tree. instar keeps no `CHANGELOG.md`: a file that every pull
+request appends to is a merge conflict between every pair of pull
+requests in flight, and the per-change record is already the commit
+messages and `docs/`. The summary a user reads -- what behaviour
+changed between two versions, one entry for a fix however many commits
+it took -- is written once, at release time, by whoever cuts the
+release (step 5 below). A pre-commit hook fails if `CHANGELOG.md`
+reappears.
 
 Release artifacts (pre-compiled Linux binaries, plus `.deb` and `.rpm`
 packages) are published to
@@ -510,12 +517,7 @@ and a version bump pushed straight to `develop` has no such run.
    `make test-rust`, and then asks before it commits `Release 0.2.0.`,
    pushes the branch and opens a pull request. On `N`, or on any
    failure before the push, it deletes the branch and leaves the
-   checkout as it was. It does not touch `CHANGELOG.md`: date the
-   release there with a second commit on `release-0.2.0`, moving the
-   `## [Unreleased]` entries under `## [0.2.0] - YYYY-MM-DD`, and push
-   it before the pull request queues. `tag-release.sh` finds the merge
-   that contains `Release 0.2.0.`, so the extra commit does not change
-   which commit is tagged.
+   checkout as it was.
 2. **Merge.** Get the pull request reviewed and land it through the
    merge queue like any other change, then wait for the queue's
    `functional-tests.yml` run on the merged commit to finish.
@@ -530,6 +532,18 @@ and a version bump pushed straight to `develop` has no such run.
    `build`, then waits at `sign-tag` for a reviewer to approve the
    `release` environment. After approval it re-signs the tag with
    gitsign and creates the GitHub release.
+5. **Write the release notes.** The workflow fills the release body
+   with GitHub's generated list of merged pull requests, which says
+   what merged but not what a user will notice. Write a summary above
+   it from `git log --no-merges v0.1.0..v0.2.0` (the previous tag to
+   this one) and the `docs/` pages those commits changed, grouped as
+   Added, Changed and Fixed, and put it on the release with
+   `gh release edit v0.2.0 --notes-file NOTES.md`, keeping the
+   generated list below it. The first release after 0.3.0 has a draft
+   already: the entries the removed `CHANGELOG.md` collected under
+   `## [Unreleased]`, which
+   `git show "$(git log -1 --format=%H --diff-filter=D -- CHANGELOG.md)^:CHANGELOG.md"`
+   prints.
 
 `ci-gate` checks that `functional-tests.yml` succeeded on the tagged
 commit, in its merge queue run. A run started by hand, as

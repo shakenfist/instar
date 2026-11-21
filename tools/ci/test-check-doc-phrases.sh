@@ -149,14 +149,14 @@ expect_pass 'a quoted example inside docs/plans/ does not trip the guard' "${TRE
 start 'the scope is every tracked file, not just docs/'
 TREE="${WORK}/toplevel-covered"
 build_tree "${TREE}"
-cat > "${TREE}/CHANGELOG.md" <<'EOF'
-# Changelog
+cat > "${TREE}/ARCHITECTURE.md" <<'EOF'
+# Architecture
 
 Since the PLAN-q workcow2-write-infrastructure, writes are supported.
 EOF
 commit_tree "${TREE}"
 expect_fail 'a corrupted phrase in a top-level page is caught' "${TREE}" \
-    'CHANGELOG.md'
+    'ARCHITECTURE.md'
 
 start 'tools/ci/ is exempt because its own fixtures carry the pattern'
 TREE="${WORK}/toolsci-exempt"

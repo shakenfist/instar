@@ -111,7 +111,7 @@ fi
 # outage this check was extended for: --locked is what builds each tool
 # against the dependency set its author released it with, so a broken
 # transitive dependency published upstream cannot reach the image. A pin
-# without --locked still re-resolves the whole tree. CHANGELOG.md,
+# without --locked still re-resolves the whole tree.
 # docs/development.md, AGENTS.md and both Dockerfiles all state --locked
 # as a rule; without a check, deleting it from one line -- or adding a
 # new `cargo install` without it -- passes pre-commit and CI in silence
