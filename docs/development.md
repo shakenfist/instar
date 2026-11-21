@@ -760,12 +760,16 @@ pull request can go back.
 So every dnf that resolves against a distro repository goes through
 `tools/ci/dnf.sh`, which retries that failure with a `clean metadata` in
 between -- so the retry cannot be answered from the copy that just
-failed -- inside one five-minute deadline. Any other failure, an unknown
-package or an unsatisfied dependency, is returned at once: that is an
-answer about the package, and retrying it would only make a clear
-failure slow. `tools/ci/test-dnf.sh` checks all of that against a fake
-dnf, including that the wrapper adds nothing to the arguments it is
-given.
+failed -- inside one five-minute deadline. The deadline is checked
+between attempts, so it bounds when the last retry starts rather than
+when the wrapper returns: an attempt against wedged mirrors is not cut
+short, and can run past it. Any other failure, an unknown package or an
+unsatisfied dependency, is returned at once: that is an answer about the
+package, and retrying it would only make a clear failure slow.
+`tools/ci/test-dnf.sh` checks all of that against a fake dnf, including
+that the wrapper adds nothing to the arguments it is given -- and fails
+on any dnf in `tools/` or the workflows that does not go through the
+wrapper, unless its line ends in `# direct dnf: <reason>`.
 
 A rotation deletes packages as well as repodata, and a deleted package
 is retried too -- but not on the mirror line. librepo reports running
@@ -800,20 +804,33 @@ It has four callers:
   `/workspace` and calls it from there. dnf loads every enabled
   repository's metadata on its first transaction, so later calls reuse
   that, but they still download packages from the mirrors, which a
-  rotation deletes too. So the wrapper covers the first dnf and every
-  later one that can fail the leg; the best-effort installs that end in
-  `|| true` call dnf directly.
+  rotation deletes too. So every dnf in the leg goes through the
+  wrapper, the best-effort installs ending in `|| true` included: losing
+  the newer interpreters to a 404 fails the leg later at the Python
+  check, with a message that hides the mirror, and losing
+  `qemu-storage-daemon` skips the bitmap oracle tests without a word.
 - `tools/validate-published-release.sh`, the manual release check, finds
   the wrapper relative to itself, so it only has it when run from a
-  clone. "From a clone" means the enclosing tree holds this very file,
-  not merely something at `tools/ci/dnf.sh`: a lone copy run from
-  `/tmp/foo/` would otherwise resolve the probe to `/tmp/tools/ci/dnf.sh`
-  and run whatever a local user had left there with `sudo` already
-  primed. A lone copy falls back to plain dnf and prints a note saying
-  so, because there a mirror mid-rotation looks like a broken artifact.
+  clone. "From a clone" means the script's own resolved directory is
+  the enclosing tree's `tools/`, not merely that something exists at
+  `tools/ci/dnf.sh`: a lone copy run from `/tmp/foo/` would otherwise
+  resolve the probe to `/tmp/tools/ci/dnf.sh` and run whatever a local
+  user had left there with `sudo` already primed. The check compares
+  `realpath`-derived names rather than inodes, because `test -ef`
+  follows a symlink planted at `/tmp/tools/validate-published-release.sh`
+  back to the real file and passes. A lone copy falls back to plain dnf
+  and prints a note saying so, because there a mirror mid-rotation looks
+  like a broken artifact.
 
 The wrapper needs bash, `mktemp`, `tee` and `grep` wherever it runs,
 which every image in the matrix has.
+
+The deb arms of the same container legs carry the same third-party risk
+-- a Debian or Ubuntu mirror caught mid-push fails with `Hash Sum
+mismatch`, or a 404 for a `Packages` file its `InRelease` still names --
+and still call `apt-get` directly. That is deliberate for now, to keep
+this wrapper about dnf, and is tracked in
+[#955](https://github.com/shakenfist/instar/issues/955).
 
 ### Self-hosted runners and the GitHub CLI
 
@@ -1247,7 +1264,7 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `tools/ci/apt-get.sh` - Runs `sudo apt-get`, waiting for apt's locks rather than failing on them; every host-side `apt-get` in CI goes through it (see "apt and its locks" above)
 - `tools/ci/test-apt-get.sh` - Tests for that wrapper against a fake `apt-get`; the `ci-tooling` CI job runs it
 - `tools/ci/dnf.sh` - Runs `dnf`, retrying a repository-metadata failure rather than failing the job on it; every dnf that resolves against a distro repository goes through it (see "Distro mirrors and dnf" above)
-- `tools/ci/test-dnf.sh` - Tests for that wrapper against a fake `dnf`; the `ci-tooling` CI job runs it
+- `tools/ci/test-dnf.sh` - Tests for that wrapper against a fake `dnf`, and that nothing in `tools/` or the workflows calls dnf around it; the `ci-tooling` CI job runs it
 - `tools/ci/install-docker.sh` - Installs the Docker client and daemon on a self-hosted runner, plus any extra packages passed as arguments (see "Self-hosted runners and Docker" above)
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
 - `tools/propose-release.sh`, `tools/tag-release.sh` - The two release steps: open the version-bump pull request, then tag the commit that merged it (see "Releases" above)

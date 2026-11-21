@@ -247,27 +247,32 @@ else
     # this very suite from the merge queue. The first transaction loads
     # the metadata of every enabled repository, so the calls below reuse
     # what it fetched -- but they still download packages from the
-    # mirrors, and a rotation deletes those too. So the qemu-img install
-    # goes through the wrapper as well, being the only later dnf that
-    # can fail the leg; the others end in || true or an echo. See
-    # "Distro mirrors and dnf" in docs/development.md.
+    # mirrors, and a rotation deletes those too. So every later dnf goes
+    # through the wrapper as well, the ones ending in || true included:
+    # losing the interpreters to a 404 fails the leg at the Python gate
+    # below with a message that hides the mirror, and losing
+    # qemu-storage-daemon skips the bitmap oracle tests without a word.
+    # Where an install has a fallback arm, the arm gets a short deadline
+    # of its own, so that a mirror that stays broken costs one wait per
+    # install rather than one per arm. See "Distro mirrors and dnf" in
+    # docs/development.md.
     /workspace/tools/ci/dnf.sh install -y --setopt=install_weak_deps=False "/pkg/$PKG_FILE"
     # The test deps (testtools >= 2.9.1) require Python >= 3.10, but some
     # EL streams (Rocky/RHEL 9) default python3 to 3.9. Install a newer
     # interpreter explicitly; the interpreter is selected below.
-    dnf install -y python3.12 python3.12-pip || dnf install -y python3.11 python3.11-pip || true
-    dnf install -y python3 python3-pip || true
+    /workspace/tools/ci/dnf.sh install -y python3.12 python3.12-pip || \
+        DNF_RETRY_TIMEOUT=60 /workspace/tools/ci/dnf.sh install -y python3.11 python3.11-pip || \
+        true
+    /workspace/tools/ci/dnf.sh install -y python3 python3-pip || true
     # The package that *provides* qemu-img differs across EL streams.
-    # The fallback arm gets a short deadline of its own, so that a
-    # mirror that stays broken costs one wait rather than one per arm.
     /workspace/tools/ci/dnf.sh install -y qemu-img || \
         DNF_RETRY_TIMEOUT=60 /workspace/tools/ci/dnf.sh install -y /usr/bin/qemu-img
     # qemu-storage-daemon is the oracle for the bitmap differential
     # tests. Fedora ships it as its own package; some EL streams do not
     # package it at all, so this is best-effort -- the tests skip
     # cleanly when it is missing rather than erroring.
-    dnf install -y qemu-storage-daemon || \
-        dnf install -y /usr/bin/qemu-storage-daemon || \
+    /workspace/tools/ci/dnf.sh install -y qemu-storage-daemon || \
+        DNF_RETRY_TIMEOUT=60 /workspace/tools/ci/dnf.sh install -y /usr/bin/qemu-storage-daemon || \
         echo "note: qemu-storage-daemon unavailable; bitmap oracle tests will skip"
 fi
 

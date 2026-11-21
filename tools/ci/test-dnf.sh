@@ -11,7 +11,8 @@
 # Contract (see the script's header): the arguments reach dnf unchanged
 # and in order, with nothing added; a metadata failure is retried, with
 # `clean metadata` between attempts, until one deadline expires; any
-# other failure is returned at once with its own status.
+# other failure is returned at once with its own status. And, last, that
+# nothing in tools/ or the workflows calls dnf without it.
 #
 # Pure bash: no sudo, no dnf, no network.
 set -uo pipefail
@@ -141,6 +142,8 @@ for message in "${DNF4_MESSAGE}" "${DNF5_MESSAGE}" "${DNF5_URL_MESSAGE}" \
         || fail "retried (${message:0:40}): ${CLEANS} cleans, wanted 2"
     [ "$(sed -n 2p "${WORK}/calls.txt")" = 'clean metadata' ] \
         || fail "retried (${message:0:40}): the retry reused the metadata that failed"
+    [[ "${OUTPUT}" == *'fake dnf: done'* ]] \
+        || fail "retried (${message:0:40}): the successful attempt's output did not reach the caller"
 done
 
 # A clean that fails does not stop the retries: the next attempt may
@@ -175,6 +178,24 @@ run 0 42 300 "${DNF4_MESSAGE}" install -y nonesuch
 [ "${CLEANS}" -eq 0 ] \
     || fail 'other failure: metadata was cleaned for an unrelated failure'
 
+# The decision is made on the attempt that just failed, not on the run
+# so far: a mirror failure followed by an ordinary one stops at the
+# ordinary one. A log kept across attempts would retry the unknown
+# package for the whole deadline on the strength of the first attempt's
+# mirror line.
+run 1 42 300 "${MIRROR_MESSAGE}" install -y nonesuch
+[ "${STATUS}" -eq 42 ] || fail "mirror then other failure: exit ${STATUS}, wanted 42"
+[ "${ATTEMPTS}" -eq 2 ] \
+    || fail "mirror then other failure: ${ATTEMPTS} attempts, wanted 2 (a stale mirror line kept it retrying)"
+[ "${CLEANS}" -eq 1 ] \
+    || fail "mirror then other failure: ${CLEANS} cleans, wanted 1"
+
+# A dnf that cannot be run at all is not weather either: the shell's
+# own 127 comes back at once, unretried.
+RUN_DNF="${WORK}/no-such-dnf" run 0 ok 300 "${DNF4_MESSAGE}" install -y qemu-img
+[ "${STATUS}" -eq 127 ] || fail "missing dnf: exit ${STATUS}, wanted 127"
+[[ "${OUTPUT}" != *'retrying'* ]] || fail 'missing dnf: it was retried'
+
 # The match is deliberately broad, and this is what that costs: a
 # repository configured with skip_if_unavailable (the default on several
 # Fedora and EPEL repositories) reports an unreachable mirror as a
@@ -190,7 +211,7 @@ run -1 ok 3 "${SKIPPED_REPO_MESSAGE}" install -y qemu-img
 [ "${STATUS}" -eq 1 ] || fail "skipped repo: exit ${STATUS}, wanted 1"
 [ "${ATTEMPTS}" -ge 2 ] \
     || fail "skipped repo: ${ATTEMPTS} attempts, wanted the deadline to be spent"
-[[ "${OUTPUT}" == *'still unusable after 3s'* ]] \
+[[ "${OUTPUT}" == *'still failing after 3s'* ]] \
     || fail 'skipped repo: the deadline was not what ended it'
 
 # Metadata that never recovers fails the step once the deadline passes,
@@ -198,8 +219,24 @@ run -1 ok 3 "${SKIPPED_REPO_MESSAGE}" install -y qemu-img
 run -1 ok 3 "${MIRROR_MESSAGE}" install -y qemu-img
 [ "${STATUS}" -eq 1 ] || fail "wedged mirrors: exit ${STATUS}, wanted 1"
 [ "${ATTEMPTS}" -ge 2 ] || fail "wedged mirrors: ${ATTEMPTS} attempts, wanted at least 2"
-[[ "${OUTPUT}" == *'still unusable after 3s'* ]] \
+[[ "${OUTPUT}" == *'still failing after 3s'* ]] \
     || fail 'wedged mirrors: no message naming the deadline'
+
+# Every dnf that resolves against a distro repository goes through the
+# wrapper, which is a claim about its callers rather than about the
+# wrapper, and one that review found broken twice while the wrapper was
+# being written. So it is checked here: a direct dnf in a script under
+# tools/ or in a workflow fails the suite unless its line says why, with
+# a trailing "# direct dnf: <reason>". Comments are skipped, and so is
+# the wrapper calling dnf itself.
+direct_dnf='(^|[^-./[:alnum:]_])dnf +(install|reinstall|upgrade|update|downgrade|makecache)( |$)'
+while IFS= read -r hit; do
+    fail "direct dnf, not through tools/ci/dnf.sh: ${hit}"
+done < <(cd "${REPO_ROOT}" \
+    && grep -nE "${direct_dnf}" tools/*.sh tools/*/*.sh .github/workflows/*.yml \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+    | grep -v '# direct dnf: ' \
+    | grep -vE '^tools/ci/(test-)?dnf\.sh:')
 
 if [ "${FAILURES}" -ne 0 ]; then
     echo "dnf: ${FAILURES} assertion(s) failed" >&2

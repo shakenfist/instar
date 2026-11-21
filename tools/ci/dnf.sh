@@ -32,7 +32,10 @@
 # dnf resolves the mirror list again, and the mirrors are current. One
 # five-minute deadline covers all of it, long enough to outlast a
 # rotation and short enough that a repository which is genuinely gone
-# still fails the step.
+# still fails the step. It is checked between attempts, so it bounds
+# when the last retry starts rather than when the wrapper returns: an
+# attempt is not cut short, and one spent on wedged mirrors -- librepo
+# does its own per-mirror retrying -- can run past it.
 #
 # A package payload that a rotation has deleted is retried the same
 # way, but it is not the mirror line that catches it. librepo reports
@@ -91,12 +94,15 @@ while true; do
         exit "${status}"
     fi
     if [ "${SECONDS}" -ge "${deadline}" ]; then
-        echo "dnf.sh: repository metadata was still unusable after" \
-            "${timeout}s" >&2
+        # The match is broad (see above), so what was retried may not
+        # have been a mirror at all: point at dnf's own error rather
+        # than naming a cause.
+        echo "dnf.sh: dnf was still failing after ${timeout}s of retries;" \
+            "its own error above says why" >&2
         exit "${status}"
     fi
-    echo "dnf.sh: a repository's metadata would not download," \
-        "discarding it and retrying in ${interval}s" >&2
+    echo "dnf.sh: dnf reported a download failure; discarding the" \
+        "metadata and retrying in ${interval}s" >&2
     # A failed clean is not a reason to stop retrying: the next attempt
     # may still reach a mirror that has what the metadata names.
     "${dnf[@]}" clean metadata >/dev/null 2>&1 || true
