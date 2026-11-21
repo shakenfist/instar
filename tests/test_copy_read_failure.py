@@ -46,8 +46,8 @@ class TestCopyReadFailure(StraceInjectionMixin, InstarTestBase):
 
     # A read line's entry, and the seek that placed it. The VMM's
     # backing store seeks and then reads rather than using `pread`, so
-    # the offset of a read comes from the preceding lseek on the same
-    # descriptor.
+    # the offset of a read comes from the preceding lseek by the same
+    # thread on the same descriptor.
     _READ_ENTRY = re.compile(r'^(?:(?P<pid>\d+)\s+)?read\((?P<fd>\d+), ')
     _LSEEK = re.compile(
         r'^(?:(?P<pid>\d+)\s+)?lseek\((?P<fd>\d+), (?P<offset>\d+), SEEK_SET\)'
@@ -75,7 +75,7 @@ class TestCopyReadFailure(StraceInjectionMixin, InstarTestBase):
             for line in f:
                 seek = self._LSEEK.match(line)
                 if seek:
-                    position[seek.group('fd')] = int(seek.group('offset'))
+                    position[(seek.group('pid'), seek.group('fd'))] = int(seek.group('offset'))
                     continue
                 entry = self._READ_ENTRY.match(line)
                 if not entry:
@@ -85,7 +85,7 @@ class TestCopyReadFailure(StraceInjectionMixin, InstarTestBase):
                 length = self._READ_LINE.match(line.rstrip('\n'))
                 if length is None or int(length.group('length')) < self.DATA_READ_BYTES:
                     continue
-                reads.append((pid, counts[pid], position.get(entry.group('fd'))))
+                reads.append((pid, counts[pid], position.get((pid, entry.group('fd')))))
         return reads, counts
 
     def _derive_injection(self, log):

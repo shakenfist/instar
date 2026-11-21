@@ -690,9 +690,10 @@ the host however long it takes, so contention alone no longer
 produces either message. In a current tree they mean something else:
 `<op> operation failed` — `convert operation failed`,
 `dd operation failed` — is a guest failure the host captured no
-reason for, and a genuine I/O error names the image and the offset
-it stopped at. Treat either as a real defect rather than replaying
-it for load.
+reason for, a genuine I/O error names the image and the offset it
+stopped at, and a guest that faulted names the CPU exception and the
+address it faulted at. Treat any of them as a real defect rather than
+replaying it for load.
 
 The design is **tests from the source tree, binary from the package**:
 the whole `tests/` tree is copied into the container and driven by

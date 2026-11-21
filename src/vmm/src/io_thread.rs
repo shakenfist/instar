@@ -524,6 +524,12 @@ mod tests {
     /// this asserts the interruption rather than only the bookkeeping.
     /// The wait is bounded so a kick that stops working fails the test
     /// instead of hanging the suite.
+    ///
+    /// The recorder keeps kicking until the failure is observed, as the
+    /// I/O loop does: a signal that lands before this thread is in
+    /// `poll` is lost, and a loaded CI host can take longer than any
+    /// fixed delay to get it there. One kick would make the test blame a
+    /// working mechanism for the scheduler's latency.
     #[test]
     fn recording_a_failure_interrupts_the_waiting_thread() {
         let fatal = Arc::new(FatalIoError::for_this_thread());
@@ -542,6 +548,13 @@ mod tests {
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(50));
                 fatal.record("the host could not read the virtqueue".to_string());
+                // Bounded by the poll's own timeout, so a test thread
+                // that never observes cannot keep this one alive.
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                while fatal.needs_kick() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                    fatal.kick();
+                }
             })
         };
 
@@ -556,6 +569,9 @@ mod tests {
         let polled = unsafe { libc::poll(&mut pollfd, 1, 2_000) };
         let errno = std::io::Error::last_os_error();
 
+        // What the run loop does once it is out of KVM_RUN, and what
+        // stops the recorder kicking.
+        let observed = fatal.observe();
         recorder.join().expect("recording thread panicked");
         // SAFETY: both ends were opened by the pipe call above and are
         // closed exactly once here.
@@ -576,7 +592,7 @@ mod tests {
             "the wait failed with {errno} rather than EINTR"
         );
         assert_eq!(
-            fatal.message().as_deref(),
+            observed.as_deref(),
             Some("the host could not read the virtqueue")
         );
     }

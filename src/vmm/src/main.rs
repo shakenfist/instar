@@ -1016,6 +1016,11 @@ struct SerialDecoder {
     /// chain read has no result struct to carry the reason, so without
     /// this the refusal reached the user as a read failure at an offset
     /// with nothing said about the rule.
+    ///
+    /// Last-wins, like every other refusal this decoder keeps. `convert`
+    /// and `dd` stop at the first refusal, so for them last is first;
+    /// an operation that reads on past one (`compare`, `bench`) reports
+    /// the most recent refused block, not the earliest.
     last_vhd_block_placement: Option<u64>,
     /// Whether `info` refused a VHD whose footer copy at offset 0 fails
     /// its checksum: an `error` message whose `operation` is
@@ -1248,14 +1253,25 @@ impl SerialDecoder {
     /// write's is an offset into the output file -- and only the device
     /// that failed is known here.
     ///
-    /// With nothing captured this is the generic text it replaces, so
-    /// one call site cannot render one of the two and forget the other.
+    /// With no failed request captured, a CPU exception the guest IDT
+    /// reported is named instead, as [`Self::no_result_error`] names it
+    /// for the operations that render through that (issue #375): a
+    /// guest that faulted mid-copy otherwise said only that the copy
+    /// failed. A failed request wins over an exception because it is the
+    /// cause the guest identified; a fault after one is its aftermath.
+    ///
+    /// With nothing captured at all this is the generic text it
+    /// replaces, so one call site cannot render one of the two and
+    /// forget the other.
     /// That text names the operation, where the string it replaces said
     /// "convert" for `dd` as well; nothing asserts the old wording for
     /// `dd`, and `docs/quirks.md`'s record of it describes a release
     /// that predates the named refusals.
     fn io_failure_error(&self, op: &str, context: &IoFailureContext) -> String {
         let Some((device, sector)) = &self.last_io_failure else {
+            if self.last_cpu_exception.is_some() {
+                return self.no_result_error(op);
+            }
             return format!("{op} operation failed");
         };
 
@@ -1871,6 +1887,27 @@ mod guest_exception_tests {
                 format!("{op} operation failed")
             );
         }
+    }
+
+    /// A guest that faulted without a failed request to blame is named
+    /// by its exception, for every operation sharing this renderer --
+    /// `copy`, `convert` and `dd` alike.
+    #[test]
+    fn io_failure_error_names_a_cpu_exception_when_no_request_failed() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_cpu_exception = Some((6, 0x300ec));
+        for op in ["copy", "convert", "dd"] {
+            assert_eq!(
+                decoder.io_failure_error(op, &io_failure_context(None)),
+                format!("{op}: guest CPU exception: invalid opcode (#UD) at guest RIP 0x300ec")
+            );
+        }
+        // A failed request is the cause the guest identified, so it
+        // still wins over an exception raised after it.
+        decoder.last_io_failure = Some(("input".to_string(), 5120));
+        assert!(decoder
+            .io_failure_error("copy", &io_failure_context(None))
+            .starts_with("copy: reading the input image"));
     }
 
     #[test]
@@ -15634,6 +15671,14 @@ fn run_guest<'vcpu>(
 /// than a file this run made: unlinking `/dev/sdb` as root destroys the
 /// node. A symlink is not followed either, so the length tested is the
 /// length of the thing `remove_file` would remove.
+///
+/// The test is advisory against anyone else who can write to the
+/// output's directory: between the stat and the unlink they could put
+/// a different file at the path, and it is that file which is removed.
+/// The output path and its directory are the invoking user's choice,
+/// which puts that party outside the untrusted-image threat model this
+/// project defends; closing the window would take an `unlinkat`
+/// against a directory descriptor opened with the output.
 ///
 /// A failure to remove it is not reported. The run has already failed
 /// and its own error is the one worth printing; a leftover empty file

@@ -198,11 +198,12 @@ user supplied, so a failed `convert in.qcow2 /dev/sdb` leaves the
 device node where it was; an output path that is a symlink is left
 alone too, along with whatever it points at.
 
-Two cases produce an output that is sized up front rather than grown as
-it is written, and such a file is never empty and so is always kept:
-`dd`, and `convert -S 0` or `--preallocation` on a raw target.
-
 `instar copy` follows the same rule.
+
+Three cases produce an output that is sized up front rather than grown
+as it is written, and such a file is never empty and so is always kept:
+`dd`, `convert -S 0` or `--preallocation` on a raw target, and
+`copy --preallocate-output`.
 
 ## Differencing images
 
