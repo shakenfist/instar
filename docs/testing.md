@@ -562,8 +562,10 @@ because each worker forks an `instar` and a `qemu-img` of its own, both
 working on multi-GB images: a run at stestr's default of one worker per
 core took a sixteen-core host to a load average of 69 and an IO
 pressure of 68%, which made the machine unusable for anything else
-sharing its disk. The containerised targets have pinned the same four
-since they were written. Raise it on a machine with room:
+sharing its disk. The containerised targets had the same four
+hardcoded; they read `STESTR_CONCURRENCY` too, so the override below
+reaches every target that runs the suite rather than the host-side ones
+alone. Raise it on a machine with room:
 
 ```bash
 make test-integration STESTR_CONCURRENCY=8
@@ -2706,7 +2708,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **171 cases**, in sixteen groups.
+There are **172 cases**, in sixteen groups.
 
 Forty-seven cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -2993,25 +2995,31 @@ through with the mark intact. Both are caught by a `vmm` unit test that
 reads the host's config back as the guest's own type and checks it
 against the same rule.
 
-Then **6 descriptor-attachment cases**, on the host side of reading a
+Then **7 descriptor-attachment cases**, on the host side of reading a
 VMDK descriptor made of separate extent files. The extents are laid out
 into the one device they make up twice over -- once for the table the
-guest reads, once to open the files as that device -- so the first two
-cases measure the files per pass instead of reading the one measurement
+guest reads, once to open the files as that device -- so the first case
+measures the files per pass instead of reading the one measurement
 chain discovery took: a file rewritten between the passes then puts the
 same extent at two offsets, and the guest reads inside the wrong extent
-and is told it succeeded. The third reads an extent the host could not
+and is told it succeeded. The second reads an extent the host could not
 measure as zero bytes long, which stacks every later extent on top of
-it. The fourth guesses `FLAT` for an extent that reached attachment with
-no kind, so a sparse extent's header is served as data. The fifth
+it. The third guesses `FLAT` for an extent that reached attachment with
+no kind, so a sparse extent's header is served as data. The fourth
 attaches a descriptor for writing, where a write crossing a member
-boundary cannot be routed to a file. The last two restore an unguarded
-`open` on a path the descriptor named -- the allowlist constrains where
-such a path may point, not what kind of file it may point at -- in the
-extent-header read `instar info` reaches and in the device the extents
-make up; each is caught by a test that opens a FIFO on a thread and
-fails if the answer does not come back, so the regression is a failure
-rather than a suite that stops (issue #936).
+boundary cannot be routed to a file. The fifth and sixth restore an
+unguarded `open` on a path the descriptor named -- the allowlist
+constrains where such a path may point, not what kind of file it may
+point at -- in the extent-header read `instar info` reaches and in the
+device the extents make up; each is caught by a test that opens a FIFO
+on a thread and fails if the answer does not come back, so the
+regression is a failure rather than a suite that stops (issue #936).
+The last stops the device requiring each member to be a regular file.
+Only a regular file has a length to compare against the span the
+descriptor declares, so a FIFO, a block device or a character device
+among the extents would contribute its whole span as zero padding and
+the read would succeed -- a wrong answer reported as a success, where
+qemu-img cannot get the node's length and errors out.
 
 Then **8 data-file entry cases**, guarding the fix for
 issue #803. qemu applies two rules to the L2 entries of an image with

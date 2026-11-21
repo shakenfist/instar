@@ -1,6 +1,6 @@
 # Phase 3: read side, lift the extent ceiling
 
-## Status: Planned
+## Status: In progress
 
 Part of [PLAN-multi-extent-vmdk.md](PLAN-multi-extent-vmdk.md). Planned
 at high effort, as that plan's *Planning effort* section requires for
@@ -816,6 +816,75 @@ refusal message also names monolithicFlat for an image that is not
 flat. `docs/measure.md` does not mention the refusal at all. All three
 are small, pre-existing, and belong with the work that lifts the
 refusal rather than with the work that made the images readable.
+
+**Review round 2 turned the hand-checked claims into tests.** The
+review of the pull request pointed out that every integration test the
+phase added runs host-side only: `instar info` on a descriptor is
+answered in `discover_backing_chain`'s `peek_is_vmdk_descriptor`
+branch, so none of them writes the extent table, starts a guest, or
+reaches `read_vmdk_descriptor_chunk`. Definition-of-done item 3 and the
+2049 MiB `convert` claim were checked by the management session by
+hand, which protects neither against regression. Both are now
+`tests/test_convert_split_sparse.py`, which goes through `convert` and
+`compare`.
+
+The review suggested `instar dd` with a `skip=` for the boundary read.
+That does not work, and not because of anything in this phase:
+`qemu-img dd` itself writes a zero-byte output for any `skip=`
+(measured on 10.0.13 and on the pinned 10.2.0), and instar matches it,
+which `tests/test_dd.py` already pins. The boundary window is read by
+converting the fixture and seeking in the output instead -- two
+seconds, and 128 KiB actually written for a 5 GiB sparse file.
+
+The parity oracle is `qemu-img compare` rather than a digest of the two
+conversions. It is hole-aware on both sides, so the 26-extent image
+takes 4 seconds against the 111 a `sha256` of its 100 GiB output costs,
+and it makes qemu read the split descriptor itself rather than letting
+instar's output be its own reference.
+
+The same round found a wrong answer reported as a success in the code
+this phase added: `BackingStore::open_concatenated` took each member's
+`readable_len` from `metadata().len()`, which is 0 for a FIFO, a block
+device and a character device, so such a member contributed its whole
+declared span as zero padding and the read succeeded. It is refused by
+name now, from an `fstat` of the descriptor just opened rather than a
+`stat` of the path, so there is no window in which the file examined is
+not the file read. `vmm-concatenated-member-length-not-required` is the
+mutation case that holds it, the seventh of the descriptor-attachment
+group, and the harness confirms it kills.
+
+**One mutant survived the new tests, and where it is caught instead is
+worth recording.** Making an extent's virtual span its file's length
+rather than the span the descriptor declares kills four of the five new
+tests. Letting a read run past an extent's span -- dropping the
+`left.min(extent.virtual_span - within)` clamp in
+`read_vmdk_descriptor_chunk` -- does not: every fixture's extents are
+exactly 2 GiB, so convert's chunking never asks for a chunk that
+straddles a boundary, and the clamp is unreachable from an integration
+test over these images. It is held by the qcow2 crate's unit tests over
+synthetic extents, where dropping it fails five, among them
+`vmdk_descriptor_honours_the_span_each_extent_declares`. So the new
+tests prove the end-to-end read and the crate's tests prove the
+straddle arithmetic; neither substitutes for the other, and a future
+fixture with a deliberately non-power-of-two extent span would be what
+closes the gap from the integration side.
+
+**Two findings from that round were filed rather than fixed here.**
+Both are real and neither belongs in a review round on the read side:
+
+- #948: the host-side read of each sparse extent's 79-byte header runs
+  for every operation that resolves a descriptor, not just the `info`
+  that reports the figure -- 26 host opens and parses on `convert` of
+  the 26-extent image. The parse is the audited, bounded exception
+  `docs/security-audits.md` records, so this is the exception running
+  more often than it needs to rather than a new exposure. Narrowing it
+  changes `resolve_vmdk_flat_descriptor`'s signature, and phase 4
+  touches that same path.
+- #949: `expected-outputs/check-human` and `check-json` hold 3888
+  files each and no test in `tests/` reads them -- `get_expected_output`
+  is never called with `command='check'`. Repository-wide and older
+  than this plan, and closing it will surface divergences that have
+  accumulated unobserved, so it is its own piece of work.
 
 ## Back brief
 

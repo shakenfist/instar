@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=171
+EXPECTED_CASES=172
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1919,15 +1919,18 @@ rust_case 'vmm-image-flags-keep-the-data-device-mark' "${VMM_MAIN_LIB}" \
 
 # A VMDK descriptor's extents are laid out into one device twice over,
 # once for the table the guest reads and once to open the files as that
-# device. The first two cases measure the files per pass again, which is
+# device. The first case measures the files per pass again, which is
 # what let the two passes put one extent at two offsets: a file that
 # grew between them moved every later extent's base in one pass only,
 # and the guest then read inside the wrong extent and was told it
-# succeeded. The third reads a length the host never got as zero, which
-# stacks every later extent on top of it. The fourth guesses FLAT for an
+# succeeded. The second reads a length the host never got as zero, which
+# stacks every later extent on top of it. The third guesses FLAT for an
 # extent that arrived with no kind, which reads a sparse extent's header
-# as data. The fifth attaches a descriptor for writing, where a write
-# across the member boundary cannot be routed to a file.
+# as data. The fourth attaches a descriptor for writing, where a write
+# across the member boundary cannot be routed to a file. The fifth and
+# sixth restore an unguarded open on a path the descriptor named, and
+# the last stops requiring a member to be a regular file, which reads a
+# lengthless node's whole extent as zeros and calls it a success.
 
 rust_case 'vmm-descriptor-layout-measured-per-pass' "${VMM_MAIN_LIB}" \
     '        let file_length = extent.file_length.clone().map_err(|e| {
@@ -2010,6 +2013,13 @@ rust_case 'vmm-concatenated-member-opens-anything' "${BACKING_LIB}" \
                 .open(path)?;' \
     '            let file = File::open(path)?; // MUTATED' \
     instar 'test_concatenated_fifo_member_does_not_block'
+
+rust_case 'vmm-concatenated-member-length-not-required' "${BACKING_LIB}" \
+    '            let metadata = file.metadata()?;
+            if !metadata.is_file() {' \
+    '            let metadata = file.metadata()?; // MUTATED
+            if false {' \
+    instar 'test_concatenated_refuses_a_character_device_member'
 
 # --- qcow2 data-file entries qemu refuses (#803) ----------------------
 #

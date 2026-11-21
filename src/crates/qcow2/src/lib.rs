@@ -15947,8 +15947,10 @@ mod tests {
     #[test]
     fn init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one() {
         use ImageFormat::{Qcow2, Raw};
-        // Only a qcow2's header names a data file, and only a VMDK
-        // descriptor names extents.
+        // Only a qcow2's header names a data file. A VMDK descriptor's
+        // extents are not devices -- they share the descriptor's own
+        // and are named by the extent table -- so a descriptor naming a
+        // data device is refused here too.
         assert_data_device_layout_refused(
             &[owner(Raw, 1), data_dev()],
             &[(0, 2)],

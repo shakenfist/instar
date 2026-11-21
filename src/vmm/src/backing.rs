@@ -115,6 +115,11 @@ impl BackingStore {
     /// what the extent itself says is there; continuing into the next file
     /// would hand the caller the following extent's header instead.
     ///
+    /// A member that is not a regular file is refused by name. Only a
+    /// regular file has a length to compare against the declared span,
+    /// and treating a lengthless node as a short file would read its
+    /// whole extent as zeros and call that a success.
+    ///
     /// Writing across members is not implemented. A writable request is
     /// refused here rather than accepted and then mishandled per request,
     /// because a write silently landing in the wrong file is worse than a
@@ -142,16 +147,34 @@ impl BackingStore {
             // what kind of file it may point at. Opening a FIFO blocks
             // until a writer appears, with no timeout, so the operation
             // would hang rather than fail; `O_NONBLOCK` returns
-            // instead, and a member that then reads short is padded with
-            // zeros like any other. On a regular file the flag does
-            // nothing.
+            // instead. On a regular file the flag does nothing.
             let file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(path)?;
+            // Only a regular file has a length. `metadata().len()` is 0
+            // for a FIFO, a block device and a character device, so a
+            // member that is any of those would contribute its whole
+            // declared span as zero padding and the read would succeed
+            // -- a wrong answer reported as a success, where qemu-img
+            // cannot get the node's length and errors out. The check is
+            // an `fstat` of the descriptor just opened rather than a
+            // `stat` of the path, so there is no window in which the
+            // file examined is not the file read.
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "extent '{}' is not a regular file, so the span \
+                         it contributes cannot be established",
+                        path.display()
+                    ),
+                ));
+            }
             // A file longer than its declared span contributes only the
             // span: the bytes past it are outside this extent.
-            let readable_len = file.metadata()?.len().min(*declared_len);
+            let readable_len = metadata.len().min(*declared_len);
             members.push(ConcatMember {
                 file,
                 start,
@@ -622,29 +645,81 @@ mod tests {
         );
         let second = extent_file(dir.path(), "second", 0xBB, 1024);
 
+        let fifo_in_message = fifo.display().to_string();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let opened = BackingStore::open_concatenated(&[(fifo, 1024), (second, 1024)], true);
-            let _ = tx.send(opened.map(|mut store| {
-                let mut buf = [0xFFu8; 16];
-                let read = store.read_at(0, &mut buf);
-                (read.is_ok(), buf)
-            }));
+            let _ = tx.send(opened.map(|_| ()).map_err(|e| (e.kind(), e.to_string())));
         });
+        // The timeout is the point of the thread: a regression that
+        // drops `O_NONBLOCK` hangs in `open` rather than returning a
+        // wrong answer, and this makes that a failure instead of a
+        // suite that never finishes.
         match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok((read_ok, buf))) => {
-                assert!(read_ok, "the member reads rather than erroring");
-                assert_eq!(
-                    buf, [0u8; 16],
-                    "a FIFO offers no bytes, so its whole span is this member's padding"
+            Ok(Err((kind, message))) => {
+                assert_eq!(kind, io::ErrorKind::InvalidInput);
+                assert!(
+                    message.contains("is not a regular file"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    message.contains(&fifo_in_message),
+                    "the refusal names the offending extent: {message}"
                 );
             }
-            Ok(Err(e)) => panic!("opening a store with a FIFO member failed: {e}"),
+            Ok(Ok(())) => panic!(
+                "a FIFO member was accepted; its whole span would read as zeros under success"
+            ),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 panic!("opening a FIFO extent blocked")
             }
             Err(other) => panic!("{other}"),
         }
+    }
+
+    #[test]
+    fn test_concatenated_refuses_a_character_device_member() {
+        // A FIFO is not the only lengthless node a descriptor may name:
+        // `metadata().len()` is 0 for a character or block device too,
+        // and the guard is on the file type rather than on FIFOs.
+        // `/dev/null` is the one such node a test can rely on without
+        // privilege.
+        let dev_null = PathBuf::from("/dev/null");
+        if !dev_null.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let second = extent_file(dir.path(), "second", 0xBB, 1024);
+
+        let err = expect_refusal(
+            BackingStore::open_concatenated(&[(dev_null, 1024), (second, 1024)], true),
+            "a character-device member must be refused",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("is not a regular file"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_concatenated_short_regular_member_still_pads() {
+        // The refusal is about nodes with no length, not about short
+        // files: a sparse VMDK extent's file is shorter than the span
+        // its descriptor declares, and those bytes must still read as
+        // zeros rather than as the next extent's header.
+        let dir = tempfile::tempdir().unwrap();
+        let first = extent_file(dir.path(), "first", 0xAA, 512);
+        let second = extent_file(dir.path(), "second", 0xBB, 1024);
+
+        let mut store =
+            BackingStore::open_concatenated(&[(first, 1024), (second, 1024)], true).unwrap();
+        let mut buf = [0xFFu8; 16];
+        store.read_at(512, &mut buf).unwrap();
+        assert_eq!(
+            buf, [0u8; 16],
+            "a short member pads with zeros rather than reading the next extent"
+        );
     }
 
     #[test]

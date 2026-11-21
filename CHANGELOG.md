@@ -857,7 +857,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   naming the bound. `map` and `measure` still refuse every VMDK
   descriptor, flat or sparse, and now say so: the message names the
   descriptor rather than `monolithicFlat`, which an image in either
-  split subformat is not. See `docs/format-coverage.md` and
+  split subformat is not. Five shapes of extent that qemu-img reads
+  are refused -- a kind other than `FLAT` or `SPARSE`, a non-zero
+  extent start offset, more than 64 extents, a compressed sparse
+  extent, and a sparse extent whose header capacity is not the span
+  the descriptor declares -- each listed with its message in
+  `docs/quirks.md`. See also `docs/format-coverage.md` and
   `docs/chain-config.md`.
 
 - **A VMDK descriptor's extent files are measured once.** Where the
@@ -869,14 +874,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   taken once, when the chain is discovered, and both passes lay the
   device out from it.
 
-- **A VMDK extent that is not a regular file no longer hangs the host.**
-  A descriptor may name any path the backing-file allowlist permits,
-  and a FIFO among them left the host blocked in `open` with no
-  timeout -- `instar info` on an uploaded image, in the one place the
-  host reads an extent's own header. Only a regular file is opened for
-  that read, and the extent files a descriptor's device spans are
-  opened with `O_NONBLOCK`, so a FIFO reads as the zeros any short
-  extent reads as. See `docs/security-audits.md`.
+- **A VMDK extent that is not a regular file is refused, not read as
+  zeros.** A descriptor may name any path the backing-file allowlist
+  permits -- it constrains where such a path may point, not what kind
+  of file it may point at -- and a FIFO among them left the host
+  blocked in `open` with no timeout, in the one place the host reads an
+  extent's own header. Only a regular file is opened for that read, and
+  the extent files a descriptor's device spans are opened with
+  `O_NONBLOCK` so that open cannot block. A member with no length of
+  its own is then refused by name: `metadata().len()` is 0 for a FIFO,
+  a block device and a character device, so such an extent would
+  otherwise have contributed its whole declared span as zero padding
+  and the read would have succeeded -- a wrong answer reported as a
+  success, where qemu-img cannot establish the node's length and errors
+  out. See `docs/security-audits.md`.
 
 - **`info --chain` reported a VMDK descriptor's own length as its size.**
   A chain member that was a descriptor had its `actual-size` taken from
