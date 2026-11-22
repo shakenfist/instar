@@ -129,6 +129,17 @@ Per-format feature detail is in
   otherwise, because no pull-request job starts a guest. See
   [docs/guest-architecture.md](docs/guest-architecture.md).
 
+- **A run loop enters the guest through `run_guest`, not
+  `vcpu.run()`.** An interrupted `KVM_RUN` is how the I/O thread
+  reports a virtqueue it could not read -- the one failure it cannot
+  complete to the guest, which otherwise waits for it for ever.
+  `run_guest` renders that recorded failure in place of the bare
+  `EINTR`; a loop calling `vcpu.run()` itself fails with an
+  unexplained `EINTR` instead, and nothing in the pull-request gate
+  starts a guest to notice. See
+  "A request the host cannot answer" in
+  [docs/guest-architecture.md](docs/guest-architecture.md).
+
 - **`automated_reviewer`'s `needs` list must name every job that can
   fail a PR**, including `ci-tooling`. Three jobs are deliberately
   outside it, each for a stated reason in the comment above the list:

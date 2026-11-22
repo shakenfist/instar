@@ -16,7 +16,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use kvm_bindings::kvm_ioeventfd;
 use kvm_ioctls::VmFd;
-use log::warn;
+use log::debug;
 use vmm_sys_util::eventfd::EventFd;
 
 /// KVM_IOEVENTFD ioctl number.
@@ -136,10 +136,26 @@ impl IoEvent {
 
 impl Drop for IoEvent {
     fn drop(&mut self) {
-        // Note: We can't unregister here because we don't have the VmFd.
-        // The caller should ensure unregister() is called before dropping.
+        // We cannot unregister here because we do not have the VmFd, so
+        // this only reports what happened.
+        //
+        // It reports it at debug level, because dropping while
+        // registered is what every ordinary run does. Each operation
+        // builds a VM, registers its devices' ioeventfds, runs one
+        // operation and drops the VM with the devices, so KVM tears the
+        // registration down with the VM that holds it: there is nothing
+        // left to leak, and three warnings on every successful run would
+        // say there was. The case worth a louder report is an IoEvent
+        // dropped while its VM goes on being used -- which is the
+        // registration rollback, where a later device's failure sends
+        // the run back to the VM-exit path with the VM still live -- and
+        // every rollback site unregisters explicitly and warns if that
+        // fails. Making the ordinary path unregister too, so this
+        // condition could mean the leak again, needs the IoEvents back
+        // out of the I/O thread they were moved into; that is left as
+        // follow-up work rather than done here.
         if self.registered {
-            warn!(
+            debug!(
                 "IoEvent dropped while still registered (mmio_base=0x{:x})",
                 self.mmio_base
             );

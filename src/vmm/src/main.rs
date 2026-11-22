@@ -1017,12 +1017,46 @@ struct SerialDecoder {
     /// alike for the input chain and the output. `status` carries
     /// nothing for this marker and is not kept.
     last_io_failure: Option<(String, u64)>,
+    /// The host byte offset of a VHD block the reader refused because
+    /// its BAT entry places it on the image's own structure: an `error`
+    /// message whose `operation` is
+    /// `shared::VhdBlockPlacementRefusal::OPERATION` (issue #909). A
+    /// chain read has no result struct to carry the reason, so without
+    /// this the refusal reached the user as a read failure at an offset
+    /// with nothing said about the rule.
+    ///
+    /// Last-wins, like every other refusal this decoder keeps. `convert`
+    /// and `dd` stop at the first refusal, so for them last is first;
+    /// an operation that reads on past one (`compare`, `bench`) reports
+    /// the most recent refused block, not the earliest.
+    last_vhd_block_placement: Option<u64>,
     /// Whether `info` refused a VHD whose footer copy at offset 0 fails
     /// its checksum: an `error` message whose `operation` is
     /// `shared::VhdFooterChecksumRefusal::OPERATION` (issue #583). `info`
     /// sends no result for an image it will not read, so this is what
     /// [`info_without_a_result`] renders in place of the generic text.
     vhd_footer_checksum_refused: bool,
+}
+
+/// qemu's wording for a VHD whose footer copy at offset 0 fails its
+/// checksum, or `None` if that is not what the guest refused.
+///
+/// Every operation that reads a VHD can reach this refusal, because
+/// `VhdState::init` raises it, and every one of them should say the same
+/// thing: qemu-img prints `Could not open 'X': Incorrect header
+/// checksum` for `info`, `map`, `measure` and `convert` alike. Before
+/// this, only `info` and chain discovery said so, while `map` reported
+/// an unrecognised format and `measure` an unsupported one -- for an
+/// image whose format was recognised and then refused (issue #909).
+fn vhd_footer_checksum_error(decoder: &SerialDecoder, input: &str) -> Option<String> {
+    if !decoder.vhd_footer_checksum_refused {
+        return None;
+    }
+    let path = escape::terminal_safe_path(Path::new(input));
+    Some(format!(
+        "Could not open '{path}': Incorrect header checksum \
+         (the VHD footer copy at offset 0 does not match its checksum)"
+    ))
 }
 
 /// The error for an `info` run that ended without a result.
@@ -1032,15 +1066,8 @@ struct SerialDecoder {
 /// with generic text, and `instar info` itself printed nothing and
 /// exited 0. Both now fail, and name the reason when the guest gave one.
 fn info_without_a_result(decoder: &SerialDecoder, input: &str) -> String {
-    if decoder.vhd_footer_checksum_refused {
-        // qemu-img's wording: `Could not open 'X': Incorrect header checksum`.
-        format!(
-            "Could not open '{input}': Incorrect header checksum \
-             (the VHD footer copy at offset 0 does not match its checksum)"
-        )
-    } else {
-        "No info result received from guest".to_string()
-    }
+    vhd_footer_checksum_error(decoder, input)
+        .unwrap_or_else(|| "No info result received from guest".to_string())
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -1057,6 +1084,7 @@ impl SerialDecoder {
             last_data_file_entry: None,
             last_malformed_l2_entry: None,
             last_io_failure: None,
+            last_vhd_block_placement: None,
             vhd_footer_checksum_refused: false,
         }
     }
@@ -1086,6 +1114,32 @@ impl SerialDecoder {
             self.data_file_entry_error(op)
         } else {
             self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Whether the reader refused a VHD block for its placement.
+    fn vhd_block_placement_refused(&self) -> bool {
+        self.last_vhd_block_placement.is_some()
+    }
+
+    /// Format the terminal error for a read the reader refused because
+    /// a VHD BAT entry places its block on the image's own structure.
+    ///
+    /// The wording matches what `map` and `measure` say for the same
+    /// image, so one image gets one answer whichever operation is asked
+    /// -- and it adds the host offset, which only the chain reader
+    /// knows. qemu reads such a block out (measured: `qemu-img convert`
+    /// of a crafted fixture yields the image's own `cxsparse` header as
+    /// payload), so there is no qemu wording to match and instar is
+    /// deliberately stricter.
+    fn vhd_block_placement_refusal_error(&self, op: &str) -> String {
+        match self.last_vhd_block_placement {
+            Some(offset) => format!(
+                "{op}: source block table names a block inside the image's own \
+                 structure, at host offset {offset} ({offset:#x}); the format is \
+                 recognised, the image is malformed"
+            ),
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -1207,14 +1261,25 @@ impl SerialDecoder {
     /// write's is an offset into the output file -- and only the device
     /// that failed is known here.
     ///
-    /// With nothing captured this is the generic text it replaces, so
-    /// one call site cannot render one of the two and forget the other.
+    /// With no failed request captured, a CPU exception the guest IDT
+    /// reported is named instead, as [`Self::no_result_error`] names it
+    /// for the operations that render through that (issue #375): a
+    /// guest that faulted mid-copy otherwise said only that the copy
+    /// failed. A failed request wins over an exception because it is the
+    /// cause the guest identified; a fault after one is its aftermath.
+    ///
+    /// With nothing captured at all this is the generic text it
+    /// replaces, so one call site cannot render one of the two and
+    /// forget the other.
     /// That text names the operation, where the string it replaces said
     /// "convert" for `dd` as well; nothing asserts the old wording for
     /// `dd`, and `docs/quirks.md`'s record of it describes a release
     /// that predates the named refusals.
     fn io_failure_error(&self, op: &str, context: &IoFailureContext) -> String {
         let Some((device, sector)) = &self.last_io_failure else {
+            if self.last_cpu_exception.is_some() {
+                return self.no_result_error(op);
+            }
             return format!("{op} operation failed");
         };
 
@@ -1229,8 +1294,11 @@ impl SerialDecoder {
         let offset = sector.saturating_mul(side.sector_size as u64);
 
         // `dd` and `convert` share this run loop and this renderer, and
-        // each has to say what it did not do.
-        let outcome = if op == "dd" {
+        // each has to say what it did not do. `copy` has its own run
+        // loop and the same thing to say as `dd`: it writes sectors
+        // through to the output without interpreting a format, so there
+        // is no image it could have failed to produce.
+        let outcome = if op == "dd" || op == "copy" {
             "the data was not copied"
         } else {
             "the image was not converted"
@@ -1359,6 +1427,9 @@ impl SerialDecoder {
                     self.last_differencing_refusal = Some(err.status);
                 } else if err.operation == shared::VhdFooterChecksumRefusal::OPERATION {
                     self.vhd_footer_checksum_refused = true;
+                } else if err.operation == shared::VhdBlockPlacementRefusal::OPERATION {
+                    // `sector` is the refused block's host byte offset.
+                    self.last_vhd_block_placement = Some(err.sector);
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
@@ -1685,6 +1756,47 @@ mod guest_exception_tests {
         assert_eq!(decoder.last_cpu_exception, None);
     }
 
+    /// The refusal reaches `map` and `measure` too, which have a result
+    /// code of their own to override, so the renderer is theirs as much
+    /// as `info`'s -- and it escapes the path it quotes, because the
+    /// name came off the command line and reaches a terminal.
+    #[test]
+    fn the_footer_checksum_refusal_renders_for_any_operation() {
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            super::vhd_footer_checksum_error(&decoder, "x.vhd"),
+            None,
+            "a run with no refusal captured must not claim a bad checksum"
+        );
+
+        let msg = guest_protocol::error_message(
+            shared::VhdFooterChecksumRefusal::OPERATION,
+            "input",
+            0,
+            0,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        for &b in &framed[..n] {
+            decoder.add_byte(b);
+        }
+
+        let text = super::vhd_footer_checksum_error(&decoder, "x.vhd")
+            .expect("a captured refusal renders");
+        assert!(
+            text.starts_with("Could not open 'x.vhd': Incorrect header checksum"),
+            "{text}"
+        );
+
+        let escaped = super::vhd_footer_checksum_error(&decoder, "a\x1b[2Jb.vhd")
+            .expect("a captured refusal renders");
+        assert!(
+            escaped.contains("a\\u{1b}[2Jb.vhd"),
+            "the quoted path reached the terminal unescaped: {escaped}"
+        );
+    }
+
     #[test]
     fn info_names_a_vhd_footer_checksum_refusal_in_qemus_wording() {
         // `info` sends no result for a VHD whose footer copy at offset 0
@@ -1785,6 +1897,27 @@ mod guest_exception_tests {
         }
     }
 
+    /// A guest that faulted without a failed request to blame is named
+    /// by its exception, for every operation sharing this renderer --
+    /// `copy`, `convert` and `dd` alike.
+    #[test]
+    fn io_failure_error_names_a_cpu_exception_when_no_request_failed() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_cpu_exception = Some((6, 0x300ec));
+        for op in ["copy", "convert", "dd"] {
+            assert_eq!(
+                decoder.io_failure_error(op, &io_failure_context(None)),
+                format!("{op}: guest CPU exception: invalid opcode (#UD) at guest RIP 0x300ec")
+            );
+        }
+        // A failed request is the cause the guest identified, so it
+        // still wins over an exception raised after it.
+        decoder.last_io_failure = Some(("input".to_string(), 5120));
+        assert!(decoder
+            .io_failure_error("copy", &io_failure_context(None))
+            .starts_with("copy: reading the input image"));
+    }
+
     #[test]
     fn io_failure_error_names_the_image_the_offset_and_the_reason() {
         // Mimic add_byte having decoded `op=io-failure device=input
@@ -1805,6 +1938,25 @@ mod guest_exception_tests {
             msg,
             "convert: reading the input image, src.qcow2, failed at offset 2621440 \
              (0x280000); the image was not converted"
+        );
+    }
+
+    /// `copy` renders through the same formatter, and says what it did
+    /// not do in its own terms: it writes sectors through without
+    /// interpreting a format, so there is no image it failed to produce.
+    #[test]
+    fn io_failure_error_says_copy_did_not_copy_the_data() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("input".to_string(), 5120));
+        let msg = decoder.io_failure_error("copy", &io_failure_context(Some("Input/output error")));
+        assert_eq!(
+            msg,
+            "copy: reading the input image, src.qcow2, failed at offset 2621440 \
+             (0x280000): Input/output error; the data was not copied"
+        );
+        assert!(
+            !msg.contains("converted"),
+            "copy converts nothing, so it must not claim an image was not converted: {msg}"
         );
     }
 
@@ -3921,7 +4073,7 @@ fn execute_info_operation(
 
     // Run the vCPU loop
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 break;
             }
@@ -8433,7 +8585,7 @@ fn run_bench_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -8551,6 +8703,14 @@ fn run_bench_guest(
     // bench then reports as a failed request. Prefer the captured reason.
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("bench").into());
+    }
+    // Likewise a VHD block whose BAT entry places it on the image's own
+    // structure: refused inside the chain reader, which has no result
+    // struct to carry the reason either, so it travels by name.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(serial_decoder
+            .vhd_block_placement_refusal_error("bench")
+            .into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -9803,11 +9963,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let verbose = cli.verbose;
 
-    // Initialize logger based on --verbose flag. Every record is escaped
-    // on its way out, since debug lines interpolate image-derived text.
-    if verbose {
-        escape::init_verbose_logger();
-    }
+    // Install the logger. Every record is escaped on its way out, since
+    // debug lines interpolate image-derived text. `--verbose` picks the
+    // level rather than deciding whether there is a logger: without it
+    // the logger still carries warnings and errors, which are written
+    // for the user to read.
+    escape::init_logger(verbose);
 
     match cli.command {
         Commands::Info(args) => run_info(args, verbose),
@@ -11504,7 +11665,7 @@ fn run_resize_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -12488,7 +12649,7 @@ fn run_amend_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -12900,7 +13061,7 @@ fn run_bitmap_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -13354,7 +13515,7 @@ fn run_rebase_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -13475,6 +13636,14 @@ fn run_rebase_guest(
     // compare and bench.
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("rebase").into());
+    }
+    // Likewise a VHD block whose BAT entry places it on the image's own
+    // structure: refused inside the chain reader, which has no result
+    // struct to carry the reason either, so it travels by name.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(serial_decoder
+            .vhd_block_placement_refusal_error("rebase")
+            .into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
@@ -13751,7 +13920,7 @@ fn run_commit_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -14281,7 +14450,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let mut saw_info_result = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -14487,6 +14656,9 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         Some(output_capacity),
         sparse_output,
     )?;
+    // `copy` always creates or truncates its output, so the file is
+    // always this run's to remove if the run fails and leaves it empty.
+    let output_cleanup = EmptyOutputCleanup::new(vec![Path::new(&args.output).to_path_buf()]);
 
     let output_mode_desc = if sparse_output {
         "sparse, grows on demand"
@@ -14681,12 +14853,19 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
 
+    // The guest's verdict on the copy, which is the completion's success
+    // flag. `None` until a completion arrives, because an absent
+    // completion is a failure too: the operation sends one on every exit
+    // from `_start`, so nothing at all means the guest died before it
+    // could report.
+    let mut copy_completion: Option<bool> = None;
+
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
-                debug!("Copy operation completed successfully!");
+                debug!("Copy operation reached HLT");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
@@ -14694,6 +14873,13 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::Complete(comp)) =
+                                &msg.payload
+                            {
+                                if comp.operation == "copy" {
+                                    copy_completion = Some(comp.success);
+                                }
+                            }
                             debug!("{}", format_message(&msg));
                         }
                     }
@@ -14810,6 +14996,38 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         return Err(error.into());
     }
 
+    // A copy is a success only if the guest said so. The operation sends
+    // a completion on every exit, carrying false for a failure, so
+    // anything other than a successful completion -- a failed one, or
+    // none at all -- is a failed run. This used to be inferred from the
+    // guest reaching HLT, which every failure path also does, so a
+    // failed read gave exit 0, nothing on stderr, and an output file
+    // holding only the sectors copied before it (issue #930). The guest
+    // reports a failed host read as `IoFailure` as well, so the message
+    // can name the image, the offset and the errno the way `convert`'s
+    // does; a failure the guest raised for its own reasons renders the
+    // generic text.
+    if copy_completion != Some(true) {
+        return Err(serial_decoder
+            .io_failure_error(
+                "copy",
+                &IoFailureContext {
+                    input: IoFailureSide {
+                        path: &args.input,
+                        sector_size: args.input_sector_size,
+                        reason: device_set.io_error_for(true),
+                    },
+                    output: IoFailureSide {
+                        path: &args.output,
+                        sector_size: args.output_sector_size,
+                        reason: device_set.io_error_for(false),
+                    },
+                },
+            )
+            .into());
+    }
+
+    output_cleanup.succeeded();
     Ok(())
 }
 
@@ -15222,7 +15440,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -16094,7 +16312,7 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -16244,6 +16462,13 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
     if serial_decoder.l2_entry_refused() {
         return Err(Box::new(CompareReadError(
             serial_decoder.l2_entry_refusal_error("compare"),
+        )));
+    }
+    // And for a VHD block whose BAT entry places it on the image's own
+    // structure, which the chain reader refuses for the same reason.
+    if serial_decoder.vhd_block_placement_refused() {
+        return Err(Box::new(CompareReadError(
+            serial_decoder.vhd_block_placement_refusal_error("compare"),
         )));
     }
 
@@ -16769,6 +16994,246 @@ fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
     text
 }
 
+/// Enter the guest, and say what happened if entering it failed.
+///
+/// Every run loop enters the guest through here rather than calling
+/// `vcpu.run()` itself, because an interrupted `KVM_RUN` is how the I/O
+/// thread reports a failure it has no other way to report.
+///
+/// A virtqueue the host cannot read -- a malformed descriptor chain, or
+/// a descriptor naming an address outside guest memory -- leaves the
+/// device with no status byte it can trust, so nothing is written to
+/// the used ring and the guest's wait for that request never ends. The
+/// I/O thread cannot fail the run, so it records the failure and
+/// signals this thread out of `KVM_RUN`, which `kvm-ioctls` reports as
+/// an `EINTR`. The signal is only the delivery; the recorded message is
+/// the reason, and without it the run would hang until it was
+/// interrupted by hand (issue #932). This also makes the two
+/// queue-service paths agree: the vCPU-exit fallback propagated the
+/// same error and always did fail the run.
+///
+/// The recorded failure is consulted on every exit, not only on an
+/// interrupted one. A failure recorded while the vCPU was already out
+/// of `KVM_RUN` is otherwise never seen if the next exit is one the
+/// loop ends on -- `HLT` -- and the run reports success over it. The
+/// check is one atomic load while nothing is recorded.
+fn run_guest<'vcpu>(
+    vcpu: &'vcpu mut VcpuFd,
+    io_thread: &Option<io_thread::IoThread>,
+) -> Result<VcpuExit<'vcpu>, Box<dyn std::error::Error>> {
+    let result = vcpu.run();
+    if let Some(failure) = io_thread.as_ref().and_then(|t| t.fatal_error()) {
+        return Err(failure.into());
+    }
+    Ok(result?)
+}
+
+/// Remove an output file a failed run left empty, if it is this run's
+/// to remove.
+///
+/// Where qemu-img and instar can differ at all is in what a *failed*
+/// run leaves on disk, and the answer has two halves.
+///
+/// A partially written output stays. `qemu-img convert` keeps its own
+/// after "Invalid cluster entry found", and matching that is
+/// deliberate: the bytes are the only record of how far the run got,
+/// and a caller that wants them gone can remove the file itself. An
+/// instar that deleted them would be destroying data qemu-img keeps.
+///
+/// An *empty* output is removed. qemu-img never leaves one, because
+/// the failures that produce it -- a source it refuses, a geometry it
+/// will not write -- are diagnosed before it creates the target at
+/// all. instar creates the output before launching the guest, so the
+/// guest's refusals and a read that fails on the first sector leave a
+/// zero-length file behind. It holds nothing, so removing it loses
+/// nothing; leaving it behind gives a caller that tests for the
+/// file's existence a reason to believe the operation ran (issue
+/// #849).
+///
+/// Only a regular file is ever removed. A block device, a character
+/// device such as `/dev/null`, or a FIFO reports a length of zero too,
+/// and an output path naming one is a target the user supplied rather
+/// than a file this run made: unlinking `/dev/sdb` as root destroys the
+/// node. A symlink is not followed either, so the length tested is the
+/// length of the thing `remove_file` would remove.
+///
+/// The test is advisory against anyone else who can write to the
+/// output's directory: between the stat and the unlink they could put
+/// a different file at the path, and it is that file which is removed.
+/// The output path and its directory are the invoking user's choice,
+/// which puts that party outside the untrusted-image threat model this
+/// project defends; closing the window would take an `unlinkat`
+/// against a directory descriptor opened with the output.
+///
+/// A failure to remove it is not reported. The run has already failed
+/// and its own error is the one worth printing; a leftover empty file
+/// is not worth replacing that message with a second one about the
+/// cleanup.
+fn remove_empty_output(path: &Path) {
+    if matches!(std::fs::symlink_metadata(path), Ok(meta) if meta.is_file() && meta.len() == 0) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove an output file whatever it holds, if it is a regular file.
+///
+/// For a refusal that must leave nothing behind even when the output
+/// was sized before the guest ran (a pre-allocated raw output, a fixed
+/// VHDX). The regular-file test is the same one `remove_empty_output`
+/// makes, for the same reason: a device node or a symlink named as the
+/// output is never this run's to unlink.
+fn remove_output_file(path: &Path) {
+    if matches!(std::fs::symlink_metadata(path), Ok(meta) if meta.is_file()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Removes the output files a run left empty, unless the run succeeds.
+///
+/// Armed as soon as the output is opened and disarmed by
+/// [`EmptyOutputCleanup::succeeded`] as the run's last act, so every
+/// other way out -- an explicit `return Err`, a `?` from guest setup, a
+/// `vm_error` exit, or a fatal I/O error out of `run_guest` -- removes
+/// what was left empty. An explicit cleanup before the error returns
+/// missed the `?` exits, which are exactly where a run the I/O thread
+/// fails now leaves (issue #849).
+///
+/// Declared after the output's `BackingStore`, so it runs while that
+/// file is still open, and after the I/O thread has been joined by its
+/// own drop or `stop`.
+struct EmptyOutputCleanup {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl EmptyOutputCleanup {
+    /// Arm the cleanup for `paths`; pass none for an output that is not
+    /// this run's to remove (convert's `--no-create`).
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    /// The run succeeded: keep every output, empty or not.
+    fn succeeded(mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for EmptyOutputCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_empty_output(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_cleanup_tests {
+    //! The rule `remove_empty_output` and `EmptyOutputCleanup` apply to
+    //! a failed run's output. The integration tests in
+    //! tests/test_failed_output_file.py prove the rule end to end for a
+    //! failed write; these pin the cases no image can steer -- an
+    //! output that is not a regular file, and an exit the guard has to
+    //! catch without being called.
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn empty_file(dir: &TempDir, name: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::File::create(&path).expect("create empty file");
+        path
+    }
+
+    /// A failed run that drops the guard -- which is what every `?`
+    /// and `return Err` does -- removes the output it left empty.
+    #[test]
+    fn a_dropped_guard_removes_an_empty_output() {
+        let dir = TempDir::new().unwrap();
+        let out = empty_file(&dir, "out.raw");
+        drop(EmptyOutputCleanup::new(vec![out.clone()]));
+        assert!(
+            !out.exists(),
+            "an output a failed run left empty survived the cleanup"
+        );
+    }
+
+    /// Bytes are the record of how far a failed run got, and qemu-img
+    /// keeps its own partial output, so a non-empty output stays.
+    #[test]
+    fn a_dropped_guard_keeps_an_output_holding_bytes() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("out.raw");
+        std::fs::write(&out, b"partial").unwrap();
+        drop(EmptyOutputCleanup::new(vec![out.clone()]));
+        assert!(out.exists(), "the cleanup removed an output holding bytes");
+    }
+
+    /// A successful run keeps its output even when it is empty: a dd of
+    /// an empty window legitimately produces a zero-length file.
+    #[test]
+    fn a_successful_run_keeps_an_empty_output() {
+        let dir = TempDir::new().unwrap();
+        let out = empty_file(&dir, "out.raw");
+        EmptyOutputCleanup::new(vec![out.clone()]).succeeded();
+        assert!(out.exists(), "a successful run's empty output was removed");
+    }
+
+    /// A FIFO reports a length of zero, as a block device and
+    /// `/dev/null` do. An output path naming one is a target the user
+    /// supplied, never a file this run made, so it is not unlinked.
+    #[test]
+    fn a_non_regular_output_is_never_removed() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("out.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(std::fs::metadata(&fifo).unwrap().len(), 0);
+
+        drop(EmptyOutputCleanup::new(vec![fifo.clone()]));
+        remove_output_file(&fifo);
+        assert!(
+            std::fs::symlink_metadata(&fifo).is_ok(),
+            "the cleanup unlinked a FIFO named as the output; as root the \
+             same test unlinks a block device"
+        );
+    }
+
+    /// A symlink to an empty file is not followed: the length judged
+    /// must be the length of what `remove_file` would remove, which is
+    /// the link. Neither the link nor its target goes.
+    #[test]
+    fn a_symlinked_output_is_never_removed() {
+        let dir = TempDir::new().unwrap();
+        let target = empty_file(&dir, "target.raw");
+        let link = dir.path().join("out.raw");
+        symlink(&target, &link).unwrap();
+
+        drop(EmptyOutputCleanup::new(vec![link.clone()]));
+        remove_output_file(&link);
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the cleanup unlinked a symlink named as the output"
+        );
+        assert!(target.exists(), "the cleanup removed a symlink's target");
+    }
+
+    /// The differencing refusal removes its output whatever it holds,
+    /// because a pre-allocated output is sized before the guest runs.
+    #[test]
+    fn remove_output_file_removes_a_sized_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("out.raw");
+        std::fs::File::create(&out)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        remove_output_file(&out);
+        assert!(!out.exists(), "a refused run's pre-sized stub survived");
+    }
+}
+
 /// Launch the convert guest, run the vCPU loop, and finalise the output.
 /// Shared by `run_convert` (window `None`) and `run_dd` (window `Some`).
 /// Behaviour for convert is identical to the previous inline body.
@@ -16981,6 +17446,24 @@ fn execute_convert(
             skip_zeros,
         )?
     };
+
+    // An output this run owns and leaves empty is removed whatever
+    // fails from here on. `!no_create` is the test for "convert owns
+    // this path": without `--no-create`, `BackingStore::open` has just
+    // created *or truncated* the target, so nothing that was in it
+    // survives either way. Under `--no-create` the target is an image
+    // the user supplied for us to write into, which is never ours to
+    // delete. See `remove_empty_output` for why an output holding bytes
+    // stays.
+    let output_cleanup = EmptyOutputCleanup::new(if exec.no_create {
+        Vec::new()
+    } else {
+        let mut paths = vec![Path::new(&exec.output).to_path_buf()];
+        if let Some((ref flat_path, _)) = flat_extent_path {
+            paths.push(flat_path.clone());
+        }
+        paths
+    });
 
     debug!(
         "Output file: {} (capacity {} bytes)",
@@ -17367,7 +17850,7 @@ fn execute_convert(
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -17478,24 +17961,19 @@ fn execute_convert(
         // "convert operation failed", which is what issue #547 was
         // filed over.
         if serial_decoder.last_differencing_refusal.is_some() {
-            // Remove the output path. Nothing was written to it, and
-            // leaving a zero-filled stub behind after refusing to compose
-            // is exactly the "success-shaped wrong answer" this refusal
-            // exists to prevent: a caller that tests for the file's
-            // existence would conclude the convert ran.
-            //
-            // `!no_create` is the test for "convert owns this path", not
-            // for "this run created the file": without `--no-create`,
-            // `BackingStore::open` has already created *or truncated* the
-            // target, so a pre-existing file's contents are gone by the
-            // time we get here either way and unlinking destroys nothing
-            // that survived. Under `--no-create` the target is an image
-            // the user supplied for us to write into, which is never ours
-            // to delete.
+            // Remove the output path even though it is not always
+            // empty. Nothing was written to it, but a pre-allocated raw
+            // output or a fixed VHDX was sized before the guest ran, so
+            // `output_cleanup`'s empty-only rule would keep a
+            // zero-filled stub -- exactly the "success-shaped wrong
+            // answer" this refusal exists to prevent: a caller that
+            // tests for the file's existence would conclude the convert
+            // ran. The same `--no-create` rule applies as for
+            // `output_cleanup`.
             if !exec.no_create {
-                let _ = std::fs::remove_file(&exec.output);
+                remove_output_file(Path::new(&exec.output));
                 if let Some((ref flat_path, _)) = flat_extent_path {
-                    let _ = std::fs::remove_file(flat_path);
+                    remove_output_file(flat_path);
                 }
             }
             let op = if exec.window.is_some() {
@@ -17518,6 +17996,18 @@ fn execute_convert(
                 "convert"
             };
             return Err(serial_decoder.l2_entry_refusal_error(op).into());
+        }
+        // Likewise a VHD block whose BAT entry places it on the image's
+        // own structure. Without this the refusal arrived as a read
+        // failure at an offset with nothing said about the rule, while
+        // `map` and `measure` named it for the same image (issue #909).
+        if serial_decoder.vhd_block_placement_refused() {
+            let op = if exec.window.is_some() {
+                "dd"
+            } else {
+                "convert"
+            };
+            return Err(serial_decoder.vhd_block_placement_refusal_error(op).into());
         }
         // Last: a request against one of the devices failed. The chain
         // reader raises this for a failed request and for a structural
@@ -17595,6 +18085,7 @@ fn execute_convert(
         f.set_len(out_vsize)?;
     }
 
+    output_cleanup.succeeded();
     Ok(())
 }
 
@@ -18900,7 +19391,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
@@ -18936,9 +19427,12 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // true but not the reason. The tail prints
                                 // the captured reason instead.
                                 // Likewise a corrupt qcow2 L2 entry refused
-                                // by the allocation scan.
+                                // by the allocation scan, and a VHD whose
+                                // footer copy fails its checksum, refused
+                                // before the scan.
                                 if serial_decoder.last_differencing_refusal.is_none()
                                     && !serial_decoder.l2_entry_refused()
+                                    && !serial_decoder.vhd_footer_checksum_refused
                                 {
                                     print_measure_result(
                                         &msg,
@@ -19052,6 +19546,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if measure_error != MEASURE_RESULT_ERROR_OK {
+        // A VHD refused for its footer checksum reports no usable code
+        // -- the scan never ran -- so the generic detail would say the
+        // format is unsupported. Prefer what qemu says about the image.
+        let source = args.input.as_deref().unwrap_or_default();
+        if let Some(refusal) = vhd_footer_checksum_error(&serial_decoder, source) {
+            return Err(refusal.into());
+        }
         return Err(format!("measure failed: {}", measure_error_detail(measure_error)).into());
     }
 
@@ -19315,7 +19816,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     let mut broken_pipe = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Map operation completed");
@@ -19447,6 +19948,14 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     // stay on stdout.
     if serial_decoder.l2_entry_refused() {
         return Err(serial_decoder.l2_entry_refusal_error("map").into());
+    }
+
+    // A VHD whose footer copy at offset 0 fails its checksum is refused
+    // before the walk starts, so the result carries only
+    // `ERROR_INVALID_SOURCE` -- "source format unrecognised", when the
+    // format was recognised and then refused. Prefer what qemu says.
+    if let Some(refusal) = vhd_footer_checksum_error(&serial_decoder, &args.input) {
+        return Err(refusal.into());
     }
 
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;
@@ -20032,7 +20541,7 @@ fn run_snapshot_list(
     let mut broken_pipe = false;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Snapshot operation completed");
@@ -20491,7 +21000,7 @@ fn run_snapshot_mutating_guest(
     let mut vm_error: Option<String> = None;
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
@@ -21824,7 +22333,7 @@ fn run_create_guest(
     debug!("Starting guest execution");
 
     loop {
-        match vcpu.run()? {
+        match run_guest(&mut vcpu, &io_thread)? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Create operation completed (HLT)");

@@ -23,6 +23,25 @@ from base import InstarTestBase
 COMPARE_REFUSAL_EXIT_CODES = (2, 4)
 
 
+def assert_output_not_ballooned(test, path, cap, what):
+    """A refused or bombed convert must not leave a huge output file.
+
+    An absent file satisfies this outright, and is now the ordinary
+    outcome for a refusal that wrote nothing: such a run removes the
+    empty output it created rather than leaving a file a caller testing
+    for the file's existence reads as success (#849). What is pinned
+    here is that a refusal never leaves a *large* file -- not that it
+    leaves one at all, which is what these assertions used to require by
+    accident, through `stat` on a path that had to exist.
+    """
+    produced = Path(path)
+    if not produced.exists():
+        return
+    test.assertLess(
+        produced.stat().st_size, cap,
+        f'output suspiciously large for {what}')
+
+
 def assert_compare_refused(test, stdout, stderr, rc, image_id):
     """Assert a compare refused `image_id` rather than reaching a verdict."""
     test.assertIn(
@@ -66,11 +85,8 @@ class TestAdversarialCompressionBomb(InstarTestBase):
                 timeout=30
             )
             # Output file should not be excessively large
-            out_size = Path(out.name).stat().st_size
-            self.assertLess(
-                out_size, 100 * 1024 * 1024,
-                'Output file suspiciously large for compression bomb'
-            )
+            assert_output_not_ballooned(
+                self, out.name, 100 * 1024 * 1024, 'compression bomb')
 
     def test_info_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
@@ -94,11 +110,8 @@ class TestAdversarialCompressionBomb(InstarTestBase):
                  str(image.path), out.name],
                 timeout=30
             )
-            out_size = Path(out.name).stat().st_size
-            self.assertLess(
-                out_size, 100 * 1024 * 1024,
-                'Output file suspiciously large for compression bomb'
-            )
+            assert_output_not_ballooned(
+                self, out.name, 100 * 1024 * 1024, 'compression bomb')
 
 
 class TestAdversarialCircularChain(InstarTestBase):
@@ -888,11 +901,8 @@ class TestAdversarialDmgManifest(InstarTestBase):
                  str(image_path), out.name],
                 timeout=15
             )
-            out_size = Path(out.name).stat().st_size
-            self.assertLess(
-                out_size, self._OUTPUT_CAP,
-                f'convert output suspiciously large for {image_path}'
-            )
+            assert_output_not_ballooned(
+                self, out.name, self._OUTPUT_CAP, f'convert of {image_path}')
         return stdout, stderr, rc
 
     def _assert_convert_refused_clean(self, image_id):
@@ -1083,9 +1093,8 @@ class TestAdversarialDmgReaderRefusals(InstarTestBase):
             self.assertTrue(
                 (c_out + c_err).strip(),
                 f'convert should emit a non-empty error for {image_id}')
-            self.assertLess(
-                Path(out.name).stat().st_size, self._OUTPUT_CAP,
-                f'convert output suspiciously large for {image_id}')
+            assert_output_not_ballooned(
+                self, out.name, self._OUTPUT_CAP, f'convert of {image_id}')
 
         # compare against itself: refused as an error, never a crash, and
         # never as "Content mismatch", which would claim an image differs
@@ -1109,9 +1118,8 @@ class TestAdversarialDmgReaderRefusals(InstarTestBase):
             self.assertTrue(
                 (d_out + d_err).strip(),
                 f'dd should emit a non-empty error for {image_id}')
-            self.assertLess(
-                Path(out.name).stat().st_size, self._OUTPUT_CAP,
-                f'dd output suspiciously large for {image_id}')
+            assert_output_not_ballooned(
+                self, out.name, self._OUTPUT_CAP, f'dd of {image_id}')
 
         # info: parses only the koly trailer -> exit 0, format dmg, the
         # trailer-derived virtual size.  No crash, no hang.

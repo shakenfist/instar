@@ -429,6 +429,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`map` and `measure` say why they refused a VHD.** Two VHD refusals
+  were correct and arrived with no reason in them. A BAT entry placing a
+  block on the image's own structure -- the footer copy and the dynamic
+  header, at an entry of zero -- was reported by `map` as `I/O failure
+  walking the source` and by `measure` as `source image is unsupported
+  format`, naming the two things that had not gone wrong: nothing failed
+  to read, and the format was understood well enough to find the
+  contradiction. Both now report a malformed block table, as they
+  already did for VHDX, and `convert`, `dd`, `compare`, `bench` and
+  `rebase` name the rule and the host offset instead of reporting a read
+  failure at an offset. A footer copy at offset 0 that fails its
+  checksum was refused as an unrecognised or unsupported format; the
+  reader now raises that refusal by name, so `info`, `map`, `measure`
+  and `convert` all print `Could not open 'X': Incorrect header
+  checksum`, which is what qemu-img prints for each of them
+  ([#909](https://github.com/shakenfist/instar/issues/909)). The
+  integration tests now assert the messages rather than the exit code
+  alone. See `docs/convert.md`, `docs/map.md`, `docs/measure.md` and
+  `docs/quirks.md`.
+
+- **A virtqueue the host cannot read fails the run instead of hanging
+  it.** A malformed descriptor chain, or a descriptor naming an address
+  outside guest memory, leaves the device with no status byte it can
+  trust, so nothing reaches the used ring and the guest's wait for that
+  request never ends -- and since that wait became unbounded, the run
+  hung until it was interrupted by hand. The I/O thread now records the
+  failure and signals the vCPU out of `KVM_RUN`, and the run fails with
+  the recorded reason
+  ([#932](https://github.com/shakenfist/instar/issues/932)). The two
+  queue-service paths now agree: whether `IoEvent::register` had
+  succeeded used to decide whether such a failure hung the run or failed
+  it. Every way to reach this is an instar bug rather than anything a
+  hostile image can ask for, so no image behaves differently. See
+  `docs/guest-architecture.md`.
+
+- **A failed `convert`, `dd` or `copy` no longer leaves an empty output
+  file behind.** instar creates its output before launching the guest,
+  so a run the guest fails has already created the target; for most
+  failures that file was empty, and a caller that tests for the file's
+  existence read it as an operation that ran. An output this run created
+  and left with no bytes in it is now removed. An output holding bytes
+  is kept, as `qemu-img convert` keeps its own after "Invalid cluster
+  entry found" -- those bytes are the only record of how far the run got
+  -- and a target supplied with `--no-create` is never instar's to
+  delete ([#849](https://github.com/shakenfist/instar/issues/849)). `dd`
+  and a preallocated raw target size their output up front, so it is
+  never empty and is always kept. Only a regular file is ever removed:
+  an output path naming a block device, `/dev/null`, a FIFO or a
+  symlink is left as it was. See `docs/convert.md`.
+
+- **`instar copy` fails when a read or a write fails.** It used to
+  report success for a run that failed: every failure path in the
+  operation reported and returned, and the host inferred success from
+  the guest reaching HLT, which those paths reach too. An ordinary
+  `EIO` on the source therefore gave exit 0, nothing on stderr, and an
+  output file holding only the sectors copied before the failure. The
+  operation now sends a completion on every exit, the host requires a
+  successful one, and a failed host read is reported like `convert`'s:
+  `copy: reading the input image, source.raw, failed at offset 327680
+  (0x50000): Input/output error; the data was not copied`, at exit 1
+  ([#930](https://github.com/shakenfist/instar/issues/930)).
+
+- **A warning or an error the host logs now reaches stderr without
+  `--verbose`.** The logger was installed only when `--verbose` was
+  passed, so by default there was no logger at all and every record was
+  discarded before its level was considered -- a `warn!` or an `error!`
+  written for a failure path reached nobody. The logger is now installed
+  on every run, and `--verbose` chooses its level: warnings and errors
+  by default, the guest's messages and the host's trace of the run with
+  the flag
+  ([#931](https://github.com/shakenfist/instar/issues/931)). A
+  successful run still prints nothing on stderr: installing the logger
+  revealed that every run dropped its ioeventfds while they were still
+  registered with KVM, which `IoEvent::drop` reported as a warning, and
+  that condition is what an ordinary teardown does -- KVM releases the
+  registration with the VM that holds it -- so it is now reported at
+  debug level. See `docs/output-formats.md`.
+
 - **`instar convert` and `instar dd` say what failed when guest I/O
   stops them.** They used to print a bare `convert operation failed`,
   with the cause available only under `--verbose`. They now name the
