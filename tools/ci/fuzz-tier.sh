@@ -70,6 +70,7 @@ FAST_TIER=(
   fuzz_bench_schedule
   fuzz_qcow2_write
   fuzz_qcow2_write_growth
+  fuzz_fetch_protocol
 )
 
 is_fast() {

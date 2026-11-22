@@ -221,6 +221,7 @@ audit: instar-devcontainer
 # src/target/debian/instar_*.deb
 deb: build-devcontainer
 	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
+	    [ ! -f "$(SRC_DIR)/target/release/instar-fetch" ] || \
 	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
 	    echo "Error: build artifacts missing. Run 'make instar' first."; \
 	    exit 1; \
@@ -246,6 +247,7 @@ deb: build-devcontainer
 # src/target/generate-rpm/instar-*.rpm
 rpm: build-devcontainer
 	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
+	    [ ! -f "$(SRC_DIR)/target/release/instar-fetch" ] || \
 	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
 	    echo "Error: build artifacts missing. Run 'make instar' first."; \
 	    exit 1; \

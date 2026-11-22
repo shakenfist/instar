@@ -2047,8 +2047,8 @@ differential fuzzing cannot reach.
 
 ### Fuzz targets
 
-44 targets across the parser and planner crates, organized in
-`src/fuzz/`:
+45 targets across the parser, planner and protocol crates, organized
+in `src/fuzz/`:
 
 | Target | Crate | Type |
 |--------|-------|------|
@@ -2069,6 +2069,7 @@ differential fuzzing cannot reach.
 | `fuzz_luks_header` | luks | Buffer-based |
 | `fuzz_vdi_header` | vdi | Buffer-based |
 | `fuzz_vdi_bat` | vdi | CallTable |
+| `fuzz_fetch_protocol` | fetch-protocol | Buffer-based |
 | `fuzz_parallels_header` | parallels | Buffer-based |
 | `fuzz_parallels_bat` | parallels | CallTable |
 | `fuzz_qcow1_header` | qcow1 | Buffer-based |
@@ -2314,9 +2315,9 @@ Rather than splitting the budget evenly, the run plan is computed by
 math, CHS rounding, and the planner/emitter crates) take a short fixed
 slice (300s — they reach steady coverage in well under a minute), and
 the deep parser/format targets split the remainder. With the current
-44 targets (18 fast, 26 deep) and the full 450 minutes, that gives the
+45 targets (19 fast, 26 deep) and the full 450 minutes, that gives the
 26 deep targets ~14 min each versus ~10 min under an even split
-(27000 / 44). A plan never sums to more than its budget: a budget too
+(27000 / 45). A plan never sums to more than its budget: a budget too
 small for every target's fast slice is shared equally instead, with a
 warning. `tools/ci/test-fuzz-tier.sh` asserts both, in `ci-tooling`.
 

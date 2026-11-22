@@ -21,6 +21,7 @@ dmg = { path = "../crates/dmg" }
 raw = { path = "../crates/raw" }
 luks = { path = "../crates/luks" }
 measure = { path = "../crates/measure" }
+fetch-protocol = { path = "../crates/fetch-protocol" }
 create = { path = "../crates/create" }
 resize = { path = "../crates/resize" }
 rebase = { path = "../crates/rebase" }
@@ -311,5 +312,11 @@ test = false
 [[bin]]
 name = "fuzz_chain_compose"
 path = "fuzz_targets/fuzz_chain_compose.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_fetch_protocol"
+path = "fuzz_targets/fuzz_fetch_protocol.rs"
 doc = false
 test = false
