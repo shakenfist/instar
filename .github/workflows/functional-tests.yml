@@ -108,6 +108,15 @@ jobs:
       - uses: actions/checkout@v7
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
+      # A guard, here rather than in ci-tooling: a pull request that
+      # only brings back CHANGELOG.md is docs-only by the filter below,
+      # so ci-tooling would skip, and this job is the one that always
+      # runs. Its failure fails Can enqueue and Can merge, which both
+      # need this job. See the script's header for what it matches.
+      - name: Check the tree carries no changelog file
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: tools/ci/check-no-changelog.sh
+
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
@@ -439,6 +448,11 @@ jobs:
 
       - name: Test the runtime LUKS create guard
         run: tools/ci/test-check-no-runtime-luks-create.sh
+
+      # The guard itself runs in check_paths, which every pull request
+      # runs; its test needs only a change to the script, which is code.
+      - name: Test the changelog guard
+        run: tools/ci/test-check-no-changelog.sh
 
       # The testdata fixture guard. Every test that reads these
       # fixtures skips rather than fails when its file is absent, so a

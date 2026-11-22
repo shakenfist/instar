@@ -89,15 +89,17 @@ repos:
       # the record it kept is the commit messages and docs/ already.
       # Release notes are written on the GitHub release instead. Older
       # plans in docs/plans/ still say to add an entry, so this stops an
-      # agent following one from bringing the file back. See "Releases"
-      # in docs/development.md.
+      # agent following one from bringing the file back, at the root or
+      # anywhere else. See "Releases" in docs/development.md. A script
+      # over `git ls-files` rather than a `files:` pattern, so it sees a
+      # file that is already in the tree as well as one being added, and
+      # so functional-tests.yml's check_paths job runs the same check.
       - id: no-changelog
         name: No CHANGELOG.md (release notes go on the GitHub release)
-        language: fail
-        entry: >-
-          instar keeps no CHANGELOG.md. Describe the change in the commit
-          message and docs/; see "Releases" in docs/development.md.
-        files: ^CHANGELOG\.md$
+        entry: ./tools/ci/check-no-changelog.sh
+        language: script
+        pass_filenames: false
+        always_run: true
 
   # Lints the agent context (AGENTS.md, CLAUDE.md, .claude/ and
   # anything else an agent is handed) for malformed structure,
