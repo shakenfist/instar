@@ -1060,7 +1060,6 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         per-format cushion to absorb writer-side alignment artefacts).
         """
         import os
-        import tempfile
 
         cushion = self._CUSHION[target]
         ext = self._EXT[target]
@@ -1117,7 +1116,6 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         per-format cushion).
         """
         import os
-        import tempfile
 
         cushion = self._CUSHION[target]
         ext = self._EXT[target]

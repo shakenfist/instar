@@ -148,9 +148,11 @@ test. The PR gate runs Python 3.13 and cannot see the difference. Only
 the merge queue's Debian 12 and Ubuntu 22.04 legs can, and 25 tests
 built like this ejected every queued pull request
 ([#959](https://github.com/shakenfist/instar/issues/959)).
-`ScratchFile` takes the same arguments and behaves the same on every
-Python. Do not assert that a refused run leaves its output in place:
-an absent output is the expected result.
+`ScratchFile` takes the same arguments, apart from Python 3.12's
+`delete_on_close`, which it refuses because forwarding it would fail
+on 3.10 and 3.11, and it behaves the same on every Python. Do not
+assert that a refused run leaves its output in place, or read it
+without checking it exists: an absent output is the expected result.
 
 `tools/ci/check-no-named-temporary-file.sh` enforces this, as a
 pre-commit hook and in the `ci-tooling` job. It matches the name

@@ -930,7 +930,14 @@ class TestCVEReproduction(InstarTestBase):
         """Converting VMDK with hostile extent does not produce /etc/shadow data."""
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
         with ScratchFile(suffix='.raw') as out:
-            _ = self.run_instar_convert(image.path, out.name)
+            stdout, stderr, _rc = self.run_instar_convert(image.path, out.name)
+            self.assert_no_sensitive_content(
+                stdout + stderr, 'CVE-2022-47951 convert'
+            )
+            # A refused convert removes the output it left empty (#849);
+            # an absent output leaks nothing, so only read one that exists.
+            if not Path(out.name).exists():
+                return
             with open(out.name, 'rb') as f:
                 out_data = f.read(4096)
             for forbidden in [b'root:', b'daemon:', b'bin:']:

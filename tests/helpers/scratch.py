@@ -25,6 +25,8 @@ def _remove(path):
     try:
         os.unlink(path)
     except FileNotFoundError:
+        # Already gone, typically because instar removed an output it
+        # left empty (#849). That is the case this module exists for.
         pass
 
 
@@ -37,12 +39,22 @@ class ScratchFile:
     already removed by the time it is cleaned up is not an error, on
     any Python. With `delete=False` the file is kept, as it is by
     NamedTemporaryFile.
+
+    `delete_on_close` (Python 3.12 and later) is refused: ScratchFile
+    always removes the file on close, and forwarding the argument would
+    be a TypeError on 3.10 and 3.11 -- the version-dependent failure
+    this class exists to remove.
     """
 
     def __init__(self, *args, delete=True, **kwargs):
+        if 'delete_on_close' in kwargs:
+            raise TypeError(
+                'ScratchFile manages deletion itself; delete_on_close is not supported')
         self._file = tempfile.NamedTemporaryFile(*args, delete=False, **kwargs)
         self.name = self._file.name
-        self._delete = delete
+        # The wrapper's own answer, not the underlying file's, which is
+        # always False because ScratchFile does the deleting.
+        self.delete = delete
         # Like NamedTemporaryFile, a ScratchFile nobody closed is still
         # removed when it is garbage collected or the interpreter exits.
         self._finalizer = weakref.finalize(
@@ -69,4 +81,11 @@ class ScratchFile:
         return iter(self._file)
 
     def __getattr__(self, attr):
+        # Only reached for attributes ScratchFile does not have itself.
+        # Private names are never passed through: if __init__ failed
+        # before binding _file, or copy or pickle built an instance
+        # without running it, looking up self._file here would re-enter
+        # __getattr__ and recurse until RecursionError hid the real fault.
+        if attr.startswith('_'):
+            raise AttributeError(attr)
         return getattr(self._file, attr)
