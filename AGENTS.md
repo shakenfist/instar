@@ -177,6 +177,13 @@ Per-format feature detail is in
   is out of scope and keeps its original ASCII as a historical record.
   See "Diagrams" in [docs/development.md](docs/development.md).
 
+- **There is no `CHANGELOG.md`; do not recreate it**, even where an
+  older plan in `docs/plans/` says to add an entry. Say what changed in
+  the commit message and the affected `docs/` page; release notes are
+  written on the GitHub release at release time. A pre-commit hook
+  fails if the file reappears. See "Releases" in
+  [docs/development.md](docs/development.md).
+
 ## Adding a prototype
 
 1. Create a subdirectory under `prototypes/` with a descriptive name

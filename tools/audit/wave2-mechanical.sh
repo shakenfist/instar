@@ -137,7 +137,7 @@ echo
 bold "=== wave 2c: doc files touched in changed set ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     DOCS=$(audit_scope_names_all \
-        | grep -E '^(README\.md|ARCHITECTURE\.md|AGENTS\.md|CHANGELOG\.md|docs/)' \
+        | grep -E '^(README\.md|ARCHITECTURE\.md|AGENTS\.md|docs/)' \
         || true)
     if [[ -n "$DOCS" ]]; then
         echo "$DOCS"

@@ -1,6 +1,6 @@
 ---
 name: pr-preparation
-description: "Verify a branch is shippable before pushing: build, pre-commit, the test suites, documentation and changelog. Use before creating or updating a pull request."
+description: "Verify a branch is shippable before pushing: build, pre-commit, the test suites and documentation. Use before creating or updating a pull request."
 ---
 
 # Instar PR Preparation

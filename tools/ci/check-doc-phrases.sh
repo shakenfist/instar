@@ -18,9 +18,10 @@
 # lists real ones.)
 #
 # Scope is every tracked file except two directories, because the
-# corruption lands in any prose that names a plan file -- CHANGELOG.md
-# and ARCHITECTURE.md cite plan names as freely as docs/ does, and
-# scoping to docs/ would leave them unguarded. The two exclusions:
+# corruption lands in any prose that names a plan file -- AGENTS.md,
+# PUSH-AUDIT.md and source comments cite plan names as freely as docs/
+# does, and scoping to docs/ would leave them unguarded. The two
+# exclusions:
 #   - tools/ci/, because this repo's own tooling legitimately contains
 #     the literal pattern -- this script's tests build fixtures
 #     carrying the corrupted phrase on purpose, to prove the guard

@@ -24,11 +24,10 @@ cannot read", which is true of any unsupported format. A sentence that
 forbids or disclaims the claim rather than making it ("must not imply
 that instar cannot compose at all") is cleared by the negation test.
 
-Two trees are deliberately not read. `docs/plans/` records what was
+One tree is deliberately not read. `docs/plans/` records what was
 true when each phase was planned, and prescribes the sweeps that made
-it false; `CHANGELOG.md` entries were true for the release they
-describe. Editing either to satisfy this script would falsify a
-record. `docs/plans/` is skipped by an explicit prefix: it used to be
+it false. Editing it to satisfy this script would falsify a record.
+`docs/plans/` is skipped by an explicit prefix: it used to be
 skipped only as a side effect of a non-recursive `docs/*.md` glob,
 which also meant the 36 pages under `docs/commentary/`,
 `docs/crates/`, `docs/qcow2/` and the rest were never read at all,

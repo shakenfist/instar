@@ -635,8 +635,6 @@ copy lives in shakenfist/development at
   entries, or memory-layout decisions.
 - `AGENTS.md` reflects any new dependencies, build
   commands, or conventions.
-- `CHANGELOG.md` has an entry under the appropriate
-  section (Added / Changed / Fixed / Packaging / CI).
 - `docs/` has been updated for the affected format or
   topic — `docs/qcow2/`, `docs/vmdk/`, `docs/security/`,
   `docs/output-formats.md`, etc.
