@@ -8,6 +8,7 @@ lists, the preallocation byte comparison, and the normalisers).
 """
 
 import json
+import os
 import shutil
 import struct
 import tempfile
@@ -15,6 +16,7 @@ import unittest
 from pathlib import Path
 
 from helpers import qemu_pins
+from helpers.scratch import ScratchFile
 from helpers.info_json import (
     FILENAME_PLACEHOLDER,
     FLAT_EXTENT_NAMES,
@@ -592,6 +594,47 @@ class TestQemuPinResultDiff(unittest.TestCase):
 
     def test_equal(self):
         self.assertEqual(qemu_pins.result_diff({'rc': 1, 'stderr': 'x'}, {'rc': 1, 'stderr': 'x'}), [])
+
+
+class TestScratchFile(unittest.TestCase):
+    """`ScratchFile` cleans up like the stdlib's, but tolerates a vanished file.
+
+    A failed convert removes an output it left empty (#849); on Python 3.10 and
+    3.11 the stdlib's named temporary file raises from its exit when its file is
+    gone (#959). These pass on every Python only if ScratchFile's cleanup does.
+    """
+
+    def test_removed_while_open_is_not_an_error(self):
+        with ScratchFile(suffix='.raw') as out:
+            os.unlink(out.name)
+
+    def test_removed_then_closed_by_hand_is_not_an_error(self):
+        out = ScratchFile(suffix='.raw')
+        os.unlink(out.name)
+        out.close()
+        out.close()
+
+    def test_removed_on_exit(self):
+        with ScratchFile(suffix='.raw') as out:
+            out.write(b'data')
+            out.flush()
+            self.assertEqual(Path(out.name).read_bytes(), b'data')
+        self.assertFalse(Path(out.name).exists())
+
+    def test_removed_on_close(self):
+        out = ScratchFile(suffix='.qcow2')
+        self.assertTrue(out.name.endswith('.qcow2'))
+        self.assertTrue(Path(out.name).exists())
+        out.close()
+        self.assertFalse(Path(out.name).exists())
+
+    def test_delete_false_keeps_the_file(self):
+        with ScratchFile(suffix='.raw', delete=False) as out:
+            pass
+        try:
+            self.assertTrue(Path(out.name).exists())
+        finally:
+            os.unlink(out.name)
 
 
 if __name__ == '__main__':

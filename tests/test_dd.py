@@ -36,6 +36,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 
 class TestDdWholeImage(InstarTestBase):
@@ -43,9 +44,9 @@ class TestDdWholeImage(InstarTestBase):
 
     def test_dd_whole_image_qcow2_to_raw(self):
         """instar dd copies a qcow2 input to raw, byte-identical to qemu-img dd."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out:
+        with ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as instar_out, \
+                ScratchFile(suffix='.raw') as qemu_out:
             # Create a small qcow2 with a recognisable written pattern.
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2', qcow2.name, '4M'],
@@ -94,9 +95,9 @@ class TestDdWholeImage(InstarTestBase):
 
     def test_dd_whole_image_raw_to_raw(self):
         """instar dd copies a raw input to raw, byte-identical to qemu-img dd."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out:
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(suffix='.raw') as instar_out, \
+                ScratchFile(suffix='.raw') as qemu_out:
             # Create a raw image with a recognisable pattern.
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', src.name, '4M'],
@@ -145,7 +146,7 @@ class TestDdWholeImage(InstarTestBase):
 
     def test_dd_missing_of_errors(self):
         """instar dd exits non-zero when the output file (of=) is absent."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src:
+        with ScratchFile(suffix='.raw') as src:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', src.name, '1M'],
                 capture_output=True,
@@ -217,8 +218,8 @@ def _assert_dd_parity(
     If *expect_empty* is True the test additionally asserts that both
     outputs are zero bytes.
     """
-    with tempfile.NamedTemporaryFile(suffix='.raw') as instar_out, \
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out:
+    with ScratchFile(suffix='.raw') as instar_out, \
+            ScratchFile(suffix='.raw') as qemu_out:
         # Substitute the placeholder output path with the real temp paths.
         instar_ops = [
             op.replace('of=__OUT__', f'of={instar_out.name}')
@@ -344,8 +345,8 @@ class TestDdRawWindow(InstarTestBase):
     def setUp(self):
         """Create one raw and one qcow2 patterned input for this test."""
         super().setUp()
-        self._raw_tmp = tempfile.NamedTemporaryFile(suffix='.raw')
-        self._qcow2_tmp = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        self._raw_tmp = ScratchFile(suffix='.raw')
+        self._qcow2_tmp = ScratchFile(suffix='.qcow2')
         _make_patterned_image(self._raw_tmp.name, 'raw')
         _make_patterned_image(self._qcow2_tmp.name, 'qcow2')
 
@@ -498,10 +499,10 @@ def _assert_structured_dd_parity(
     *label* is a short human-readable tag used in failure messages.
     """
     with (
-        tempfile.NamedTemporaryFile(suffix=out_suffix) as instar_out,
-        tempfile.NamedTemporaryFile(suffix=out_suffix) as qemu_out,
-        tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw,
-        tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw,
+        ScratchFile(suffix=out_suffix) as instar_out,
+        ScratchFile(suffix=out_suffix) as qemu_out,
+        ScratchFile(suffix='.raw') as instar_raw,
+        ScratchFile(suffix='.raw') as qemu_raw,
     ):
         # Run instar dd with -O <fmt>.
         stdout, stderr, rc = test_case.run_instar_dd(
@@ -582,8 +583,8 @@ class TestDdStructuredWindow(InstarTestBase):
     def setUp(self):
         """Create one raw and one qcow2 patterned input for this test."""
         super().setUp()
-        self._raw_tmp = tempfile.NamedTemporaryFile(suffix='.raw')
-        self._qcow2_tmp = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        self._raw_tmp = ScratchFile(suffix='.raw')
+        self._qcow2_tmp = ScratchFile(suffix='.qcow2')
         _make_patterned_image(self._raw_tmp.name, 'raw')
         _make_patterned_image(self._qcow2_tmp.name, 'qcow2')
 
@@ -691,8 +692,8 @@ class TestDdStructuredWindow(InstarTestBase):
         Both tools must exit 0 and report the same (zero) virtual-size.
         """
         with (
-            tempfile.NamedTemporaryFile(suffix=out_suffix) as instar_out,
-            tempfile.NamedTemporaryFile(suffix=out_suffix) as qemu_out,
+            ScratchFile(suffix=out_suffix) as instar_out,
+            ScratchFile(suffix=out_suffix) as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={src_path}', f'of={instar_out.name}'] + window_ops,
@@ -742,7 +743,7 @@ class TestDdStructuredWindow(InstarTestBase):
         qemu-img dd is not run (it would succeed, but comparing the output
         would fail and obscure the known limitation).
         """
-        with tempfile.NamedTemporaryFile(suffix=out_suffix) as instar_out:
+        with ScratchFile(suffix=out_suffix) as instar_out:
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={src_path}', f'of={instar_out.name}'] + window_ops,
                 output_format=out_fmt,
@@ -911,7 +912,7 @@ class TestDdUnalignedClusterCrossing(InstarTestBase):
         -O qcow2 while qemu-img dd exited 0 -- the fuzzer's
         exit_code_divergence (seed 2630842467, iteration 96).
         """
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as src:
+        with ScratchFile(suffix='.qcow2') as src:
             _make_hole_then_data_qcow2(src.name)
             self._run_all_formats(src.name, 'hole_then_data')
 
@@ -922,7 +923,7 @@ class TestDdUnalignedClusterCrossing(InstarTestBase):
         content silently differed from qemu's (cluster tails read from
         the physically-adjacent file cluster).
         """
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as src:
+        with ScratchFile(suffix='.qcow2') as src:
             _make_out_of_order_qcow2(src.name)
             self._run_all_formats(src.name, 'out_of_order')
 
@@ -947,8 +948,8 @@ class TestDdErrors(InstarTestBase):
     def setUp(self):
         """Create small valid input images for rejection tests."""
         super().setUp()
-        self._raw_tmp = tempfile.NamedTemporaryFile(suffix='.raw')
-        self._qcow2_tmp = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        self._raw_tmp = ScratchFile(suffix='.raw')
+        self._qcow2_tmp = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'raw', self._raw_tmp.name, '1M'],
             capture_output=True, check=True,
@@ -975,7 +976,7 @@ class TestDdErrors(InstarTestBase):
         The output path must be a real temporary file so neither tool
         trips over a missing destination.
         """
-        with tempfile.NamedTemporaryFile(suffix='.out') as out:
+        with ScratchFile(suffix='.out') as out:
             instar_ops = [
                 op.replace('of=__OUT__', f'of={out.name}')
                 for op in operands
@@ -1049,7 +1050,7 @@ class TestDdErrors(InstarTestBase):
 
     def test_reject_missing_if(self):
         """Missing if= (only of= given) is rejected by both tools."""
-        with tempfile.NamedTemporaryFile(suffix='.out') as out:
+        with ScratchFile(suffix='.out') as out:
             _, stderr, rc = self.run_instar_dd(
                 [f'of={out.name}', 'bs=512'],
             )
@@ -1120,9 +1121,9 @@ class TestDdOutputDefault(InstarTestBase):
     def test_output_default_is_raw(self):
         """Omitting -O on a qcow2 input produces a raw (not qcow2) output."""
         with (
-            tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2,
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.qcow2') as qcow2,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             # Create a patterned qcow2 input so the output is not all-zeros.
             _make_patterned_image(qcow2.name, 'qcow2')
@@ -1220,8 +1221,8 @@ class TestDdInputFormats(InstarTestBase):
         explicitly so the output is always raw (comparable byte-for-byte).
         """
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={src_path}', f'of={instar_out.name}'] + self._WINDOW,
@@ -1257,8 +1258,8 @@ class TestDdInputFormats(InstarTestBase):
     def test_input_vmdk(self):
         """dd reads a vmdk input and produces byte-identical output to qemu-img dd."""
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
-            tempfile.NamedTemporaryFile(suffix='.vmdk') as vmdk,
+            ScratchFile(suffix='.raw') as raw,
+            ScratchFile(suffix='.vmdk') as vmdk,
         ):
             _make_patterned_raw(raw.name)
             result = subprocess.run(
@@ -1274,8 +1275,8 @@ class TestDdInputFormats(InstarTestBase):
     def test_input_vpc(self):
         """dd reads a vhd (vpc) input and produces byte-identical output to qemu-img dd."""
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
-            tempfile.NamedTemporaryFile(suffix='.vpc') as vpc,
+            ScratchFile(suffix='.raw') as raw,
+            ScratchFile(suffix='.vpc') as vpc,
         ):
             _make_patterned_raw(raw.name)
             result = subprocess.run(
@@ -1291,8 +1292,8 @@ class TestDdInputFormats(InstarTestBase):
     def test_input_vhdx(self):
         """dd reads a vhdx input and produces byte-identical output to qemu-img dd."""
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
-            tempfile.NamedTemporaryFile(suffix='.vhdx') as vhdx,
+            ScratchFile(suffix='.raw') as raw,
+            ScratchFile(suffix='.vhdx') as vhdx,
         ):
             _make_patterned_raw(raw.name)
             result = subprocess.run(
@@ -1319,8 +1320,8 @@ class TestDdInputFormats(InstarTestBase):
         self.skip_if_hash_mismatch(image)
 
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'],
@@ -1370,8 +1371,8 @@ class TestDdInputFormats(InstarTestBase):
         self.skip_if_hash_mismatch(image)
 
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'],
@@ -1424,8 +1425,8 @@ class TestDdInputFormats(InstarTestBase):
 
         window = ['bs=65536', 'skip=2', 'count=4']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1486,8 +1487,8 @@ class TestDdInputFormats(InstarTestBase):
 
         window = ['bs=65536', 'skip=30', 'count=34']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1580,8 +1581,8 @@ class TestDdInputFormats(InstarTestBase):
             window = ['bs=65536', 'skip=0', 'count=5']
 
             with (
-                tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+                ScratchFile(suffix='.raw') as instar_out,
+                ScratchFile(suffix='.raw') as qemu_out,
             ):
                 stdout, stderr, rc = self.run_instar_dd(
                     [f'if={overlay_path}', f'of={instar_out.name}'] + window,
@@ -1635,9 +1636,9 @@ class TestDdInputFormats(InstarTestBase):
         output matches qemu-img dd (which uses auto-detection).
         """
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as raw,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             _make_patterned_raw(raw.name)
             window = ['bs=65536', 'skip=0', 'count=2']
@@ -1692,8 +1693,8 @@ class TestDdInputFormats(InstarTestBase):
 
         window = ['bs=4096', 'skip=4', 'count=6']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1754,8 +1755,8 @@ class TestDdInputFormats(InstarTestBase):
 
         window = ['bs=4096', 'skip=0', 'count=3']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1826,8 +1827,8 @@ class TestDdDmg(InstarTestBase):
 
         window = ['bs=65536', 'skip=31', 'count=33']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1890,8 +1891,8 @@ class TestDdDmg(InstarTestBase):
 
         window = ['bs=65536', 'skip=15', 'count=17']
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'] + window,
@@ -1953,8 +1954,8 @@ class TestDdDmg(InstarTestBase):
         self.skip_if_hash_mismatch(image)
 
         with (
-            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
-            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ScratchFile(suffix='.raw') as instar_out,
+            ScratchFile(suffix='.raw') as qemu_out,
         ):
             i_out, i_err, i_rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={instar_out.name}'],
@@ -1997,7 +1998,7 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
 
     def _assert_refused(self, image_id, fmt):
         image = self._refusal_image(image_id)
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={out.name}']
             )
@@ -2038,7 +2039,7 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
         container length (dd sizes to the file, not the padded vsize).
         """
         image = self._refusal_image('iso-simple')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_dd(
                 [f'if={image.path}', f'of={out.name}']
             )

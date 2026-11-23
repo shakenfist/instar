@@ -137,6 +137,28 @@ the option has to be exempted by name in the script, with its reason;
 `tests/test_measure.py`, which passes it to `instar measure` to check
 the refusal, is the one exemption.
 
+**Never use `tempfile.NamedTemporaryFile` in a test; use `ScratchFile`
+from `tests/helpers/scratch.py`.** A failed `convert`, `dd` or `copy`
+removes an output file it left empty
+([#849](https://github.com/shakenfist/instar/issues/849)), so a test
+that expects a refusal can reach the end of its `with` block with the
+temporary file already gone. Python 3.12 and later ignore that, but
+3.10 and 3.11 raise `FileNotFoundError` from the cleanup and fail the
+test. The PR gate runs Python 3.13 and cannot see the difference. Only
+the merge queue's Debian 12 and Ubuntu 22.04 legs can, and 25 tests
+built like this ejected every queued pull request
+([#959](https://github.com/shakenfist/instar/issues/959)).
+`ScratchFile` takes the same arguments and behaves the same on every
+Python. Do not assert that a refused run leaves its output in place:
+an absent output is the expected result.
+
+`tools/ci/check-no-named-temporary-file.sh` enforces this, as a
+pre-commit hook and in the `ci-tooling` job. It matches the name
+anywhere under `tests/`, comments included, because whether instar
+writes to a given temporary file is a property of the test that can
+change in an edit the `with` statement never sees.
+`tests/helpers/scratch.py` itself is the one exemption.
+
 ## Test Categories
 
 ### Safe Images (`test_info_safe.py`)

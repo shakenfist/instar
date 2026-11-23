@@ -454,6 +454,16 @@ jobs:
       - name: Test the changelog guard
         run: tools/ci/test-check-no-changelog.sh
 
+      # A test whose NamedTemporaryFile instar removes passes on the PR
+      # gate's Python 3.13 and fails on the merge queue's 3.10 and 3.11
+      # legs, ejecting unrelated pull requests (#959), so this has to
+      # run where the PR gate can see it. Pure text parsing.
+      - name: Check no test uses NamedTemporaryFile
+        run: tools/ci/check-no-named-temporary-file.sh
+
+      - name: Test the NamedTemporaryFile guard
+        run: tools/ci/test-check-no-named-temporary-file.sh
+
       # The testdata fixture guard. Every test that reads these
       # fixtures skips rather than fails when its file is absent, so a
       # partial checkout used to shrink the suite with CI still green.

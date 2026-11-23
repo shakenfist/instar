@@ -7,7 +7,6 @@ import re
 import resource
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -20,6 +19,7 @@ from helpers.comparators import (
     substitute_actual_size,
     substitute_testdata_root,
 )
+from helpers.scratch import ScratchFile
 from helpers.types import TestImage
 
 
@@ -1269,11 +1269,11 @@ class InstarTestBase(testtools.TestCase):
             else f'block={block_size}'
         )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix=suffix) as fmt_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             _, stderr, rc = self.run_instar_convert(
                 image.path, Path(fmt_out.name),
@@ -1349,7 +1349,7 @@ class InstarTestBase(testtools.TestCase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix=suffix) as out:
             _, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name),

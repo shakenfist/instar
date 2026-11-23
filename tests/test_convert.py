@@ -13,6 +13,7 @@ from pathlib import Path
 from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
 from helpers import vhdx_structure
+from helpers.scratch import ScratchFile
 from test_create import (VHDX_FIXED_TOO_LARGE_FOR_EXT4,
                          VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH)
 from test_vhdx_fixed_fixtures import (PARTIAL_PAST_FIRST_CHUNK, QEMU_CANNOT_OPEN,
@@ -24,8 +25,8 @@ class TestConvertBasicQcow2ToRaw(InstarTestBase):
 
     def test_convert_empty_qcow2(self):
         """Convert an empty QCOW2 image to raw."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+        with ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  qcow2.name, '1M'],
@@ -38,7 +39,7 @@ class TestConvertBasicQcow2ToRaw(InstarTestBase):
             self.assertEqual(stdout, '')
 
             # Verify output matches qemu-img convert
-            with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            with ScratchFile(suffix='.raw') as qemu_raw:
                 self.run_qemu_img_convert(
                     Path(qcow2.name), Path(qemu_raw.name)
                 )
@@ -52,8 +53,8 @@ class TestConvertBasicQcow2ToRaw(InstarTestBase):
 
     def test_convert_qcow2_with_data(self):
         """Convert QCOW2 with written data to raw."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+        with ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  qcow2.name, '1M'],
@@ -75,7 +76,7 @@ class TestConvertBasicQcow2ToRaw(InstarTestBase):
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # Cross-validate with qemu-img
-            with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            with ScratchFile(suffix='.raw') as qemu_raw:
                 self.run_qemu_img_convert(
                     Path(qcow2.name), Path(qemu_raw.name)
                 )
@@ -89,8 +90,8 @@ class TestConvertBasicQcow2ToRaw(InstarTestBase):
 
     def test_convert_output_size_matches_virtual_size(self):
         """Converted raw output has the correct size."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+        with ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  qcow2.name, '2M'],
@@ -108,9 +109,9 @@ class TestConvertCompressed(InstarTestBase):
 
     def test_convert_compressed_qcow2(self):
         """Convert a compressed QCOW2 image to raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as comp, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as output:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as comp, \
+                ScratchFile(suffix='.raw') as output:
             # Create a raw base with data
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -374,8 +375,8 @@ class TestConvertRawToRaw(InstarTestBase):
 
     def test_convert_raw_passthrough(self):
         """Converting a raw image to raw is an identity operation."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as dst:
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(suffix='.raw') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -468,8 +469,8 @@ class TestConvertErrors(InstarTestBase):
 
     def test_convert_unsupported_output_format(self):
         """Converting to unsupported format returns an error."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(suffix='.vdi') as dst:
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(suffix='.vdi') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -484,7 +485,7 @@ class TestConvertErrors(InstarTestBase):
 
     def test_convert_nonexistent_input(self):
         """Converting a nonexistent file returns an error."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as dst:
+        with ScratchFile(suffix='.raw') as dst:
             stdout, stderr, rc = self.run_instar_convert(
                 Path('/nonexistent/image.qcow2'),
                 Path(dst.name)
@@ -608,9 +609,9 @@ class TestConvertManifestImages(InstarTestBase):
         vsize, _ = self._get_qcow2_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -708,8 +709,8 @@ class TestConvertRawToQcow2(InstarTestBase):
 
     def test_convert_empty_raw_to_qcow2(self):
         """Convert an empty raw image to QCOW2."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -733,8 +734,8 @@ class TestConvertRawToQcow2(InstarTestBase):
 
     def test_convert_raw_with_data_to_qcow2(self):
         """Convert raw with written data to QCOW2."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -767,8 +768,8 @@ class TestConvertRawToQcow2(InstarTestBase):
 
     def test_convert_qcow2_output_correct_virtual_size(self):
         """QCOW2 output has correct virtual size."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '2M'],
@@ -790,8 +791,8 @@ class TestConvertRawToQcow2(InstarTestBase):
 
     def test_convert_qcow2_output_smaller_than_virtual(self):
         """QCOW2 output file is smaller than virtual size."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '10M'],
@@ -822,10 +823,10 @@ class TestConvertRoundTrip(InstarTestBase):
 
     def test_roundtrip_empty(self):
         """Round-trip: raw -> qcow2 -> raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as dst:
+                ScratchFile(suffix='.raw') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -855,10 +856,10 @@ class TestConvertRoundTrip(InstarTestBase):
 
     def test_roundtrip_with_data(self):
         """Round-trip with data: raw -> qcow2 -> raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as dst:
+                ScratchFile(suffix='.raw') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -893,10 +894,10 @@ class TestConvertRoundTrip(InstarTestBase):
 
     def test_roundtrip_with_skip_zeros(self):
         """Round-trip with skip_zeros: raw -> qcow2 -> raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as dst:
+                ScratchFile(suffix='.raw') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -926,12 +927,12 @@ class TestConvertRoundTrip(InstarTestBase):
 
     def test_roundtrip_qcow2_to_qcow2(self):
         """Round-trip: qcow2 -> qcow2 (re-encode)."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                     suffix='.qcow2') as src, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r2:
+                ScratchFile(suffix='.raw') as r1, \
+                ScratchFile(suffix='.raw') as r2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  src.name, '1M'],
@@ -981,8 +982,8 @@ class TestConvertToQcow2CrossValidation(InstarTestBase):
 
     def test_qemu_img_check_passes(self):
         """qemu-img check passes on instar QCOW2 output."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -1008,12 +1009,12 @@ class TestConvertToQcow2CrossValidation(InstarTestBase):
 
     def test_qemu_img_can_read_output(self):
         """qemu-img can convert instar QCOW2 output back."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as qemu_raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1049,8 +1050,8 @@ class TestConvertToQcow2CrossValidation(InstarTestBase):
 
     def test_instar_check_passes(self):
         """instar check passes on instar QCOW2 output."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -1182,9 +1183,9 @@ class TestConvertToQcow2ManifestRaw(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                     suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as roundtrip:
             # Convert raw -> qcow2
             stdout, stderr, rc = self.run_instar_convert(
@@ -1285,8 +1286,8 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_raw_to_qcow2(self):
         """Convert raw with data to compressed QCOW2."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1316,10 +1317,10 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_round_trip(self):
         """Round-trip: raw -> compressed qcow2 -> raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1361,10 +1362,10 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_output_smaller(self):
         """Compressed QCOW2 is smaller than uncompressed."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as uncomp, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.qcow2') as comp:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1399,13 +1400,13 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_qcow2_to_compressed_qcow2(self):
         """Re-encode QCOW2 input as compressed QCOW2."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                     suffix='.qcow2') as src, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.qcow2') as comp, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as r2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
@@ -1521,10 +1522,10 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_incompressible_data(self):
         """Compress random (incompressible) data."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as roundtrip:
             # Create raw with random data
             subprocess.run(
@@ -1571,8 +1572,8 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_empty_image(self):
         """Compress an all-zero image."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1597,12 +1598,12 @@ class TestConvertCompressedOutput(InstarTestBase):
 
     def test_compress_cross_validate_with_qemu(self):
         """Cross-validate instar compressed output with qemu."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as src, \
+                ScratchFile(
                     suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as qemu_raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
@@ -1761,11 +1762,11 @@ class TestConvertToQcow2ManifestQcow2(InstarTestBase):
         if self._compress:
             timeout *= 3
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                     suffix='.qcow2') as reenc, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as raw_orig, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw') as raw_reenc:
             # Re-encode: qcow2 -> qcow2
             stdout, stderr, rc = self.run_instar_convert(
@@ -1888,7 +1889,7 @@ class TestConvertLargeCluster(InstarTestBase):
 
     def test_convert_2mb_cluster_to_raw(self):
         """Convert a 2MB-cluster QCOW2 to raw, cross-validate."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.qcow2', delete=False
         ) as f:
             qcow2_path = f.name
@@ -1913,9 +1914,9 @@ class TestConvertLargeCluster(InstarTestBase):
                     timeout=30,
                 )
 
-            with tempfile.NamedTemporaryFile(
+            with ScratchFile(
                 suffix='.raw', delete=False
-            ) as instar_f, tempfile.NamedTemporaryFile(
+            ) as instar_f, ScratchFile(
                 suffix='.raw', delete=False
             ) as qemu_f:
                 instar_raw = instar_f.name
@@ -1962,9 +1963,9 @@ class TestConvertLargeCluster(InstarTestBase):
 
     def test_compare_2mb_cluster_vs_raw(self):
         """Compare a 2MB-cluster QCOW2 against its raw equivalent."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.qcow2', delete=False
-        ) as qf, tempfile.NamedTemporaryFile(
+        ) as qf, ScratchFile(
             suffix='.raw', delete=False
         ) as rf:
             qcow2_path = qf.name
@@ -2024,11 +2025,11 @@ class TestConvertLargeClusterOutput(InstarTestBase):
         self, cluster_size, compress=False, image_size='64M'
     ):
         """Helper: raw -> qcow2 (large cluster) -> raw, compare."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.raw', delete=False
-        ) as src_f, tempfile.NamedTemporaryFile(
+        ) as src_f, ScratchFile(
             suffix='.qcow2', delete=False
-        ) as mid_f, tempfile.NamedTemporaryFile(
+        ) as mid_f, ScratchFile(
             suffix='.raw', delete=False
         ) as dst_f:
             src = src_f.name
@@ -2127,11 +2128,11 @@ class TestConvertLargeClusterOutput(InstarTestBase):
 
     def test_qcow2_to_qcow2_large_cluster(self):
         """Convert QCOW2 (default cluster) -> QCOW2 (128KB)."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.raw', delete=False
-        ) as raw_f, tempfile.NamedTemporaryFile(
+        ) as raw_f, ScratchFile(
             suffix='.qcow2', delete=False
-        ) as src_f, tempfile.NamedTemporaryFile(
+        ) as src_f, ScratchFile(
             suffix='.qcow2', delete=False
         ) as dst_f:
             raw = raw_f.name
@@ -2200,9 +2201,9 @@ class TestConvertLargeClusterOutput(InstarTestBase):
 
     def test_2m_cluster_preserves_size(self):
         """2MB cluster output -> convert back preserves data."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.qcow2', delete=False
-        ) as src_f, tempfile.NamedTemporaryFile(
+        ) as src_f, ScratchFile(
             suffix='.qcow2', delete=False
         ) as dst_f:
             src = src_f.name
@@ -2310,9 +2311,9 @@ class TestConvertVmdkToRaw(InstarTestBase):
         vsize = self._get_vmdk_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -2383,7 +2384,7 @@ class TestConvertVmdkFlatRejection(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=60
             )
@@ -2415,7 +2416,7 @@ class TestConvertVmdkFlatChain(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=120
             )
@@ -2469,7 +2470,7 @@ class TestConvertVmdkMultiExtent(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=60
             )
@@ -2795,7 +2796,7 @@ class TestConvertVmdkCompare(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with qemu-img as baseline
             q_stdout, q_stderr, q_rc = \
@@ -2874,9 +2875,9 @@ class TestConvertVmdkStreamOptimized(InstarTestBase):
         timeout = max(120, int(120 + (vsize or 0)
                                 / (1024 ** 3) * 10))
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -2940,7 +2941,7 @@ class TestConvertVmdkStreamOptimized(InstarTestBase):
         timeout = max(120, int(120 + (vsize or 0)
                                 / (1024 ** 3) * 10))
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as qemu_raw:
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
@@ -2990,11 +2991,11 @@ class TestConvertToVmdk(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vmdk') as vmdk_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert to VMDK with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -3096,11 +3097,11 @@ class TestConvertToVmdkCompressed(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vmdk') as vmdk_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert to streamOptimized VMDK
             stdout, stderr, rc = self.run_instar_convert(
@@ -3204,11 +3205,11 @@ class TestConvertVmdkToQcow2Roundtrip(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.qcow2') as qcow2_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert VMDK to QCOW2
             stdout, stderr, rc = self.run_instar_convert(
@@ -3293,7 +3294,7 @@ class TestConvertVmdkCheckOutput(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vmdk') as vmdk_out:
             # Convert to VMDK
             stdout, stderr, rc = self.run_instar_convert(
@@ -3392,9 +3393,9 @@ class TestConvertVhdxToRaw(InstarTestBase):
         vsize = self._get_vhdx_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -3459,7 +3460,7 @@ class TestConvertVhdxCompare(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with qemu-img as baseline
             q_stdout, q_stderr, q_rc = \
@@ -3509,11 +3510,11 @@ class TestConvertToVhdx(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vhdx') as vhdx_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert to VHDX with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -3938,7 +3939,7 @@ class TestConvertVhdxCheckOutput(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vhdx') as vhdx_out:
             # Convert to VHDX
             stdout, stderr, rc = self.run_instar_convert(
@@ -4072,9 +4073,9 @@ class TestConvertVhdToRaw(InstarTestBase):
         else:
             timeout = 120
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name),
@@ -4131,7 +4132,7 @@ class TestConvertVhdToRaw(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=60
             )
@@ -4180,9 +4181,9 @@ class TestConvertParallelsToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
@@ -4300,9 +4301,9 @@ class TestConvertParallelsToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
-                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+        with ScratchFile(suffix='.raw') as ref_raw, \
+                ScratchFile(suffix=f'.{fmt}') as instar_out, \
+                ScratchFile(suffix='.raw') as flat_raw:
             # Canonical raw view of the Parallels image, via qemu-img.
             q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(ref_raw.name), timeout=120
@@ -4473,8 +4474,8 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
             )
@@ -4540,8 +4541,8 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
             )
@@ -4575,8 +4576,8 @@ class TestConvertQcow1ToRaw(InstarTestBase):
                 self.skipTest(f'Image not found: {img.path}')
             self.skip_if_hash_mismatch(img)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as data_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as comp_raw:
+        with ScratchFile(suffix='.raw') as data_raw, \
+                ScratchFile(suffix='.raw') as comp_raw:
             _, d_err, d_rc = self.run_instar_convert(
                 data.path, Path(data_raw.name), timeout=120)
             self.assertEqual(d_rc, 0, f'convert qcow1-data failed: {d_err}')
@@ -4602,7 +4603,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=60)
             self.assertNotEqual(
@@ -4630,9 +4631,9 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
-                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+        with ScratchFile(suffix='.raw') as ref_raw, \
+                ScratchFile(suffix=f'.{fmt}') as instar_out, \
+                ScratchFile(suffix='.raw') as flat_raw:
             _, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(ref_raw.name), timeout=120)
             self.assertEqual(
@@ -4822,9 +4823,9 @@ class TestConvertVdiToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
@@ -4870,9 +4871,9 @@ class TestConvertVdiToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
@@ -4950,9 +4951,9 @@ class TestConvertVdiToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
-                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+        with ScratchFile(suffix='.raw') as ref_raw, \
+                ScratchFile(suffix=f'.{fmt}') as instar_out, \
+                ScratchFile(suffix='.raw') as flat_raw:
             # Canonical raw view of the VDI, produced by qemu-img.
             q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(ref_raw.name), timeout=120
@@ -5122,7 +5123,7 @@ class TestConvertVhdCompare(InstarTestBase):
         else:
             timeout = 120
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as qemu_raw:
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
@@ -5194,11 +5195,11 @@ class TestConvertToVhd(InstarTestBase):
         else:
             timeout = 120
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vhd') as vhd_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert to VHD with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -5303,7 +5304,7 @@ class TestConvertVhdCheckOutput(InstarTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.vhd') as vhd_out:
             # Convert to VHD
             stdout, stderr, rc = self.run_instar_convert(
@@ -5389,11 +5390,11 @@ class TestConvertVhdToQcow2Roundtrip(InstarTestBase):
         else:
             timeout = 120
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.qcow2') as qcow2_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # VHD -> QCOW2
             stdout, stderr, rc = self.run_instar_convert(
@@ -5466,9 +5467,9 @@ class TestConvertSnapshot(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert snap1 with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -5512,9 +5513,9 @@ class TestConvertSnapshot(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert snap2 with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -5559,9 +5560,9 @@ class TestConvertSnapshot(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert snapshot ID "1" with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -5703,7 +5704,7 @@ class TestConvertSnapshot(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -5726,9 +5727,9 @@ class TestConvertEncryptedQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert with instar using password
             stdout, stderr, rc = self.run_instar_convert(
@@ -5777,7 +5778,7 @@ class TestConvertEncryptedQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             # Convert without password - should still
             # produce output but data will be encrypted
@@ -5801,9 +5802,9 @@ class TestConvertEncryptedQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as correct_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as wrong_raw:
             # Convert with correct password
             _, _, rc1 = self.run_instar_convert(
@@ -5843,9 +5844,9 @@ class TestConvertLuksQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                 suffix='.raw') as qemu_raw:
             # Convert with instar using LUKS passphrase
             stdout, stderr, rc = self.run_instar_convert(
@@ -5895,7 +5896,7 @@ class TestConvertLuksQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name)
@@ -5914,7 +5915,7 @@ class TestConvertLuksQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -5947,7 +5948,7 @@ class TestConvertNativeLuks(InstarTestBase):
                 f'Expected raw not found: {expected_raw}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -5978,7 +5979,7 @@ class TestConvertNativeLuks(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name)
@@ -5998,7 +5999,7 @@ class TestConvertNativeLuks(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6031,7 +6032,7 @@ class TestConvertNativeLuksV2(InstarTestBase):
                 f'Expected raw not found: {expected_raw}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6062,7 +6063,7 @@ class TestConvertNativeLuksV2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6081,7 +6082,7 @@ class TestConvertNativeLuksV2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6114,7 +6115,7 @@ class TestConvertLuksWrappedQcow2(InstarTestBase):
                 f'Expected raw not found: {expected_raw}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6160,7 +6161,7 @@ class TestConvertLuksWrappedQcow2(InstarTestBase):
                 f'Image not found: {image.path}'
             )
 
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 suffix='.raw') as raw_out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -6176,8 +6177,8 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_raw_to_qcow2(self):
         """Convert raw to QCOW2 with --extended-l2."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -6222,9 +6223,9 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_roundtrip(self):
         """Round-trip: raw -> extended L2 QCOW2 -> raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6264,10 +6265,10 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_qcow2_to_qcow2(self):
         """Re-encode standard QCOW2 as extended L2 QCOW2."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as q_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw2:
+        with ScratchFile(suffix='.qcow2') as q_in, \
+                ScratchFile(suffix='.qcow2') as q_out, \
+                ScratchFile(suffix='.raw') as raw1, \
+                ScratchFile(suffix='.raw') as raw2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  q_in.name, '1M'],
@@ -6312,9 +6313,9 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_compressed(self):
         """Extended L2 with compression."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6357,8 +6358,8 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_non_qcow2_rejected(self):
         """--extended-l2 with non-QCOW2 output is rejected."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6375,9 +6376,9 @@ class TestConvertExtendedL2Output(InstarTestBase):
 
     def test_convert_extended_l2_sparse(self):
         """Extended L2 with skip-zeros (sparse output)."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '10M'],
@@ -6440,9 +6441,9 @@ class TestExtendedL2SparseOutput(InstarTestBase):
     def test_sparse_bitmap_roundtrip(self):
         """Raw with mixed zero/data at subcluster granularity
         round-trips through instar ext-l2 QCOW2."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             # Create a 1M raw with mixed zero/data at 2KB
             # subcluster boundaries:
             # - subcluster 0 (0-2KB): 0xAA
@@ -6510,8 +6511,8 @@ class TestExtendedL2SparseOutput(InstarTestBase):
     def test_sparse_bitmap_compare_vs_raw(self):
         """Ext-l2 QCOW2 with alternating zero/data subclusters
         compares identical to its raw equivalent."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             # 128KB raw (2 clusters at 64KB): cluster 0 has
             # alternating 2KB data / 2KB zeros (even
             # subclusters get 0xDD, odd stay zero); cluster 1
@@ -6581,10 +6582,10 @@ class TestExtendedL2NarrowIO(InstarTestBase):
         """Read partial subclusters via narrow I/O path
         (sector_size=512 <= sc_size=2048) and verify output
         matches qemu-img convert."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.qcow2') as img, \
+                ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Create extended-L2 image with mixed subclusters
             subprocess.run(
@@ -6644,8 +6645,8 @@ class TestExtendedL2NarrowIO(InstarTestBase):
         """Compare extended-L2 QCOW2 against raw using
         sector_size=512 to exercise the narrow read path in
         the compare operation."""
-        with tempfile.NamedTemporaryFile(suffix='.qcow2') as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+        with ScratchFile(suffix='.qcow2') as img, \
+                ScratchFile(suffix='.raw') \
                 as raw:
             # Create extended-L2 image with partial data
             subprocess.run(
@@ -6687,9 +6688,9 @@ class TestConvertLuksEncryptOutput(InstarTestBase):
 
     def test_convert_luks_encrypt_raw_to_qcow2(self):
         """Convert raw to LUKS-encrypted QCOW2, decrypt back."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6728,9 +6729,9 @@ class TestConvertLuksEncryptOutput(InstarTestBase):
 
     def test_convert_luks_encrypt_roundtrip(self):
         """Encrypt with LUKS, decrypt, verify data at offsets."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '2M'],
@@ -6771,9 +6772,9 @@ class TestConvertLuksEncryptOutput(InstarTestBase):
 
     def test_convert_luks_encrypt_wrong_passphrase(self):
         """Decryption with wrong passphrase should fail."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6804,8 +6805,8 @@ class TestConvertLuksEncryptOutput(InstarTestBase):
 
     def test_convert_luks_encrypt_compress_rejected(self):
         """LUKS encrypt + compress should be rejected."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -6823,8 +6824,8 @@ class TestConvertLuksEncryptOutput(InstarTestBase):
 
     def test_convert_luks_encrypt_non_qcow2_rejected(self):
         """LUKS encrypt with non-QCOW2 output is rejected."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_in, \
+                ScratchFile(suffix='.raw') as raw_out:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw_in.name, '1M'],
@@ -7075,8 +7076,8 @@ class TestConvertDmgToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120
             )
@@ -7122,8 +7123,8 @@ class TestConvertDmgToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             _, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120)
             self.assertEqual(
@@ -7172,8 +7173,8 @@ class TestConvertDmgToRaw(InstarTestBase):
             self._pattern_sectors('INSTAR-DMG-MULTIPART-0', 1024)
             + self._pattern_sectors('INSTAR-DMG-MULTIPART-1', 1024))
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             _, stderr, rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=120)
             self.assertEqual(
@@ -7208,9 +7209,9 @@ class TestConvertDmgToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
-                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+        with ScratchFile(suffix='.raw') as ref_raw, \
+                ScratchFile(suffix=f'.{fmt}') as instar_out, \
+                ScratchFile(suffix='.raw') as flat_raw:
             _, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(ref_raw.name), timeout=120)
             self.assertEqual(
@@ -7270,8 +7271,8 @@ class TestConvertDmgToRaw(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as instar_raw, \
+                ScratchFile(suffix='.raw') as qemu_raw:
             i_out, i_err, i_rc = self.run_instar_convert(
                 image.path, Path(instar_raw.name), timeout=60)
             self.assertNotEqual(
@@ -7449,7 +7450,7 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
 
     def _assert_refused(self, image_id, fmt):
         image = self._refusal_image(image_id)
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name)
             )
@@ -7528,7 +7529,7 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
         the guest's virtio device reports (#821).
         """
         image = self._refusal_image('iso-simple')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name)
             )
