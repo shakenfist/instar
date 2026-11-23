@@ -17,6 +17,7 @@ from pathlib import Path
 import testtools
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 # Markers that indicate /etc/passwd or /etc/shadow content has leaked.
 # Used by assert_no_sensitive_content() across multiple test classes.
@@ -843,7 +844,7 @@ class TestCVEReproduction(InstarTestBase):
     def test_cve_2024_32498_convert_rejects_external_data_file(self):
         """Convert rejects image with external data file pointing to host path."""
         image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_instar_convert(image.path, out.name)
             self.assertNotEqual(
                 rc, 0,
@@ -880,7 +881,7 @@ class TestCVEReproduction(InstarTestBase):
     def test_cve_2015_5163_dotdot_convert_rejects(self):
         """Convert rejects image with ../ traversal backing path."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_instar_convert(image.path, out.name)
             self.assertNotEqual(
                 rc, 0,
@@ -928,8 +929,15 @@ class TestCVEReproduction(InstarTestBase):
     def test_cve_2022_47951_convert_no_shadow_content(self):
         """Converting VMDK with hostile extent does not produce /etc/shadow data."""
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            _ = self.run_instar_convert(image.path, out.name)
+        with ScratchFile(suffix='.raw') as out:
+            stdout, stderr, _rc = self.run_instar_convert(image.path, out.name)
+            self.assert_no_sensitive_content(
+                stdout + stderr, 'CVE-2022-47951 convert'
+            )
+            # A refused convert removes the output it left empty (#849);
+            # an absent output leaks nothing, so only read one that exists.
+            if not Path(out.name).exists():
+                return
             with open(out.name, 'rb') as f:
                 out_data = f.read(4096)
             for forbidden in [b'root:', b'daemon:', b'bin:']:
@@ -988,7 +996,7 @@ class TestCVEReproduction(InstarTestBase):
     def test_cve_2014_0223_convert_no_crash(self):
         """Convert on image with L1 overflow boundary does not crash."""
         image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],

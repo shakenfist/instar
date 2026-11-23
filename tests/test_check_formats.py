@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 
 class TestCheckFormatDetection(InstarTestBase):
@@ -432,11 +433,11 @@ class TestIncompatibleFeatureBits(InstarTestBase):
     def _create_patched_qcow2(self, incompat_bits):
         """Create a v3 QCOW2 and patch incompatible_features.
 
-        Returns a NamedTemporaryFile (caller must manage lifetime).
+        Returns a ScratchFile (caller must manage lifetime).
         The incompatible_features field is at offset 72, 8 bytes
         big-endian.
         """
-        f = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        f = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
              '-o', 'compat=1.1', f.name, '1M'],
@@ -517,7 +518,7 @@ class TestIncompatibleFeatureBits(InstarTestBase):
     def test_compare_rejects_unknown_feature_bit(self):
         """Compare should reject images with unknown feature bits."""
         with self._create_patched_qcow2(1 << 5) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+                ScratchFile(suffix='.raw') as raw:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -537,7 +538,7 @@ class TestIncompatibleFeatureBits(InstarTestBase):
     def test_convert_rejects_unknown_feature_bit(self):
         """Convert should reject images with unknown feature bits."""
         with self._create_patched_qcow2(1 << 5) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+                ScratchFile(suffix='.raw') as raw:
             stdout, stderr, rc = self.run_instar_convert(
                 Path(img.name), Path(raw.name)
             )
@@ -558,10 +559,10 @@ class TestZstdCompression(InstarTestBase):
     def _create_zstd_qcow2(self, size='1M', data_pattern=None):
         """Create a ZSTD-compressed QCOW2 and optionally write data.
 
-        Returns a NamedTemporaryFile (caller manages lifetime).
+        Returns a ScratchFile (caller manages lifetime).
         """
         # Create base raw with data
-        raw = tempfile.NamedTemporaryFile(suffix='.raw')
+        raw = ScratchFile(suffix='.raw')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'raw',
              raw.name, size],
@@ -572,7 +573,7 @@ class TestZstdCompression(InstarTestBase):
                 f.write(data_pattern)
 
         # Convert to ZSTD-compressed QCOW2
-        zstd = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        zstd = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'convert', '-f', 'raw',
              '-O', 'qcow2', '-c',
@@ -631,9 +632,9 @@ class TestZstdCompression(InstarTestBase):
         with self._create_zstd_qcow2(
             data_pattern=pattern
         ) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -666,7 +667,7 @@ class TestZstdCompression(InstarTestBase):
         with self._create_zstd_qcow2(
             data_pattern=pattern
         ) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as raw:
             # Create matching raw via qemu-img
             subprocess.run(
@@ -700,9 +701,9 @@ class TestExtendedL2(InstarTestBase):
     ):
         """Create an extended L2 QCOW2 image.
 
-        Returns a NamedTemporaryFile (caller manages lifetime).
+        Returns a ScratchFile (caller manages lifetime).
         """
-        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        img = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
              '-o', 'extended_l2=on',
@@ -760,9 +761,9 @@ class TestExtendedL2(InstarTestBase):
         with self._create_extended_l2_qcow2(
             data_pattern=0xCC
         ) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             # Convert with instar
             stdout, stderr, rc = self.run_instar_convert(
@@ -795,7 +796,7 @@ class TestExtendedL2(InstarTestBase):
         with self._create_extended_l2_qcow2(
             data_pattern=0xDD
         ) as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as raw:
             # Create matching raw via qemu-img
             subprocess.run(
@@ -824,13 +825,13 @@ class TestExtendedL2(InstarTestBase):
         with self._create_extended_l2_qcow2(
             data_pattern=0xEE
         ) as ext_img, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.qcow2'
                 ) as compressed, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw'
                 ) as instar_raw, \
-                tempfile.NamedTemporaryFile(
+                ScratchFile(
                     suffix='.raw'
                 ) as qemu_raw:
             # Re-encode with compression
@@ -890,9 +891,9 @@ class TestExtendedL2Subclusters(InstarTestBase):
         - Cluster 1: fully written (0xBB)
         - Rest: unallocated
 
-        Returns a NamedTemporaryFile.
+        Returns a ScratchFile.
         """
-        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        img = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
              '-o', 'extended_l2=on,cluster_size=65536',
@@ -923,9 +924,9 @@ class TestExtendedL2Subclusters(InstarTestBase):
         """Partially-allocated extended L2 cluster converts
         correctly when compared against qemu-img."""
         with self._create_partial_subcluster_qcow2() as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as instar_raw, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as qemu_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 Path(img.name), Path(instar_raw.name)
@@ -955,7 +956,7 @@ class TestExtendedL2Subclusters(InstarTestBase):
         """Zero subclusters produce zeros in output even though
         host data may exist at the cluster offset."""
         with self._create_partial_subcluster_qcow2() as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as instar_raw:
             stdout, stderr, rc = self.run_instar_convert(
                 Path(img.name), Path(instar_raw.name)
@@ -990,7 +991,7 @@ class TestExtendedL2Subclusters(InstarTestBase):
         """Compare extended L2 with partial subclusters against
         qemu-img convert output."""
         with self._create_partial_subcluster_qcow2() as img, \
-                tempfile.NamedTemporaryFile(suffix='.raw') \
+                ScratchFile(suffix='.raw') \
                 as raw:
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
@@ -1056,11 +1057,11 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
     def _make_allocated_ext_l2(self):
         """Create an extended-L2 QCOW2 with one allocated cluster.
 
-        Returns a NamedTemporaryFile with a clean image where cluster
+        Returns a ScratchFile with a clean image where cluster
         0 has data written (0xFF pattern). The first L2 entry will
         have a valid host offset and alloc_bits set by QEMU.
         """
-        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        img = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
              '-o', 'extended_l2=on,cluster_size=65536',
@@ -1167,7 +1168,7 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
         corruption."""
         with self._make_allocated_ext_l2() as img:
             # Create a compressed cluster first via qemu-io
-            img2 = tempfile.NamedTemporaryFile(suffix='.qcow2')
+            img2 = ScratchFile(suffix='.qcow2')
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
                  '-O', 'qcow2',
@@ -1224,7 +1225,7 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
         compressed entry, this pattern included, so instar does too.
         """
         with self._make_allocated_ext_l2() as img:
-            img2 = tempfile.NamedTemporaryFile(suffix='.qcow2')
+            img2 = ScratchFile(suffix='.qcow2')
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
                  '-O', 'qcow2',
@@ -1593,8 +1594,8 @@ class TestCheckCompressedLeaks(InstarTestBase):
 
     def test_compressed_zlib_no_leaks(self):
         """Zlib-compressed QCOW2 should have zero leaks."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as comp:
             # Create raw with data
             subprocess.run(
@@ -1633,8 +1634,8 @@ class TestCheckCompressedLeaks(InstarTestBase):
 
     def test_compressed_matches_qemu_img(self):
         """Compressed check results should match qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as comp:
             # Create raw with multiple data patterns
             subprocess.run(
@@ -1684,8 +1685,8 @@ class TestCheckCompressedLeaks(InstarTestBase):
 
     def test_compressed_multi_cluster_no_leaks(self):
         """Multi-cluster compressed image should have zero leaks."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(
                     suffix='.qcow2') as comp:
             # Create larger image with many clusters
             subprocess.run(
@@ -1729,7 +1730,7 @@ class TestCheckRefcountWidths(InstarTestBase):
 
     def _create_refcount_qcow2(self, refcount_bits):
         """Create a QCOW2 v3 image with a specific refcount width."""
-        f = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        f = ScratchFile(suffix='.qcow2')
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
              '-o', f'refcount_bits={refcount_bits}',
@@ -1859,7 +1860,7 @@ class TestCheckLargeCluster(InstarTestBase):
 
     def test_check_2mb_cluster_clean(self):
         """A clean 2MB-cluster QCOW2 should pass check."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.qcow2', delete=False
         ) as f:
             tmp = f.name
@@ -1917,7 +1918,7 @@ class TestCheckLargeCluster(InstarTestBase):
 
     def test_check_256k_cluster_clean(self):
         """A clean 256K-cluster QCOW2 should pass check."""
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
             suffix='.qcow2', delete=False
         ) as f:
             tmp = f.name

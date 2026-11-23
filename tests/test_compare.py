@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 
 class TestCompareRawIdentical(InstarTestBase):
@@ -18,7 +19,7 @@ class TestCompareRawIdentical(InstarTestBase):
 
     def test_compare_identical_self(self):
         """Comparing a raw image with itself returns identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f:
+        with ScratchFile(suffix='.raw') as f:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
@@ -32,8 +33,8 @@ class TestCompareRawIdentical(InstarTestBase):
 
     def test_compare_identical_two_files(self):
         """Two separate raw images with identical content are identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -51,7 +52,7 @@ class TestCompareRawIdentical(InstarTestBase):
 
     def test_compare_identical_matches_qemu(self):
         """Instar output matches qemu-img compare for identical images."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f:
+        with ScratchFile(suffix='.raw') as f:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
@@ -71,8 +72,8 @@ class TestCompareRawDifferent(InstarTestBase):
 
     def test_compare_different_content(self):
         """Raw images with different content report mismatch at offset 0."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -98,8 +99,8 @@ class TestCompareRawDifferent(InstarTestBase):
 
     def test_compare_mismatch_middle(self):
         """Mismatch in the middle of the file reports correct offset."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -124,8 +125,8 @@ class TestCompareRawDifferent(InstarTestBase):
 
     def test_compare_different_matches_qemu(self):
         """Instar output matches qemu-img compare for different images."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -154,8 +155,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_zeros_nonstrict(self):
         """Different sizes (extra zeros) in non-strict: identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -173,8 +174,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_zeros_nonstrict_matches_qemu(self):
         """Size mismatch (zeros) non-strict matches qemu-img output."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -194,8 +195,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_nonzero_nonstrict(self):
         """Different sizes with non-zero extra data: mismatch."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -221,8 +222,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_nonzero_nonstrict_matches_qemu(self):
         """Size mismatch with non-zero data matches qemu-img output."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -247,8 +248,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_strict(self):
         """Strict mode: size mismatch alone causes failure."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -267,8 +268,8 @@ class TestCompareRawSizeMismatch(InstarTestBase):
 
     def test_size_mismatch_strict_matches_qemu(self):
         """Strict size mismatch matches qemu-img -s output."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -349,7 +350,7 @@ class TestCompareRawJson(InstarTestBase):
 
     def test_identical_json(self):
         """JSON output for identical images."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f:
+        with ScratchFile(suffix='.raw') as f:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
@@ -365,8 +366,8 @@ class TestCompareRawJson(InstarTestBase):
 
     def test_different_json(self):
         """JSON output for different images."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -391,8 +392,8 @@ class TestCompareRawJson(InstarTestBase):
 
     def test_size_mismatch_json(self):
         """JSON output includes size-mismatch flag."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as f2:
+        with ScratchFile(suffix='.raw') as f1, \
+                ScratchFile(suffix='.raw') as f2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f1.name, '1M'],
                 capture_output=True
@@ -439,8 +440,8 @@ class TestCompareQcow2VsRaw(InstarTestBase):
 
     def test_qcow2_vs_raw_identical(self):
         """QCOW2 and raw with identical content are identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, qcow2.name)
             stdout, stderr, rc = self.run_instar_compare(
@@ -453,8 +454,8 @@ class TestCompareQcow2VsRaw(InstarTestBase):
 
     def test_qcow2_vs_raw_identical_matches_qemu(self):
         """QCOW2 vs raw identical matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, qcow2.name)
             instar_out, _, instar_rc = self.run_instar_compare(
@@ -468,9 +469,9 @@ class TestCompareQcow2VsRaw(InstarTestBase):
 
     def test_qcow2_vs_raw_different(self):
         """QCOW2 and raw with different content report mismatch."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw1, \
+                ScratchFile(suffix='.raw') as raw2, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             # Create raw with pattern 0xAA
             self._create_raw_with_data(raw1.name, pattern=0xAA)
             self._convert_to_qcow2(raw1.name, qcow2.name)
@@ -486,9 +487,9 @@ class TestCompareQcow2VsRaw(InstarTestBase):
 
     def test_qcow2_vs_raw_different_matches_qemu(self):
         """QCOW2 vs raw different matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as raw2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw1, \
+                ScratchFile(suffix='.raw') as raw2, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw1.name, pattern=0xAA)
             self._convert_to_qcow2(raw1.name, qcow2.name)
             self._create_raw_with_data(raw2.name, pattern=0xBB)
@@ -503,8 +504,8 @@ class TestCompareQcow2VsRaw(InstarTestBase):
 
     def test_qcow2_vs_raw_all_zeros(self):
         """QCOW2 and raw with all-zero content are identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  raw.name, '1M'],
@@ -550,9 +551,9 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_identical(self):
         """Two QCOW2 images with identical content are identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(raw.name, q2.name)
@@ -566,9 +567,9 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_identical_matches_qemu(self):
         """QCOW2 vs QCOW2 identical matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(raw.name, q2.name)
@@ -583,10 +584,10 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_different(self):
         """Two QCOW2 images with different content report mismatch."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as r1, \
+                ScratchFile(suffix='.raw') as r2, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(r1.name, pattern=0xAA)
             self._create_raw_with_data(r2.name, pattern=0xBB)
             self._convert_to_qcow2(r1.name, q1.name)
@@ -601,10 +602,10 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_different_matches_qemu(self):
         """QCOW2 vs QCOW2 different matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as r1, \
+                ScratchFile(suffix='.raw') as r2, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(r1.name, pattern=0xAA)
             self._create_raw_with_data(r2.name, pattern=0xBB)
             self._convert_to_qcow2(r1.name, q1.name)
@@ -620,10 +621,10 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_size_mismatch(self):
         """QCOW2 images with different virtual sizes."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as r1, \
+                ScratchFile(suffix='.raw') as r2, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  r1.name, '1M'],
@@ -645,10 +646,10 @@ class TestCompareQcow2VsQcow2(InstarTestBase):
 
     def test_qcow2_vs_qcow2_size_mismatch_matches_qemu(self):
         """QCOW2 size mismatch matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as r1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as r2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as r1, \
+                ScratchFile(suffix='.raw') as r2, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  r1.name, '1M'],
@@ -701,8 +702,8 @@ class TestCompareQcow2Compressed(InstarTestBase):
 
     def test_compressed_qcow2_vs_raw_identical(self):
         """Compressed QCOW2 vs raw with same content: identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(
                 raw.name, qcow2.name, compressed=True
@@ -717,8 +718,8 @@ class TestCompareQcow2Compressed(InstarTestBase):
 
     def test_compressed_qcow2_vs_raw_matches_qemu(self):
         """Compressed QCOW2 vs raw matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(
                 raw.name, qcow2.name, compressed=True
@@ -734,9 +735,9 @@ class TestCompareQcow2Compressed(InstarTestBase):
 
     def test_compressed_vs_uncompressed_qcow2_identical(self):
         """Compressed vs uncompressed QCOW2 with same content."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(
@@ -752,9 +753,9 @@ class TestCompareQcow2Compressed(InstarTestBase):
 
     def test_compressed_vs_uncompressed_matches_qemu(self):
         """Compressed vs uncompressed matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as q2:
+        with ScratchFile(suffix='.raw') as raw, \
+                ScratchFile(suffix='.qcow2') as q1, \
+                ScratchFile(suffix='.qcow2') as q2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(
@@ -818,9 +819,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_qcow2_with_backing_vs_raw_identical(self):
         """QCOW2 overlay with backing vs flattened raw is identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(base.name)
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name)
@@ -835,9 +836,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_qcow2_with_backing_vs_raw_matches_qemu(self):
         """QCOW2 overlay vs flattened raw matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(base.name)
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name)
@@ -853,9 +854,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_qcow2_with_backing_vs_raw_different(self):
         """QCOW2 overlay vs different raw reports mismatch."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as diff:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as diff:
             self._create_raw_with_data(base.name, pattern=0xAA)
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name, pattern=0xBB)
@@ -872,9 +873,9 @@ class TestCompareBackingChain(InstarTestBase):
         self
     ):
         """QCOW2 overlay vs different raw matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as diff:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as diff:
             self._create_raw_with_data(base.name, pattern=0xAA)
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name, pattern=0xBB)
@@ -892,10 +893,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_deep_chain_vs_raw_identical(self):
         """3-level chain vs flattened raw is identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as mid, \
+                ScratchFile(suffix='.qcow2') as top, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0x11
             )
@@ -922,10 +923,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_deep_chain_vs_raw_matches_qemu(self):
         """3-level chain vs flattened raw matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as mid, \
+                ScratchFile(suffix='.qcow2') as top, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0x11
             )
@@ -953,10 +954,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_both_chains_identical(self):
         """Two chains with same virtual content are identical."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ba, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as oa, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as bb, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ob:
+        with ScratchFile(suffix='.raw') as ba, \
+                ScratchFile(suffix='.qcow2') as oa, \
+                ScratchFile(suffix='.raw') as bb, \
+                ScratchFile(suffix='.qcow2') as ob:
             # Chain A: base has 0xAA, overlay adds 0xBB
             self._create_raw_with_data(
                 ba.name, pattern=0xAA
@@ -984,10 +985,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_both_chains_identical_matches_qemu(self):
         """Two chains with same content matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as ba, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as oa, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as bb, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ob:
+        with ScratchFile(suffix='.raw') as ba, \
+                ScratchFile(suffix='.qcow2') as oa, \
+                ScratchFile(suffix='.raw') as bb, \
+                ScratchFile(suffix='.qcow2') as ob:
             self._create_raw_with_data(
                 ba.name, pattern=0xAA
             )
@@ -1013,9 +1014,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_overlay_no_writes_vs_raw_identical(self):
         """Overlay with no writes (100% from backing) vs raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0xCC
             )
@@ -1032,9 +1033,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_overlay_no_writes_vs_raw_matches_qemu(self):
         """Overlay with no writes matches qemu-img compare."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as ov, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0xCC
             )
@@ -1051,10 +1052,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_chains_different_virtual_sizes(self):
         """Two chains with different virtual sizes, zero-fill tail."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as b1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as o1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as b2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as o2:
+        with ScratchFile(suffix='.raw') as b1, \
+                ScratchFile(suffix='.qcow2') as o1, \
+                ScratchFile(suffix='.raw') as b2, \
+                ScratchFile(suffix='.qcow2') as o2:
             # Chain 1: 1M with data at offset 0
             self._create_raw_with_data(
                 b1.name, size='1M', pattern=0xAA
@@ -1077,10 +1078,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_chains_different_virtual_sizes_matches_qemu(self):
         """Chains with different sizes matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as b1, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as o1, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as b2, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as o2:
+        with ScratchFile(suffix='.raw') as b1, \
+                ScratchFile(suffix='.qcow2') as o1, \
+                ScratchFile(suffix='.raw') as b2, \
+                ScratchFile(suffix='.qcow2') as o2:
             self._create_raw_with_data(
                 b1.name, size='1M', pattern=0xAA
             )
@@ -1100,10 +1101,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_passthrough_intermediate_vs_raw_identical(self):
         """Chain with empty intermediate overlay vs flattened raw."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as mid, \
+                ScratchFile(suffix='.qcow2') as top, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0x55
             )
@@ -1128,10 +1129,10 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_passthrough_intermediate_vs_raw_matches_qemu(self):
         """Empty intermediate overlay matches qemu-img."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as mid, \
+                ScratchFile(suffix='.qcow2') as top, \
+                ScratchFile(suffix='.raw') as flat:
             self._create_raw_with_data(
                 base.name, pattern=0x55
             )
@@ -1155,9 +1156,9 @@ class TestCompareBackingChain(InstarTestBase):
 
     def test_corrupt_backing_chain_image(self):
         """Corrupt QCOW2 header in backing file is handled."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
-                tempfile.NamedTemporaryFile(suffix='.qcow2') as top:
+        with ScratchFile(suffix='.raw') as base, \
+                ScratchFile(suffix='.qcow2') as mid, \
+                ScratchFile(suffix='.qcow2') as top:
             self._create_raw_with_data(base.name)
             self._create_overlay(base.name, mid.name)
             self._write_to_qcow2(mid.name, pattern=0xDD)
@@ -1188,7 +1189,7 @@ class TestCompareLuksQcow2(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_out:
             # First convert LUKS-QCOW2 to raw using instar
             stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
@@ -1217,7 +1218,7 @@ class TestCompareLuksQcow2(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_out:
             # Create a small raw file for comparison target
             with open(raw_out.name, 'wb') as f:
                 f.write(b'\x00' * 1048576)
@@ -1236,7 +1237,7 @@ class TestCompareLuksQcow2(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+        with ScratchFile(suffix='.raw') as raw_out:
             # Create a small raw file for comparison target
             with open(raw_out.name, 'wb') as f:
                 f.write(b'\x00' * 1048576)
@@ -1333,7 +1334,7 @@ class TestCompareDmg(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as qemu_raw:
             q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(qemu_raw.name), timeout=120
             )
@@ -1364,7 +1365,7 @@ class TestCompareDmg(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as qemu_raw:
             _, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(qemu_raw.name), timeout=120)
             self.assertEqual(
@@ -1437,7 +1438,7 @@ class TestCompareVdi(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as qemu_raw:
             q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(qemu_raw.name), timeout=120
             )
@@ -1469,7 +1470,7 @@ class TestCompareVdi(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.vdi') as vdi_copy:
+        with ScratchFile(suffix='.vdi') as vdi_copy:
             result = subprocess.run(
                 ['qemu-img', 'convert', '-O', 'vdi',
                  str(image.path), vdi_copy.name],
@@ -1539,7 +1540,7 @@ class TestCompareParallels(InstarTestBase):
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+        with ScratchFile(suffix='.raw') as qemu_raw:
             q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
                 image.path, Path(qemu_raw.name), timeout=120
             )
@@ -1670,7 +1671,7 @@ class TestCompareQcow1(InstarTestBase):
         instar's backing fall-through composes the same bytes qemu does.
         """
         (img,) = self._skip_unless('qcow1-backing')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+        with ScratchFile(suffix='.raw') as flat:
             _, q_stderr, q_rc = self.run_qemu_img_convert(
                 img.path, Path(flat.name), timeout=120)
             self.assertEqual(

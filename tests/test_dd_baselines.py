@@ -46,10 +46,10 @@ stay in sync. Drift is surfaced by ``test_dd_cases_match_baselines``.
 
 import json
 import subprocess
-import tempfile
 
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
+from helpers.scratch import ScratchFile
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ _INSTAR_TO_INFO_JSON_FMT = {
     'vhd': 'vpc',
 }
 
-# File-suffix for each output format (for NamedTemporaryFile).
+# File-suffix for each output format (for ScratchFile).
 _FMT_SUFFIX = {
     'raw':   '.raw',
     'qcow2': '.qcow2',
@@ -341,8 +341,8 @@ def _make_dd_baseline_test(case):
         # by qemu-img info (known open limitation). Assert exit 0 only.
         if skip_info:
             with (
-                tempfile.NamedTemporaryFile(suffix=in_suffix) as tmp_in,
-                tempfile.NamedTemporaryFile(suffix=out_suffix) as tmp_out,
+                ScratchFile(suffix=in_suffix) as tmp_in,
+                ScratchFile(suffix=out_suffix) as tmp_out,
             ):
                 subprocess.run(
                     ['qemu-img', 'create', '-f', input_format,
@@ -367,8 +367,8 @@ def _make_dd_baseline_test(case):
 
         # Normal path: create fixture, run instar dd, info-compare.
         with (
-            tempfile.NamedTemporaryFile(suffix=in_suffix) as tmp_in,
-            tempfile.NamedTemporaryFile(suffix=out_suffix) as tmp_out,
+            ScratchFile(suffix=in_suffix) as tmp_in,
+            ScratchFile(suffix=out_suffix) as tmp_out,
         ):
             # Create the fixture (no data needed — virtual-size rounding
             # is data-independent; actual-size is normalised at compare time).

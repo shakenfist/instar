@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 
 #: The exit codes `instar compare` gives an image it refuses: qemu-img's
@@ -78,7 +79,7 @@ class TestAdversarialCompressionBomb(InstarTestBase):
 
     def test_convert_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -104,7 +105,7 @@ class TestAdversarialCompressionBomb(InstarTestBase):
 
     def test_convert_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _ = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -138,7 +139,7 @@ class TestAdversarialCircularChain(InstarTestBase):
 
     def test_convert_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -157,7 +158,7 @@ class TestAdversarialCircularChain(InstarTestBase):
 
     def test_convert_circular_3(self):
         image = self.get_adversarial_image('qcow2-circular-3')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -176,7 +177,7 @@ class TestAdversarialCircularChain(InstarTestBase):
 
     def test_convert_self_referencing(self):
         image = self.get_adversarial_image('qcow2-self-referencing')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -196,7 +197,7 @@ class TestAdversarialDeepChain(InstarTestBase):
         exceeds the 16-device maximum. This should be rejected cleanly.
         """
         image = self.get_adversarial_image('qcow2-chain-depth-16')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -210,7 +211,7 @@ class TestAdversarialDeepChain(InstarTestBase):
     def test_convert_chain_depth_17(self):
         """Chain at 17 levels should be rejected."""
         image = self.get_adversarial_image('qcow2-chain-depth-17')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -455,7 +456,7 @@ class TestAdversarialIntegerOverflow(InstarTestBase):
 
     def test_convert_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _, _, _ = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -464,7 +465,7 @@ class TestAdversarialIntegerOverflow(InstarTestBase):
 
     def test_convert_cluster_bits_low(self):
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _, _, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -619,7 +620,7 @@ class TestAdversarialBatBeyondEof(InstarTestBase):
 
     def test_convert_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -642,7 +643,7 @@ class TestAdversarialBatBeyondEof(InstarTestBase):
 
     def test_convert_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -676,7 +677,7 @@ class TestAdversarialPolyglot(InstarTestBase):
 
     def test_convert_polyglot_qcow2_vmdk(self):
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -700,7 +701,7 @@ class TestAdversarialPolyglot(InstarTestBase):
 
     def test_convert_polyglot_qcow2_elf(self):
         image = self.get_adversarial_image('polyglot-qcow2-elf')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             _ = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -733,7 +734,7 @@ class TestAdversarialTruncatedHeader(InstarTestBase):
 
     def test_convert_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -756,7 +757,7 @@ class TestAdversarialTruncatedHeader(InstarTestBase):
 
     def test_convert_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -779,7 +780,7 @@ class TestAdversarialTruncatedHeader(InstarTestBase):
 
     def test_convert_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
@@ -895,7 +896,7 @@ class TestAdversarialDmgManifest(InstarTestBase):
     def _run_convert(self, image_path):
         """Run convert against a fixture path; assert no hang/crash and
         bounded output.  Returns (stdout, stderr, rc)."""
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert', '-O', 'raw',
                  str(image_path), out.name],
@@ -1079,7 +1080,7 @@ class TestAdversarialDmgReaderRefusals(InstarTestBase):
         image = self.get_adversarial_image(image_id)
         instar = str(self.get_instar_binary())
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             # convert: must refuse, non-zero, non-empty message, no crash.
             c_out, c_err, c_rc = self.run_adversarial(
                 [instar, 'convert', '-O', 'raw', str(image.path), out.name],
@@ -1105,7 +1106,7 @@ class TestAdversarialDmgReaderRefusals(InstarTestBase):
         )
         assert_compare_refused(self, m_out, m_err, m_rc, image_id)
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+        with ScratchFile(suffix='.raw') as out:
             d_out, d_err, d_rc = self.run_adversarial(
                 [instar, 'dd', '-O', 'raw',
                  f'if={image.path}', f'of={out.name}'],
@@ -1217,8 +1218,8 @@ class TestAdversarialVdiManifest(InstarTestBase):
         image = self.get_adversarial_image(image_id)
         instar = str(self.get_instar_binary())
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+        with ScratchFile(suffix='.raw') as out, \
+                ScratchFile(suffix='.raw') as other:
             # A tiny raw file to compare against.
             Path(other.name).write_bytes(bytes(512))
 
@@ -1336,8 +1337,8 @@ class TestAdversarialParallelsManifest(InstarTestBase):
         image = self.get_adversarial_image(image_id)
         instar = str(self.get_instar_binary())
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+        with ScratchFile(suffix='.raw') as out, \
+                ScratchFile(suffix='.raw') as other:
             # A tiny raw file to compare against.
             Path(other.name).write_bytes(bytes(512))
 
@@ -1448,8 +1449,8 @@ class TestAdversarialQcow1Manifest(InstarTestBase):
         image = self.get_adversarial_image(image_id)
         instar = str(self.get_instar_binary())
 
-        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
-                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+        with ScratchFile(suffix='.raw') as out, \
+                ScratchFile(suffix='.raw') as other:
             Path(other.name).write_bytes(bytes(512))
 
             # convert: must refuse, non-zero, non-empty message, no hang.

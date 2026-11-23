@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 
 
 # Mirror of SIZE_CASES from instar-testdata/scripts/generate-baselines.py.
@@ -1059,12 +1060,11 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         per-format cushion to absorb writer-side alignment artefacts).
         """
         import os
-        import tempfile
 
         cushion = self._CUSHION[target]
         ext = self._EXT[target]
 
-        with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as src_f:
+        with ScratchFile(suffix='.raw', delete=False) as src_f:
             src_path = src_f.name
 
         # Register cleanup before anything that might raise.
@@ -1086,7 +1086,7 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         fully_allocated = m['fully-allocated']
 
         # 2. instar convert <empty raw> -O target out.<ext>
-        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as out_f:
+        with ScratchFile(suffix=f'.{ext}', delete=False) as out_f:
             out_path = out_f.name
         self.addCleanup(lambda p=out_path: os.unlink(p) if os.path.exists(p) else None)
 
@@ -1116,7 +1116,6 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         per-format cushion).
         """
         import os
-        import tempfile
 
         cushion = self._CUSHION[target]
         ext = self._EXT[target]
@@ -1135,7 +1134,7 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         fully_allocated = m['fully-allocated']
 
         # 2. instar convert <image> -O target out.<ext>
-        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as out_f:
+        with ScratchFile(suffix=f'.{ext}', delete=False) as out_f:
             out_path = out_f.name
         self.addCleanup(lambda p=out_path: os.unlink(p) if os.path.exists(p) else None)
 

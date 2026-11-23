@@ -56,6 +56,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.scratch import ScratchFile
 from helpers.snapshot_readback import snapshot_readback
 
 
@@ -1019,7 +1020,7 @@ class TestBenchWrite(BenchTestBase):
         ptrace over a KVM guest is slow, hence the generous timeout.
         """
         instar = self.get_instar_binary()
-        with tempfile.NamedTemporaryFile(
+        with ScratchFile(
                 mode='r', suffix='.strace', delete=False) as tf:
             trace_path = tf.name
         try:
