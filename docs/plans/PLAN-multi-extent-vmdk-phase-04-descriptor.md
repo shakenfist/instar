@@ -647,3 +647,58 @@ is what makes a gap fail. And step 4d now names
 `TestQemuPinCases` in `tests/test_helpers.py` as its pattern: a plain
 `unittest.TestCase` reading the pin with no testdata dependency,
 where the brief would otherwise have led to `InstarTestBase`.
+
+**Step 4d, 2026-11-24.** `tests/test_vmdk_split_descriptor_pins.py`,
+four tests, run directly rather than through Docker because the module
+imports only the standard library and `helpers.qemu_pins`. All
+fourteen literals matched first time, and the fixture check did not
+skip on this host.
+
+The guard was proved to fail twice, on different constants: by its
+author on the 21 GiB cylinder count, and in review on the 2049 MiB
+case's short last extent, each naming the right case with a readable
+diff. Both restorations were `cp` from a copy, verified with `cmp`,
+never `git checkout` -- there was uncommitted work in the tree
+throughout.
+
+Scope grew by one check beyond the row, deliberately.
+`QEMU_SPLIT_SPARSE_33G` is hand-copied from the testdata fixture and
+nothing guarded *that* copy either, which is the same gap decision 8
+exists to close and which the row had simply missed. It skips when the
+testdata clone is absent, which is legitimate because testdata is a
+separate git-LFS repository; a skip would not be acceptable for the
+pin checks, since the pin file is committed here.
+
+What the guard still does not check is which literal each table row
+uses, so a row pointing at the wrong constant would pass it. The
+crate's parity test covers exactly that, because the emitter's output
+for one case's size cannot match another case's text. The two together
+close it and neither does alone.
+
+**Step 4e, 2026-11-25 (AEDT).** Run by the management session rather
+than a sub-agent, which is a departure from the step table. The step
+is three GitHub issues whose text is public the moment it exists, two
+paragraphs of format reference, and three Future work entries that
+have to cite issue numbers which do not exist until the issues are
+filed. Briefing that was more work than doing it, and the issue
+wording went to the operator for review first; he approved all three
+as drafted.
+
+Filed: [#964](https://github.com/shakenfist/instar/issues/964), the
+`ddb.*` retrofit open question 3 asks for;
+[#965](https://github.com/shakenfist/instar/issues/965), the five
+descriptor builders; and
+[#966](https://github.com/shakenfist/instar/issues/966), the
+`snprintf` interface the operator asked to have revisited. All three
+are in the master plan's Future work, together with a fourth entry for
+extending step 4d's guard to the VHDX literals, which are copied from
+the same pin file with nothing checking them.
+
+`docs/vmdk/vmdk-extents.md`'s *Split Image Layout* section gained the
+extent naming rule, the zero-padding floor, the geometry derivation
+with its missing 65535 clamp, and the measurement that a split-sparse
+extent's own 20 reserved descriptor sectors are left zero. The
+*instar support* section was deliberately left alone: it describes
+input variants, and this phase changed nothing a user can reach. No
+changelog entry, because the repository keeps none and a hook refuses
+one.

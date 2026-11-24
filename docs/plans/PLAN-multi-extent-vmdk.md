@@ -839,9 +839,42 @@ Status line above.
 
 Filled in as the plan runs. Already known:
 
-* Retrofitting `ddb.*` onto `monolithicSparse`, `streamOptimized` and
+* [#964](https://github.com/shakenfist/instar/issues/964), retrofitting
+  `ddb.*` onto `monolithicSparse`, `streamOptimized` and
   `monolithicFlat` descriptors (open question 3), which churns every
   existing VMDK baseline and wants its own differential-fuzz exposure.
+  Filed by phase 4, which resolved open question 3 by writing the block
+  on the new subformats only. qemu writes it for `monolithicFlat` too,
+  so this is a live divergence rather than only an internal
+  inconsistency, and until it lands instar's VMDK subformats disagree
+  with each other.
+
+* [#965](https://github.com/shakenfist/instar/issues/965), five VMDK
+  descriptor builders across the `vmdk` and `create` crates, one of
+  them re-implementing another because the first hard-codes
+  `parentCID` and has no hook for a parent filename, and carrying a
+  second copy of the decimal formatter. The master plan's phase 4
+  intent assumed there was one; the survey found four, and phase 4
+  added the fifth rather than unifying them, which would have touched
+  every VMDK instar writes.
+
+* [#966](https://github.com/shakenfist/instar/issues/966), the
+  descriptor builders' `snprintf` interface -- return the length
+  needed, copy only what fits -- which is not idiomatic Rust and
+  leaves a caller that does not measure first writing a silently
+  truncated descriptor. Unreachable while every descriptor was a
+  fixed length; reachable from phase 4, because a split descriptor's
+  length grows with its extent count. Raised at phase 4's back brief,
+  where the operator kept the contract for now and asked for this
+  issue.
+
+* Extending phase 4's pin-literal guard,
+  `tests/test_vmdk_split_descriptor_pins.py`, to the VHDX literals in
+  `src/crates/create/tests/round_trip.rs`. Those are copied from the
+  same pin file by hand for the same reason -- the Rust workspace has
+  no JSON parser -- and nothing checks that copy either. The guard is
+  about thirty lines of Python per literal family and would have
+  caught a drifted VHDX expectation as readily as a VMDK one.
 * `twoGbMaxExtent*` as a backing file or in a backing chain, excluded
   from scope above.
 * `instar map` on flat sources, which is refused today for all flat
