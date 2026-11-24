@@ -841,3 +841,75 @@ What was re-run for the round, on the round's own tree:
 | `tests/test_vmdk_split_descriptor_pins.py` | 4 tests, none skipped |
 | The same module with `INSTAR_TESTDATA_PATH` at an empty directory | 1 failure naming the missing fixture, no skip |
 | `tools/ci/check-test-partition.sh` | PASS, halves cover the baseline exactly |
+
+## Review round 2 (2026-11-25, AEDT)
+
+No `fix` items: 2 document, 5 consider, 3 informational. Both document
+items were taken, and three of the five optional ones.
+
+The useful finding was that a zero-extent layout emits a descriptor the
+crate's own `parse_descriptor_extents` refuses as `NoExtents`, so the
+emitter can write something instar cannot read. Nothing was wrong --
+`split_layout(0, ..)` has always been documented as this function's own
+choice of the least surprising answer, no pin covers it, and there is no
+caller -- but no test emitted a descriptor at that size, so the fact was
+incidental rather than pinned. It is now a test, and the two bounds a
+caller must apply beyond the cost bound (refuse a zero size; cap
+`extent_count` at `MAX_EXTENTS` if the output is to be readable) are
+stated in the rustdoc where phase 5's author will read them rather than
+only in decision 6 here.
+
+Two test gaps were taken on the same reasoning as round 1's. The
+`offset` parameter had no test distinguishing it from a hardcoded zero:
+every test passed either 0 or a value past the end of the buffer, so the
+one piece of arithmetic the parameter exists for was unexercised. And
+`split_descriptor_measured_length_equals_written_length` asserted
+`buf[written] == 0`, which only caught an overrun because the buffer was
+zero-filled and every emitted byte happens to be non-zero ASCII; it now
+fills with 0xAA and checks the whole tail, so its teeth come from the
+sentinel rather than from the initialiser. Both are the same class as
+the three this phase has already found: an assertion that holds for a
+reason other than the property it names.
+
+Two items were declined. The reviewer proposed exporting an extent-name
+safety predicate from the crate so phase 5 and the guest writers share
+one rule instead of re-deriving the host's. The argument is good -- five
+descriptor builders exist in this tree precisely because rules got
+re-derived -- but where the refusal lives is open question 4, which is
+the operator's to resolve and is explicitly phase 5's, so adding the
+predicate here would pre-empt a decision this phase was told not to
+take. **Note for phase 5:** when open question 4 is settled, the
+predicate belongs beside the emitter in the vmdk crate rather than only
+in `vmdk_flat_extent_path`, with a unit test per rejected byte, so the
+guest-side writers in phases 10 and 11 call it rather than copy it. The
+other declined item was loading the pin file once per module instead of
+once per case, which the reviewer itself scoped as tidiness worth
+milliseconds in a suite measured in minutes.
+
+Round 2's prose finding was fair and is fixed: the group paragraph in
+`docs/testing.md` called two different cases "the last" and listed the
+seven out of script order. The seven sentences now run in the order
+`tools/mutate-differencing.sh` invokes them, and only the last one says
+so.
+
+With no `fix` item live the loop exits here rather than going a third
+round. Round 2 raised nothing about code round 1 added, which is the
+trajectory that matters: the reviewer is a generator with no notion of
+good enough, and the stopping rule is an empty `fix` column.
+
+What was re-run for round 2:
+
+| Check | Result |
+|-------|--------|
+| `pre-commit run --all-files` | all hooks pass |
+| `make test-rust` | 3117 passed, 0 failed |
+| `tools/mutate-differencing.sh --check-patterns` | 179 patterns, 179 land, 0 drifted |
+| A hand-run mutant ignoring `offset` | killed `split_descriptor_writes_at_an_offset_within_the_buffer`; not kept, and the harness is back to 179 cases |
+
+The offset mutant needed `let mut pos = 0usize` rather than `0`: the
+untyped literal makes `saturating_add` ambiguous, and the harness scores
+a mutant that will not compile as BROKEN rather than killed, which is
+the right answer and not a pass. The strengthened overrun assertion was
+not mutated, because a sentinel fill checked across the whole tail is
+strictly stronger than a zero fill checked at one index -- there is no
+behaviour the old form caught that the new one does not.

@@ -476,6 +476,16 @@ fn format_u64_padded(mut val: u64, min_width: usize, buf: &mut [u8; 20]) -> &[u8
 /// measuring call alone. A caller must bound the virtual size before it
 /// measures, not only before it writes. That matters most for a size
 /// derived from an image rather than from an argument.
+///
+/// Two further bounds are the caller's, and both are narrower than the
+/// cost bound. A layout of zero extents emits a descriptor with no
+/// extent lines at all, which `parse_descriptor_extents` refuses as
+/// `NoExtents`, so a caller must refuse a zero virtual size rather than
+/// write a descriptor instar cannot read. And past `MAX_EXTENTS`
+/// extents the descriptor is well formed but still unreadable here, for
+/// `TooManyExtents`: the read side is capped by the guest configuration
+/// page and the write side is not, so a caller that wants its own
+/// output readable must bound `extent_count` at `MAX_EXTENTS`.
 pub fn build_split_descriptor(
     buf: &mut [u8],
     offset: usize,
@@ -2969,14 +2979,41 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
                 let layout = split_layout(extents * SPLIT_EXTENT_SECTORS * 512, kind);
                 let measured = build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk");
                 assert!(measured < DESC_BUF);
-                let mut buf = [0u8; DESC_BUF];
+                let mut buf = [0xAAu8; DESC_BUF];
                 let written = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
                 assert_eq!(measured, written, "{extents} extents, {kind:?}");
                 assert_eq!(buf[written - 1], b'\n');
-                assert_eq!(buf[written], 0, "wrote past the reported length");
+                // A sentinel rather than a zero fill, over the whole tail
+                // rather than one position: zero would be caught only
+                // because every emitted byte happens to be non-zero ASCII,
+                // and one position would miss a discontiguous write.
+                assert!(
+                    buf[written..].iter().all(|&b| b == 0xAA),
+                    "wrote past the reported length: {extents} extents, {kind:?}"
+                );
             }
         }
         assert!(split_len(1000, SplitKind::Sparse) > split_len(17, SplitKind::Sparse));
+    }
+
+    #[test]
+    fn split_descriptor_of_no_extents_is_one_the_parser_refuses() {
+        let layout = split_layout(0, SplitKind::Sparse);
+        assert_eq!(layout.extent_count, 0);
+        let mut buf = [0u8; 1024];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        // Well formed, and empty of extents: the header, the geometry and
+        // no `RW` line anywhere.
+        assert!(text.contains("createType=\"twoGbMaxExtentSparse\"\n"));
+        assert!(text.contains("ddb.geometry.cylinders = \"0\"\n"));
+        assert!(!text.contains("RW "));
+        // So the crate can write a descriptor it cannot read. A caller has
+        // to refuse the size; this pins what happens if one does not.
+        assert!(matches!(
+            parse_descriptor_extents(text),
+            Err(ExtentParseError::NoExtents)
+        ));
     }
 
     #[test]
@@ -3012,6 +3049,22 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
         let got = build_split_descriptor(&mut buf, 1 << 20, &layout, b"image", b".vmdk");
         assert_eq!(got, need);
         assert_eq!(buf, [0x55u8; 8]);
+    }
+
+    #[test]
+    fn split_descriptor_writes_at_an_offset_within_the_buffer() {
+        let layout = split_layout(GIB, SplitKind::Sparse);
+        let mut plain = [0u8; 1024];
+        let n = build_split_descriptor(&mut plain, 0, &layout, b"image", b".vmdk");
+
+        // The same descriptor, written 16 bytes in. The return value is the
+        // descriptor's length, not the position the cursor ended at.
+        let mut buf = [0x5Au8; 1024];
+        let got = build_split_descriptor(&mut buf, 16, &layout, b"image", b".vmdk");
+        assert_eq!(got, n);
+        assert!(buf[..16].iter().all(|&b| b == 0x5A));
+        assert_eq!(buf[16..16 + n], plain[..n]);
+        assert!(buf[16 + n..].iter().all(|&b| b == 0x5A));
     }
 
     #[test]

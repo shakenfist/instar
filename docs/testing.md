@@ -3099,26 +3099,30 @@ descriptor is compared byte for byte against what every pinned qemu-img
 build writes, so most of these are caught by that comparison; what the
 group is really checking is that a narrow test notices each one too,
 because a single broad golden comparison tells you something broke
-without saying what. One drops the `ddb.toolsVersion` line qemu has
-written since 6.2.0. One gives a sparse layout the flat `-f` name
-infix, so every extent line names a file that was never written. One
-removes the blank line between `#DDB` and the first `ddb.` line, which
-is the one piece of whitespace the three single-extent emitters do not
-have and so the easiest to copy wrongly. One stops clamping the final
-extent to the remainder, so a 5 GiB image claims three full 2 GiB
-extents and over-reports its own size; it is caught in the layout
-rather than the descriptor, because that is where the clamp lives. The
-last formats the extent index to a floor of two digits instead of
-three, turning `image-s001.vmdk` into `image-s01.vmdk`. One drops the
-` 0` start offset from a flat extent line, which is the only one of the
-four differences between the two subformats that had no narrow test of
-its own until this case was added. The last makes a `put` that does not
-fit copy the bytes that do, instead of skipping the write whole, which
-is the buffer contract every descriptor builder in the crate shares and
-the one thing a short-buffer test can check that a full-buffer test
-cannot.
+without saying what. They are described here in the order the script
+runs them, so the group can be checked against `rust_case` entries
+without matching prose to code by hand.
 
-That last case is why the group exists in this form. The test named for
+The first drops the `ddb.toolsVersion` line qemu has written since
+6.2.0. The second gives a sparse layout the flat `-f` name infix, so
+every extent line names a file that was never written. The third
+formats the extent index to a floor of two digits instead of three,
+turning `image-s001.vmdk` into `image-s01.vmdk`. The fourth stops
+clamping the final extent to the remainder, so a 5 GiB image claims
+three full 2 GiB extents and over-reports its own size; it is caught in
+the layout rather than the descriptor, because that is where the clamp
+lives. The fifth removes the blank line between `#DDB` and the first
+`ddb.` line, which is the one piece of whitespace the three
+single-extent emitters do not have and so the easiest to copy wrongly.
+The sixth drops the ` 0` start offset from a flat extent line, the only
+one of the four differences between the two subformats that had no
+narrow test of its own until that case was added. The last makes a
+`put` that does not fit copy the bytes that do, instead of skipping the
+write whole, which is the buffer contract every descriptor builder in
+the crate shares and the one thing a short-buffer test can check that a
+full-buffer test cannot.
+
+The third case is why the group exists in this form. The test named for
 the padding rule asserted only that `image-s999.vmdk` and
 `image-s1000.vmdk` appear, which checks that three digits is not a
 *cap* -- both print in full at any width -- and never that it is a
