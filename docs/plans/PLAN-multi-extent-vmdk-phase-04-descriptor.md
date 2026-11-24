@@ -1,6 +1,6 @@
 # Multi-extent VMDK phase 4: the descriptor emitter
 
-## Status: Planned
+## Status: In progress
 
 Master plan: `PLAN-multi-extent-vmdk.md`.
 
@@ -279,6 +279,12 @@ is written against, with a comment saying so; and `snprintf` semantics
 are a correct API rather than a workaround -- the hazard is a caller
 that ignores the return value, not the contract.
 
+**Amended at the back brief, 2026-11-24:** keep `snprintf` semantics
+for now, and file an issue to revisit whether the interface should be
+done the idiomatic Rust way -- a `Result`, or a writer the caller
+feeds -- across all five builders rather than only the new one. Step
+4e files it, and this plan does not pre-empt its answer.
+
 The cost is real and worth stating. Today no caller can get it wrong,
 because every descriptor is a fixed length that fits any buffer anyone
 would pass. A split descriptor is as long as its extent count makes
@@ -393,7 +399,7 @@ one. Release notes go on the GitHub release; see "Releases" in
 | 4b | medium | sonnet | none | **The emitter.** In the same file, add `pub fn build_split_descriptor(buf: &mut [u8], offset: usize, layout: &SplitLayout, prefix: &[u8], postfix: &[u8]) -> usize`. Follow `build_flat_descriptor` at `src/crates/vmdk/src/lib.rs:266` exactly for structure and for the `put` closure: advance the cursor past the end of the buffer, copy only when the write fits, return the needed length. **Do not return a `Result` and do not change the existing builders** -- see decision 2; the host caller at `src/vmm/src/main.rs:16988` measures with an empty slice and depends on this. Emit, in order: the five fixed header lines with `CID=fffffffe` and `parentCID=ffffffff`; `createType="twoGbMaxExtentSparse"` or `..Flat`; a blank line; `# Extent description`; one line per extent, `RW <sectors> SPARSE "<name>"` or `RW <sectors> FLAT "<name>" 0`; a blank line; `# The Disk Data Base`; `#DDB`; a blank line; then `ddb.virtualHWVersion = "4"`, `ddb.geometry.cylinders = "<n>"`, `ddb.geometry.heads = "16"`, `ddb.geometry.sectors = "63"`, `ddb.adapterType = "ide"`, `ddb.toolsVersion = "2147483647"`. Note the blank line after `#DDB`, which the existing single-extent emitters do not have because they stop there. Extent names are `<prefix>-s<NNN><postfix>` for sparse and `-f<NNN>` for flat, where `<NNN>` is the 1-based index formatted at **minimum** width 3, zero-padded, running to four or more digits past 999 (qemu writes `image-s1000.vmdk` verbatim; measured in phase 1 on four builds). Reuse `format_u64` for the sector counts and cylinders; add a small zero-padded formatter for the index rather than widening `format_u64`. Unit tests here cover only mechanics, not parity, which is step 4c's job: that the measured length equals the written length for 1, 2, 17 and 1000 extents; that a buffer one byte short returns the same needed length and leaves the first `len - 1` bytes equal to the full output's prefix, with no panic; and that a zero-length buffer writes nothing. Commit subject: `Emit twoGbMaxExtent VMDK descriptors.` |
 | 4c | medium | sonnet | none | **Parity against the pin.** Add unit tests that compare `build_split_descriptor`'s output byte-for-byte with what qemu writes. **Derive every expected byte from `tests/golden/qemu-create-pins.json`, and do not read the emitter's output to decide what to expect** -- an expectation copied from the thing under test proves nothing. For each of the ten `vmdk-multi-sparse-*` and `vmdk-multi-flat-*` cases, take the last version group (6.2.0 to 10.2.0), substitute `image` for `$STEM`, `fffffffe` for `$CID` and the case's `extent_names` for `$EXTENT<n>`, and assert the emitter produces exactly that text for the case's size with `prefix = b"image"` and `postfix = b".vmdk"`. Follow the pattern and the comment style of `src/crates/create/tests/round_trip.rs:2180-2250`: a table of cases, each row naming the pin case it came from, and a comment stating that the crate tests cannot read the pin file because the workspace has no JSON parser, so the literals are copied by hand and `tests/test_vmdk_split_descriptor_pins.py` guards the copy. Add one more test that is not from the pin: emit the 17-extent 33 GiB sparse descriptor with `prefix = b"vmdk-split-sparse-33g"` and compare it with the committed descriptor of `custom/format-coverage/vmdk-split-sparse-33g.vmdk`, with its CID line replaced -- that fixture is qemu-written and is the only committed witness past 16 extents and past 65535 cylinders. Finally, round-trip: feed the emitter's output to phase 3's `parse_descriptor_extents` and assert the extent count, each kind, each sector count and each filename come back. Commit subject: `Pin the split descriptors against qemu's.` |
 | 4d | medium | sonnet | none | **Guard the copy.** Add `tests/test_vmdk_split_descriptor_pins.py`: for every pin case whose name starts `vmdk-multi-`, read the last version group's `descriptor` from `tests/golden/qemu-create-pins.json` via `helpers.qemu_pins`, build the text with the same substitutions step 4c used, and assert that text appears verbatim in the Rust test source that holds the literals. Read the `.rs` file as text; no Rust is run. The failure message must say which case drifted, print a unified diff, and name both remedies: re-copy the literal, or re-run `tools/sweep-qemu-create.py` if qemu is what changed. Follow `tests/test_qemu_create_pins.py` for style and for `REPIN_HINT`. Register the file in `tests/manifest.json` if that is how test modules are declared there; check rather than assume. This test is the only part of the phase's verification that a wrong emitter cannot also satisfy, so it must fail if a literal is edited -- prove that by editing one digit, observing the failure, and restoring from a copy rather than with `git checkout`. Commit subject: `Guard the pin literals against drift.` |
-| 4e | low | haiku | none | **File the deferred work and document the rules.** Two GitHub issues. First, the `ddb.*` retrofit for `monolithicSparse`, `streamOptimized` and `monolithicFlat`, which open question 3 asks this phase to file: say that qemu writes the block for every subformat including `monolithicFlat` (pin case `vmdk-flat-64M`, `cylinders = "130"`), that instar omits it everywhere, that the retrofit changes the bytes of every VMDK instar has ever written and churns every VMDK baseline, that `-o adapter_type`, `hwversion` and `toolsversion` are accepted and ignored today, and that `docs/quirks.md`'s "VMDK descriptors omit qemu's DDB lines" section and `docs/create.md`'s Future work entry both have to be rewritten when it lands. Second, the four duplicated descriptor builders listed in this plan's survey table, with `format_u64` / `format_u64_decimal` as the concrete duplication and the create crate's own comment as the reason the fourth exists. Then add both issue numbers to the master plan's Future work, add a Future work entry for extending step 4d's guard to the VHDX literals in `src/crates/create/tests/round_trip.rs`, and add the split naming rule and the geometry derivation to `docs/vmdk/vmdk-extents.md` (naming: qemu's `filename_decompose` plus `-s%03d` / `-f%03d`, minimum width three; geometry: 2 GiB extents with a short last one, heads 16, sectors 63, cylinders a truncating divide by 1008 with no 65535 clamp, witnessed at 68656). Do not create or edit a changelog file: this repository keeps none and the `no-changelog` hook refuses one wherever it is put. Commit subject: `File the DDB retrofit and document the rules.` |
+| 4e | low | haiku | none | **File the deferred work and document the rules.** Two GitHub issues. First, the `ddb.*` retrofit for `monolithicSparse`, `streamOptimized` and `monolithicFlat`, which open question 3 asks this phase to file: say that qemu writes the block for every subformat including `monolithicFlat` (pin case `vmdk-flat-64M`, `cylinders = "130"`), that instar omits it everywhere, that the retrofit changes the bytes of every VMDK instar has ever written and churns every VMDK baseline, that `-o adapter_type`, `hwversion` and `toolsversion` are accepted and ignored today, and that `docs/quirks.md`'s "VMDK descriptors omit qemu's DDB lines" section and `docs/create.md`'s Future work entry both have to be rewritten when it lands. Second, the four duplicated descriptor builders listed in this plan's survey table, with `format_u64` / `format_u64_decimal` as the concrete duplication and the create crate's own comment as the reason the fourth exists. Third, the buffer contract: all five builders return the length the descriptor needs and copy only what fits, which is `snprintf` semantics rather than anything idiomatic in Rust, and a caller that does not measure first silently writes a truncated descriptor -- now reachable, because a split descriptor's length is its extent count. Say what the alternatives are (a `Result`, or a writer the caller feeds), that the existing host helper's only check is a `debug_assert_eq!` that release builds drop, that `src/vmm/src/main.rs`'s measure-then-write caller is the one live consumer, and that changing it touches every VMDK instar writes. Do not propose a fix in the issue; it is a decision to revisit, raised at this phase's back brief. Then add all three issue numbers to the master plan's Future work, add a Future work entry for extending step 4d's guard to the VHDX literals in `src/crates/create/tests/round_trip.rs`, and add the split naming rule and the geometry derivation to `docs/vmdk/vmdk-extents.md` (naming: qemu's `filename_decompose` plus `-s%03d` / `-f%03d`, minimum width three; geometry: 2 GiB extents with a short last one, heads 16, sectors 63, cylinders a truncating divide by 1008 with no 65535 clamp, witnessed at 68656). Do not create or edit a changelog file: this repository keeps none and the `no-changelog` hook refuses one wherever it is put. Commit subject: `File the DDB retrofit and document the rules.` |
 | 4f | medium | sonnet | none | **Mutation-check the guards.** Extend `tools/mutate-differencing.sh` with one case per property this phase claims a test enforces, following the existing cases' shape (`rust_case`, a `--check-patterns` entry, and `EXPECTED_CASES` bumped to match): drop the `ddb.toolsVersion` line; emit `-f%03d` for a sparse layout; format the index at width 2; stop clamping the last extent to the remainder (make every extent 4194304 sectors); and remove the blank line after `#DDB`. Each must be killed by a named test, and the report must say which test caught each and that no mutant was counted as killed by a skip. Run every mutant under `timeout`. Restore from a copy, never with `git checkout` on a directory. Then re-run the suites the master plan's "Verification that is not optional" requires: `make test-rust`, the integration selection that covers the new Python test, and `scripts/check-binary-sizes.sh` -- the last because this phase adds code to a crate linked into guest operations, and the before and after numbers go in the execution notes. Classify the integration run with `tools/ci/check-stestr-run.sh`, not by reading stestr's totals block. Commit subject: `Mutation-check the descriptor emitter.` |
 
 ## Risks and mitigations
@@ -467,8 +473,8 @@ Falsifiable; each is checkable by someone who did not do the work.
 9. No `create`, `convert`, CLI or `CreateConfig` change: `git diff
    --stat` lists no file under `src/operations/`, and `shared`'s
    `vmdk_subformat` still carries three values.
-10. Two issues exist, with the content step 4e specifies, and both
-    numbers appear in the master plan's Future work.
+10. Three issues exist, with the content step 4e specifies, and all
+    three numbers appear in the master plan's Future work.
 11. `docs/vmdk/vmdk-extents.md` states the naming rule and the
     geometry derivation, including that cylinders is not clamped.
 12. Five mutants, one per property in step 4f, each killed by a named
@@ -484,7 +490,8 @@ Falsifiable; each is checkable by someone who did not do the work.
 
 ## Back brief
 
-Answer these before step 4a starts.
+Answered 2026-11-24 (AEDT); see *Execution notes* for the answers.
+Questions as put:
 
 1. **Open question 3, which this phase turns on.** Decision 4 adopts
    the master plan's recommendation: emit the 6.2.0-and-later `ddb.*`
@@ -515,4 +522,22 @@ Answer these before step 4a starts.
 
 ## Execution notes
 
-Filled in as the phase runs.
+Implementation began 2026-11-24 (AEDT), from commit `8adaf05a` on
+`multi-extent-vmdk-phase-04-descriptor`.
+
+**Back brief, answered 2026-11-24.** Three of the four questions were
+answered as the plan recommended: the new subformats emit the
+6.2.0-and-later `ddb.*` set and the retrofit of the existing three is
+filed rather than done (open question 3, now resolved); step 4d's
+Python guard over the Rust literals goes in; and instar's write-side
+extent limit stays phase 5's decision under open question 5.
+
+The fourth answer changed the plan. The `snprintf` buffer contract
+stays for now, as decision 2 proposed, **and** step 4e files a third
+issue to revisit whether the interface should be done the idiomatic
+Rust way across all five builders. Decision 2 and the definition of
+done are amended above. The phase does not pre-empt that issue's
+answer: this emitter ships with the contract the other four have.
+
+Steps run in the order the table gives them, sequentially, because
+every one of 4a to 4d writes to the same worktree and 4f mutates it.
