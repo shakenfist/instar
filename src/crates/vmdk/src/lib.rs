@@ -3017,6 +3017,9 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
         // ... and not a cap: a longer one is written in full.
         assert!(has(b"\"image-s999.vmdk\""));
         assert!(has(b"\"image-s1000.vmdk\""));
+        // The whole thousandth line, not just the name: qemu writes this
+        // verbatim at a thousand extents, measured on four builds.
+        assert!(has(b"RW 4194304 SPARSE \"image-s1000.vmdk\"\n"));
     }
 
     // ====================================================================
