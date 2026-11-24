@@ -300,6 +300,104 @@ pub fn build_flat_descriptor(
     pos - offset
 }
 
+/// Sectors in every extent of a split VMDK except possibly the last:
+/// 2 GiB, which is the size qemu cuts a `twoGbMaxExtent` image at.
+pub const SPLIT_EXTENT_SECTORS: u64 = 4_194_304;
+
+/// Heads in the CHS geometry qemu writes for a split VMDK. It is a
+/// constant whatever the size of the disk.
+pub const SPLIT_HEADS: u32 = 16;
+
+/// Sectors per track in the CHS geometry qemu writes for a split VMDK.
+/// Also a constant whatever the size of the disk.
+pub const SPLIT_SECTORS_PER_TRACK: u32 = 63;
+
+/// Which of the two split subformats a descriptor describes. They share
+/// a layout rule and differ only in how each extent is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitKind {
+    /// `twoGbMaxExtentSparse`: every extent is a sparse VMDK4 file.
+    Sparse,
+    /// `twoGbMaxExtentFlat`: every extent is a raw file.
+    Flat,
+}
+
+/// How a split VMDK of a given virtual size is cut into extents, and
+/// the CHS geometry its descriptor records.
+///
+/// Everything here is a pure function of the virtual size, so no caller
+/// supplies `cylinders` or an extent size and two callers cannot derive
+/// them differently. Use `split_layout` to build one, and
+/// `sectors_of_extent` rather than re-deriving the short last extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitLayout {
+    /// The virtual size in 512-byte sectors, rounded up.
+    pub total_sectors: u64,
+    /// Number of extent files. Zero only for a zero-byte disk.
+    pub extent_count: u64,
+    /// Sectors in the final extent: `SPLIT_EXTENT_SECTORS` when the size
+    /// is an exact multiple of it, never a zero-length trailing extent.
+    pub last_extent_sectors: u64,
+    /// `total_sectors / (heads * sectors)`, truncating. Deliberately not
+    /// clamped to the 65535 a real CHS geometry allows, because qemu
+    /// does not: its 33 GiB split image records 68656.
+    pub cylinders: u64,
+    /// Always `SPLIT_HEADS`.
+    pub heads: u32,
+    /// Always `SPLIT_SECTORS_PER_TRACK`.
+    pub sectors: u32,
+    /// The subformat this layout is for.
+    pub kind: SplitKind,
+}
+
+impl SplitLayout {
+    /// The sector count of extent `index` (zero-based): a full extent
+    /// for every one but the last, the remainder for the last, and zero
+    /// for an index past the end.
+    pub fn sectors_of_extent(&self, index: u64) -> u64 {
+        if index >= self.extent_count {
+            0
+        } else if index + 1 == self.extent_count {
+            // index < extent_count, so index + 1 cannot overflow.
+            self.last_extent_sectors
+        } else {
+            SPLIT_EXTENT_SECTORS
+        }
+    }
+}
+
+/// Work out the extent layout and CHS geometry for a split VMDK of
+/// `virtual_size_bytes`.
+///
+/// A size that is not a multiple of 512 is rounded up to the next
+/// sector, and a size of zero gives zero extents and zero cylinders. No
+/// pinned qemu case covers either: both are this function's own choice
+/// of the least surprising answer. All arithmetic is overflow-free for
+/// any `u64`, since the largest sector count is 2^55.
+pub fn split_layout(virtual_size_bytes: u64, kind: SplitKind) -> SplitLayout {
+    let total_sectors = virtual_size_bytes.div_ceil(VMDK_SECTOR);
+    let extent_count = total_sectors.div_ceil(SPLIT_EXTENT_SECTORS);
+    let remainder = total_sectors % SPLIT_EXTENT_SECTORS;
+    let last_extent_sectors = if extent_count == 0 {
+        0
+    } else if remainder == 0 {
+        SPLIT_EXTENT_SECTORS
+    } else {
+        remainder
+    };
+    let cylinders = total_sectors / (SPLIT_HEADS as u64 * SPLIT_SECTORS_PER_TRACK as u64);
+
+    SplitLayout {
+        total_sectors,
+        extent_count,
+        last_extent_sectors,
+        cylinders,
+        heads: SPLIT_HEADS,
+        sectors: SPLIT_SECTORS_PER_TRACK,
+        kind,
+    }
+}
+
 /// Format a u64 as a decimal string in a fixed buffer.
 /// Returns a slice of the formatted digits.
 fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
@@ -2608,6 +2706,119 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
         let without_flag = classify_vmdk_gt_entry(ZERO_GRAIN_MARKER, 0, 65536, false);
         assert_eq!(with_flag.state, MapExtentState::ZeroAllocated);
         assert_eq!(without_flag.state, MapExtentState::ZeroAllocated);
+    }
+
+    // ====================================================================
+    // split_layout tests
+    // ====================================================================
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Assert extent count, last-extent sectors and cylinders for a size.
+    fn check_layout(bytes: u64, count: u64, last: u64, cyl: u64) {
+        let l = split_layout(bytes, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, bytes / 512, "total_sectors for {bytes}");
+        assert_eq!(l.extent_count, count, "extent_count for {bytes}");
+        assert_eq!(
+            l.last_extent_sectors, last,
+            "last_extent_sectors for {bytes}"
+        );
+        assert_eq!(l.cylinders, cyl, "cylinders for {bytes}");
+        assert_eq!(l.heads, 16);
+        assert_eq!(l.sectors, 63);
+    }
+
+    #[test]
+    fn split_layout_matches_every_pinned_size() {
+        // vmdk-multi-sparse-1M
+        check_layout(MIB, 1, 2048, 2);
+        // vmdk-multi-sparse-2G: exactly one full extent, not two.
+        check_layout(2 * GIB, 1, 4_194_304, 4161);
+        // vmdk-multi-sparse-2049M
+        check_layout(2049 * MIB, 2, 2048, 4163);
+        // vmdk-multi-sparse-4G
+        check_layout(4 * GIB, 2, 4_194_304, 8322);
+        // vmdk-multi-sparse-5G
+        check_layout(5 * GIB, 3, 2_097_152, 10402);
+        // vmdk-multi-sparse-21G
+        check_layout(21 * GIB, 11, 2_097_152, 43690);
+    }
+
+    #[test]
+    fn split_layout_does_not_clamp_cylinders() {
+        // custom/format-coverage/vmdk-split-sparse-33g.vmdk records
+        // ddb.geometry.cylinders = "68656", past the 16-bit 65535.
+        check_layout(33 * GIB, 17, 2_097_152, 68656);
+    }
+
+    #[test]
+    fn split_layout_kind_is_carried_through() {
+        assert_eq!(split_layout(MIB, SplitKind::Flat).kind, SplitKind::Flat);
+        assert_eq!(split_layout(MIB, SplitKind::Sparse).kind, SplitKind::Sparse);
+    }
+
+    #[test]
+    fn split_layout_sectors_of_extent() {
+        let l = split_layout(5 * GIB, SplitKind::Flat);
+        assert_eq!(l.sectors_of_extent(0), 4_194_304);
+        assert_eq!(l.sectors_of_extent(1), 4_194_304);
+        assert_eq!(l.sectors_of_extent(2), 2_097_152);
+        assert_eq!(l.sectors_of_extent(3), 0);
+        assert_eq!(l.sectors_of_extent(u64::MAX), 0);
+        let whole = split_layout(4 * GIB, SplitKind::Flat);
+        assert_eq!(whole.sectors_of_extent(1), 4_194_304);
+        assert_eq!(whole.sectors_of_extent(2), 0);
+    }
+
+    #[test]
+    fn split_layout_extent_sectors_sum_to_total() {
+        for bytes in [MIB, 2 * GIB, 2049 * MIB, 5 * GIB, 33 * GIB] {
+            let l = split_layout(bytes, SplitKind::Sparse);
+            let mut sum = 0u64;
+            for i in 0..l.extent_count {
+                sum += l.sectors_of_extent(i);
+            }
+            assert_eq!(sum, l.total_sectors, "extents of {bytes}");
+        }
+    }
+
+    #[test]
+    fn split_layout_zero_size() {
+        // No pin covers a zero-byte disk. Chosen answer: no extents, no
+        // sectors, no cylinders, and every extent index is out of range.
+        let l = split_layout(0, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, 0);
+        assert_eq!(l.extent_count, 0);
+        assert_eq!(l.last_extent_sectors, 0);
+        assert_eq!(l.cylinders, 0);
+        assert_eq!(l.sectors_of_extent(0), 0);
+    }
+
+    #[test]
+    fn split_layout_rounds_unaligned_size_up() {
+        // No pin covers a size that is not a multiple of 512. Chosen
+        // answer: round up to the next sector, as for the other builders.
+        let l = split_layout(MIB + 1, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, 2049);
+        assert_eq!(l.extent_count, 1);
+        assert_eq!(l.last_extent_sectors, 2049);
+        // One byte over a full extent spills a one-sector extent.
+        let l = split_layout(2 * GIB + 1, SplitKind::Sparse);
+        assert_eq!(l.extent_count, 2);
+        assert_eq!(l.last_extent_sectors, 1);
+    }
+
+    #[test]
+    fn split_layout_u64_max_does_not_overflow() {
+        let l = split_layout(u64::MAX, SplitKind::Flat);
+        assert_eq!(l.total_sectors, 1u64 << 55);
+        assert_eq!(l.extent_count, 1u64 << 33);
+        assert_eq!(l.last_extent_sectors, SPLIT_EXTENT_SECTORS);
+        assert_eq!(
+            l.sectors_of_extent(l.extent_count - 1),
+            SPLIT_EXTENT_SECTORS
+        );
     }
 }
 
