@@ -3011,6 +3011,10 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
         let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
         let text = &buf[..n];
         let has = |needle: &[u8]| text.windows(needle.len()).any(|w| w == needle);
+        // A floor: a short index is zero-padded up to three digits ...
+        assert!(has(b"\"image-s001.vmdk\""));
+        assert!(has(b"\"image-s099.vmdk\""));
+        // ... and not a cap: a longer one is written in full.
         assert!(has(b"\"image-s999.vmdk\""));
         assert!(has(b"\"image-s1000.vmdk\""));
     }

@@ -2754,7 +2754,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **172 cases**, in sixteen groups.
+There are **177 cases**, in seventeen groups.
 
 Forty-seven cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -3066,6 +3066,32 @@ descriptor declares, so a FIFO, a block device or a character device
 among the extents would contribute its whole span as zero padding and
 the read would succeed -- a wrong answer reported as a success, where
 qemu-img cannot get the node's length and errors out.
+
+Then **5 split-descriptor cases**, on the emitter that writes a
+`twoGbMaxExtentSparse` or `twoGbMaxExtentFlat` descriptor. The
+descriptor is compared byte for byte against what every pinned qemu-img
+build writes, so most of these are caught by that comparison; what the
+group is really checking is that a narrow test notices each one too,
+because a single broad golden comparison tells you something broke
+without saying what. One drops the `ddb.toolsVersion` line qemu has
+written since 6.2.0. One gives a sparse layout the flat `-f` name
+infix, so every extent line names a file that was never written. One
+removes the blank line between `#DDB` and the first `ddb.` line, which
+is the one piece of whitespace the three single-extent emitters do not
+have and so the easiest to copy wrongly. One stops clamping the final
+extent to the remainder, so a 5 GiB image claims three full 2 GiB
+extents and over-reports its own size; it is caught in the layout
+rather than the descriptor, because that is where the clamp lives. The
+last formats the extent index to a floor of two digits instead of
+three, turning `image-s001.vmdk` into `image-s01.vmdk`.
+
+That last case is why the group exists in this form. The test named for
+the padding rule asserted only that `image-s999.vmdk` and
+`image-s1000.vmdk` appear, which checks that three digits is not a
+*cap* -- both print in full at any width -- and never that it is a
+*floor*. The mutant survived it, and only the broad golden comparison
+failed. The test now also asserts `image-s001.vmdk` and
+`image-s099.vmdk`, and kills it.
 
 Then **8 data-file entry cases**, guarding the fix for
 issue #803. qemu applies two rules to the L2 entries of an image with
