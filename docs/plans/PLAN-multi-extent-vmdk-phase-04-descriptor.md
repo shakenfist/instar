@@ -1,6 +1,6 @@
 # Multi-extent VMDK phase 4: the descriptor emitter
 
-## Status: In progress
+## Status: Complete
 
 Master plan: `PLAN-multi-extent-vmdk.md`.
 
@@ -702,3 +702,70 @@ extent's own 20 reserved descriptor sectors are left zero. The
 input variants, and this phase changed nothing a user can reach. No
 changelog entry, because the repository keeps none and a hook refuses
 one.
+
+**Step 4f, 2026-11-25 (AEDT).** Five mutation cases against the `vmdk`
+package, taking `tools/mutate-differencing.sh` from 172 to 177, and
+`docs/testing.md` a seventeenth group describing them. All five killed:
+`--list` shows the names, `--check-patterns` reports 177 of 177
+landing with none drifted, and running the five by name exits 0 with
+5 PASS, 0 FAIL, 0 BROKEN. Re-run by the management session, not taken
+from the report.
+
+The useful result is that one case did not kill its test when written.
+`split_descriptor_index_padding_is_a_floor` asserted only that
+`image-s999.vmdk` and `image-s1000.vmdk` appear, which both do at any
+padding width, so the width-two mutant survived it and only the broad
+golden comparison failed. The test now also asserts `image-s001.vmdk`
+and `image-s099.vmdk` and kills it. Four of the five cases target a
+narrow test rather than the fourteen-case parity table, so no mutant
+rests on one broad comparison alone.
+
+`scripts/check-binary-sizes.sh` passes with the figures unmoved:
+core 70 KB (`.bin` 70672 bytes), convert 372 KB (381328 bytes), info
+143 KB, compare 247 KB, bench 224 KB, every other operation under 125
+KB, all against the 768 KB cap. They did not move because no operation
+calls the new emitter, so the linker drops it. That is the honest
+answer rather than evidence the emitter is cheap; the real cost lands
+in phase 5, when a caller appears, and that is where this check earns
+its place.
+
+Two corrections to the sub-agent's account. It bumped
+`docs/testing.md`'s headline count to 177 and left the sixteen group
+counts beneath it summing to 172, which is the same off-by-one this
+file carried when the descriptor-attachment group landed; the five
+cases now have their own group with a paragraph saying what each
+proves. And it read the harness's exit 2 on its own run as the
+case-count check failing on a partial selection, which cannot be right:
+`check_case_count` returns early whenever a selection is given. Exit 2
+is `check_selection_matched`, so a name it passed matched no case --
+deliberately a failure rather than an empty pass. With exactly the five
+names the run exits 0.
+
+## Verification
+
+Run on 2026-11-25 (AEDT) against the branch tip, by the management
+session.
+
+| Check | Result |
+|-------|--------|
+| `pre-commit run --all-files` | 9 of 9 Passed |
+| `make test-rust` | 3112 passed, 0 failed, 3 ignored, over 83 test binaries |
+| `make test-container-core` | `MAKE_EXIT=0`, Ran 4231 in 546 s, 0 failures |
+| `tools/ci/check-stestr-run.sh <log> in-output` | exit 0: 3284 of 4231 executed, 947 skipped, against 2767 discovered; no worker lost |
+| `tools/mutate-differencing.sh --check-patterns` | 177 patterns, 177 land, 0 drifted |
+| The five new mutation cases, by name | exit 0, 5 PASS, 0 FAIL, 0 BROKEN |
+| `scripts/check-binary-sizes.sh` | pass, figures unmoved |
+| `tests/test_vmdk_split_descriptor_pins.py` | 4 tests, all ran in the container, none skipped |
+
+The integration run was classified by the repository's own guard rather
+than by reading stestr's totals block, which prints `Failed: 0` for a
+run that lost a worker. It was run with `INSTAR_REQUIRE_LIBVHDI=1`, so
+a missing libvhdi oracle would have been red rather than a skip reading
+as a pass; the devcontainer provides the oracle and both
+`TestDifferencingLibvhdiOracle` tests ran green, which is why the
+host's missing `vhdiinfo` does not matter here.
+
+The phase's own diff is ten files, scoped against the merge base rather
+than `develop`, which has moved five commits since the branch point: a
+two-dot diff showed this phase reverting other people's merged work and
+would have made the scope items unanswerable.
