@@ -2754,7 +2754,33 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **177 cases**, in seventeen groups.
+There are **179 cases**, in seventeen groups. The prose below
+describes each group, with sub-totals nested inside the larger ones; this
+table is the flat version, so the sum can be checked in one pass. The
+headline, `EXPECTED_CASES` and the case count the script itself reports
+are checked against each other by `--check-patterns`; the group counts
+here are not, so they are the thing to re-derive if the two disagree.
+
+| Group | Cases |
+|-------|------:|
+| writer | 47 |
+| fixed VHDX measure | 3 |
+| reader | 47 |
+| `compare` with two chains | 5 |
+| `bench` and `rebase` | 6 |
+| `commit` | 1 |
+| `map`, `measure` and `check` | 15 |
+| device count | 2 |
+| subcluster | 3 |
+| data device | 12 |
+| descriptor attachment | 7 |
+| split descriptor | 7 |
+| data-file entry | 8 |
+| host-offset refusal | 2 |
+| VHDX metadata | 6 |
+| VHD footer copy | 4 |
+| partial last block | 4 |
+| **total** | **179** |
 
 Forty-seven cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -3067,7 +3093,7 @@ among the extents would contribute its whole span as zero padding and
 the read would succeed -- a wrong answer reported as a success, where
 qemu-img cannot get the node's length and errors out.
 
-Then **5 split-descriptor cases**, on the emitter that writes a
+Then **7 split-descriptor cases**, on the emitter that writes a
 `twoGbMaxExtentSparse` or `twoGbMaxExtentFlat` descriptor. The
 descriptor is compared byte for byte against what every pinned qemu-img
 build writes, so most of these are caught by that comparison; what the
@@ -3083,7 +3109,14 @@ extent to the remainder, so a 5 GiB image claims three full 2 GiB
 extents and over-reports its own size; it is caught in the layout
 rather than the descriptor, because that is where the clamp lives. The
 last formats the extent index to a floor of two digits instead of
-three, turning `image-s001.vmdk` into `image-s01.vmdk`.
+three, turning `image-s001.vmdk` into `image-s01.vmdk`. One drops the
+` 0` start offset from a flat extent line, which is the only one of the
+four differences between the two subformats that had no narrow test of
+its own until this case was added. The last makes a `put` that does not
+fit copy the bytes that do, instead of skipping the write whole, which
+is the buffer contract every descriptor builder in the crate shares and
+the one thing a short-buffer test can check that a full-buffer test
+cannot.
 
 That last case is why the group exists in this form. The test named for
 the padding rule asserted only that `image-s999.vmdk` and

@@ -373,7 +373,10 @@ impl SplitLayout {
 /// sector, and a size of zero gives zero extents and zero cylinders. No
 /// pinned qemu case covers either: both are this function's own choice
 /// of the least surprising answer. All arithmetic is overflow-free for
-/// any `u64`, since the largest sector count is 2^55.
+/// any `u64`, since the largest sector count is 2^55. Rounding up means
+/// a size in the last 511 bytes of the `u64` range describes a disk
+/// marginally larger than the one asked for; nothing reaches that,
+/// because a caller bounds the virtual size long before it.
 pub fn split_layout(virtual_size_bytes: u64, kind: SplitKind) -> SplitLayout {
     let total_sectors = virtual_size_bytes.div_ceil(VMDK_SECTOR);
     let extent_count = total_sectors.div_ceil(SPLIT_EXTENT_SECTORS);
@@ -459,6 +462,20 @@ fn format_u64_padded(mut val: u64, min_width: usize, buf: &mut [u8; 20]) -> &[u8
 /// the extension including its dot (e.g. `b".vmdk"`). The geometry is
 /// taken from `layout`, and the `CID` is a fixed value rather than the
 /// random one qemu writes, so output is reproducible.
+///
+/// `prefix` and `postfix` are copied verbatim into a quoted field on a
+/// newline-terminated line, so the caller must reject a name that is not
+/// UTF-8 or that holds a `"`, CR or LF: such a name would name a file
+/// other than the extent, or close the quote and add descriptor lines of
+/// its own. `vmdk_flat_extent_path` in the host already refuses exactly
+/// those for the single-extent subformat, and is the rule to follow.
+///
+/// Both passes cost one iteration per extent, measuring as well as
+/// writing, and nothing here bounds `layout.extent_count`: a virtual
+/// size of `u64::MAX` yields 2^33 extents and hours of work in the
+/// measuring call alone. A caller must bound the virtual size before it
+/// measures, not only before it writes. That matters most for a size
+/// derived from an image rather than from an argument.
 pub fn build_split_descriptor(
     buf: &mut [u8],
     offset: usize,
@@ -476,7 +493,9 @@ pub fn build_split_descriptor(
         pos = end;
     };
 
-    let (create_type, keyword, tag, start): (&[u8], &[u8], &[u8], &[u8]) = match layout.kind {
+    // `trailer` closes the quoted name and ends the line: a flat extent
+    // line carries the start offset qemu writes, a sparse one does not.
+    let (create_type, keyword, tag, trailer): (&[u8], &[u8], &[u8], &[u8]) = match layout.kind {
         SplitKind::Sparse => (b"twoGbMaxExtentSparse", b" SPARSE \"", b"-s", b"\"\n"),
         SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\" 0\n"),
     };
@@ -501,7 +520,7 @@ pub fn build_split_descriptor(
         // index < extent_count <= 2^33, so index + 1 cannot overflow.
         put(format_u64_padded(index + 1, 3, &mut num_buf));
         put(postfix);
-        put(start);
+        put(trailer);
         index += 1;
     }
 
@@ -2970,11 +2989,17 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
         let mut short = [0xAAu8; 4096];
         let got = build_split_descriptor(&mut short[..need - 1], 0, &layout, b"image", b".vmdk");
         assert_eq!(got, need);
-        // The final write does not fit, so it is skipped entirely and the
-        // buffer is left holding a prefix of the full output.
-        let copied = need - 1 - b"ddb.toolsVersion = \"2147483647\"\n".len();
+        // The final write does not fit, so it is skipped entirely: the
+        // buffer holds the output up to that line and none of the line.
+        let copied = need - b"ddb.toolsVersion = \"2147483647\"\n".len();
         assert_eq!(short[..copied], full[..copied]);
-        assert_eq!(short[need - 1], 0xAA);
+        // Past what was copied, and still inside the slice the emitter was
+        // given, the bytes are the caller's own. That is what separates an
+        // all-or-nothing `put` from a byte-level truncation, and it has to
+        // be asserted inside the slice: index `need - 1` was never handed
+        // to the emitter, so it reads 0xAA whatever the emitter does.
+        assert!(copied < need - 1);
+        assert!(short[copied..need - 1].iter().all(|&b| b == 0xAA));
     }
 
     #[test]
@@ -3005,6 +3030,42 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
     }
 
     #[test]
+    fn format_u64_padded_pads_to_a_floor_and_clamps_the_width() {
+        let mut buf = [0u8; 20];
+        // Zero at width zero takes the fallback that writes one digit.
+        assert_eq!(format_u64_padded(0, 0, &mut buf), &b"0"[..]);
+        assert_eq!(format_u64_padded(0, 3, &mut buf), &b"000"[..]);
+        assert_eq!(format_u64_padded(7, 1, &mut buf), &b"7"[..]);
+        // A floor, so a longer value is written in full and not truncated.
+        assert_eq!(format_u64_padded(12345, 3, &mut buf), &b"12345"[..]);
+        assert_eq!(
+            format_u64_padded(u64::MAX, 3, &mut buf),
+            &b"18446744073709551615"[..]
+        );
+        // A width past the twenty digits a u64 can need is clamped to the
+        // buffer rather than running off it.
+        assert_eq!(
+            format_u64_padded(1, 25, &mut buf),
+            &b"00000000000000000001"[..]
+        );
+    }
+
+    #[test]
+    fn split_descriptor_flat_5g_text() {
+        let want = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+createType=\"twoGbMaxExtentFlat\"\n\n# Extent description\n\
+RW 4194304 FLAT \"image-f001.vmdk\" 0\nRW 4194304 FLAT \"image-f002.vmdk\" 0\n\
+RW 2097152 FLAT \"image-f003.vmdk\" 0\n\n# The Disk Data Base\n#DDB\n\n\
+ddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\n\
+ddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\n\
+ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
+        let layout = split_layout(5 * GIB, SplitKind::Flat);
+        let mut buf = [0u8; 2048];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        assert_eq!(&buf[..n], &want[..]);
+    }
+
+    #[test]
     fn split_descriptor_index_padding_is_a_floor() {
         let layout = split_layout(1000 * SPLIT_EXTENT_SECTORS * 512, SplitKind::Sparse);
         let mut buf = [0u8; DESC_BUF];
@@ -3020,6 +3081,19 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
         // The whole thousandth line, not just the name: qemu writes this
         // verbatim at a thousand extents, measured on four builds.
         assert!(has(b"RW 4194304 SPARSE \"image-s1000.vmdk\"\n"));
+    }
+
+    #[test]
+    fn split_descriptor_names_an_extent_with_an_empty_prefix() {
+        // Splitting a name that is nothing but an extension at its last
+        // dot leaves an empty prefix, so the tag leads the name. This is
+        // what qemu's own decompose produces for `.hid`.
+        let layout = split_layout(GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 1024];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"", b".hid");
+        let text = &buf[..n];
+        let has = |needle: &[u8]| text.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"RW 2097152 SPARSE \"-s001.hid\"\n"));
     }
 
     // ====================================================================

@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=177
+EXPECTED_CASES=179
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -3108,6 +3108,22 @@ rust_case 'vmdk-split-descriptor-blank-line-after-ddb-removed' "${VMDK_LIB}" \
     '    put(b"#DDB\n\n");' \
     '    put(b"#DDB\n"); // MUTATED' \
     vmdk 'split_descriptor_sparse_5g_text'
+
+rust_case 'vmdk-split-descriptor-flat-drops-start-offset' "${VMDK_LIB}" \
+    'SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\" 0\n"),' \
+    'SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\"\n"), // MUTATED' \
+    vmdk 'split_descriptor_flat_5g_text'
+
+rust_case 'vmdk-split-descriptor-put-truncates-a-line' "${VMDK_LIB}" \
+    '        if let Some(dst) = buf.get_mut(pos..end) {
+            dst.copy_from_slice(bytes);
+        }' \
+    '        // MUTATED
+        let fits = buf.len().saturating_sub(pos).min(bytes.len());
+        if let Some(dst) = buf.get_mut(pos..pos + fits) {
+            dst.copy_from_slice(&bytes[..fits]);
+        }' \
+    vmdk 'split_descriptor_short_buffer_returns_needed_length'
 
 # ---------------------------------------------------------------------
 # Totals

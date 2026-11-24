@@ -8,7 +8,10 @@ with each other. These tests read the pin and the Rust source as text and
 check the copy here, so they are the one check an emitter bug cannot satisfy.
 
 Source-only: no testdata is needed except for the fixture comparison, which
-skips when the instar-testdata clone is absent.
+fails rather than skips when the clone is absent, as `InstarTestBase` does for
+every other test in the suite. The fixture is the only committed witness past
+sixteen extents and past 65535 cylinders, so a skip there would read as a pass
+on the one check an emitter bug cannot satisfy.
 """
 
 import difflib
@@ -149,9 +152,16 @@ class TestSplitFixtureLiteral(unittest.TestCase):
         return Path(__file__).resolve().parent.parent.parent / 'instar-testdata'
 
     def test_fixture_literal_matches(self):
-        fixture = self._testdata_root() / FIXTURE
+        root = self._testdata_root()
+        fixture = root / FIXTURE
         if not fixture.exists():
-            self.skipTest(f'testdata fixture not present: {fixture}')
+            # Not a skip. This is the only check on the hand copy of the
+            # 33 GiB descriptor, and the suite treats testdata as a hard
+            # dependency everywhere else (tests/base.py raises when the
+            # root is missing), so a missing fixture is a failure here too.
+            missing = 'the testdata clone' if not root.exists() else 'the fixture'
+            self.fail(f'{missing} is absent, so {FIXTURE_CONSTANT} is unchecked: {fixture}\n'
+                      f'Set INSTAR_TESTDATA_PATH, or clone instar-testdata beside this repository.')
         want = re.sub(r'^CID=[0-9a-f]+$', f'CID={CID}', fixture.read_text(encoding='utf-8'), flags=re.M)
         source = _unescape(_rust_source())
         match = re.search(rf'const {FIXTURE_CONSTANT}: &str = "\\\n(.*?)";\n', source, re.S)

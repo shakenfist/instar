@@ -769,3 +769,75 @@ The phase's own diff is ten files, scoped against the merge base rather
 than `develop`, which has moved five commits since the branch point: a
 two-dot diff showed this phase reverting other people's merged work and
 would have made the scope items unanswerable.
+
+## Review round 1 (2026-11-25, AEDT)
+
+The automated reviewer raised 2 fix, 3 document, 7 consider and 1
+informational item on the pushed branch. Both fix items were real and
+both were defects in what this phase added.
+
+The one worth recording is the short-buffer test. Its final assertion
+read a byte *outside* the slice the emitter was handed, so it held
+whatever the emitter did, and its prefix comparison stopped one byte
+short of the boundary. Definition of done item 5 -- already corrected
+once during the phase, because a `put` is all-or-nothing rather than
+byte-wise -- therefore still had nothing testing it. The assertion now
+sits inside the slice, and a new mutation case makes a `put` that does
+not fit copy the bytes that do: it kills the strengthened test and was
+*survived* by the old one, which is the proof the old form could not
+fail. That is three tests in this phase found claiming more than they
+checked, all three in code written to demonstrate a contract rather
+than to implement it, and in every case the fault was an assertion
+placed where the behaviour it describes cannot reach it.
+
+The other fix item was a documentation example that contradicted its own
+rule: splitting `.hid` at its last dot leaves an empty prefix, so qemu
+writes `-s001.hid` and not `.hid-s001`. The host's own
+`vmdk_flat_extent_path` rustdoc had it right, which is where the rule
+was taken from in the first place. A test for an empty prefix was added
+with the correction.
+
+Two rustdoc gaps were taken because phase 5's author will read the
+signature and not this plan: that `prefix` and `postfix` are copied
+verbatim into a quoted field so the caller must refuse a name holding a
+`"`, CR or LF, and that both the measuring and the writing pass cost one
+iteration per extent so the virtual size must be bounded before the
+measure, not only before the write. Neither changes behaviour; both say
+out loud what decisions 6 and 8 left to the caller.
+
+Of the seven optional items, five were taken: the 33 GiB fixture guard
+now fails rather than skipping when testdata is absent, matching
+`InstarTestBase`, since it is the only check on that literal and a skip
+reads as a pass; the flat subformat gained a narrow text test and a
+mutation case for its trailing ` 0`, which was the last of the four
+sparse/flat differences covered only by the broad parity table; the
+private index formatter gained a direct test, and both of its defensive
+branches were confirmed killable by hand-run mutants that were not kept,
+because the branches are unreachable from the only caller and a
+permanent case would pin code that cannot affect behaviour; and the
+subformat tuple's fourth field was renamed from `start`, which read as a
+start offset when it holds the end of the line.
+
+The claim that `docs/testing.md`'s group counts do not sum was checked
+and is wrong: the seventeen groups sum to exactly the headline. The
+reviewer missed three groups (`compare` with two chains, `commit`, and
+`bench` and `rebase`), which is 12 cases and accounts for its figures
+precisely. The nested sub-totals are what make that easy, so the section
+now carries a flat table of group against count; it is the suggestion
+without the premise. The remaining two items were declined: the
+testdata-root resolution now has five copies in `tests/`, of which this
+phase wrote one, filed as #973; and making `SplitLayout`'s CHS fields
+`u64` is cosmetic, since every cast is an infallible widening.
+
+What was re-run for the round, on the round's own tree:
+
+| Check | Result |
+|-------|--------|
+| `pre-commit run --all-files` | all hooks pass (rustfmt wanted two assertions split; applied) |
+| `make test-rust` | 3115 passed, 0 failed |
+| `tools/mutate-differencing.sh --check-patterns` | 179 patterns, 179 land, 0 drifted |
+| The seven split-descriptor cases, by name | 7 PASS, 0 FAIL, 0 BROKEN; sources restored and `cmp`-checked |
+| The same put-truncation case against the old assertion | FAIL, "the test still passed against mutated code" |
+| `tests/test_vmdk_split_descriptor_pins.py` | 4 tests, none skipped |
+| The same module with `INSTAR_TESTDATA_PATH` at an empty directory | 1 failure naming the missing fixture, no skip |
+| `tools/ci/check-test-partition.sh` | PASS, halves cover the baseline exactly |

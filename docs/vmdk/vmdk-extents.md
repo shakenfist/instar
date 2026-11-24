@@ -168,7 +168,8 @@ any string in an input descriptor. It takes the basename after the last
 `<prefix>-f<NNN><postfix>` for a flat one, in the output's own
 directory. The descriptor records the bare name, not a path. A name
 with no dot gets the suffix appended, and a leading dot is the split
-point, so `.hid` yields `.hid-s001`.
+point, so `.hid` splits into an empty prefix and the postfix `.hid`
+and yields `-s001.hid`.
 
 `<NNN>` is the one-based extent number zero-padded to **at least**
 three digits. Three is a floor and not a cap: at a thousand extents
