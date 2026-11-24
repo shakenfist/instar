@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# source-size.sh -- the push auditor's by-hand stand-in for the
-# source-size ratchet.
+# source-size.sh -- the push auditor's counting for the two bands the
+# source-size ratchet does not cover.
 #
 # PUSH-AUDIT.md's source-file-size block says a file over 1,500 lines
 # may stay that long but may not grow, that no file may cross 1,500,
-# and that growth of a file already over 800 lines is raised too. A
-# repository that has adopted shakenfist/development's
-# source-size-ratchet checks that on every commit against a baseline
-# file; instar has not, so the auditor applies the rule by hand and
-# this script does the counting.
+# and that growth of a file already over 800 lines is raised too.
+# tools/source-size-ratchet.py enforces the first two on every commit
+# against tools/source-size-baseline, so this script is not that: it
+# measures the band the ratchet's threshold leaves out, 800 to 1,500,
+# and the file types its fleet-wide extension list leaves out, of which
+# workflow YAML is the one instar has over either line. The auditor
+# still applies the block's rule to those by hand, and this does the
+# counting.
 #
 # The scope is audit-scope.sh's, so --commits-file means here what it
 # means everywhere else in the audit: on a push-audit branch the phases
@@ -22,8 +25,10 @@
 # Usage:
 #   tools/audit/source-size.sh --baseline [LINES]
 #       Every tracked source file over LINES lines (default 1500),
-#       longest first. Whole tree, not scoped: this is the baseline the
-#       ratchet would otherwise keep in a file.
+#       longest first. Whole tree, not scoped. Pass 800 for the
+#       candidate-to-split set, which is the band tools/source-size-baseline
+#       does not reach; at 1500 it is that baseline plus the file types
+#       the ratchet does not count.
 #   tools/audit/source-size.sh [--range REV..REV | --commits-file PATH]
 #       The findings: every source file the audit scope grows that is
 #       over 800 lines now, with its length and its net growth across
@@ -35,7 +40,9 @@
 # What counts as source is every tracked file except the formats that
 # are not, rather than a list of languages: a new language is then in
 # scope the day it is committed, and a new data format shows up as
-# noise in the output rather than going missing from it. That is also
+# noise in the output rather than going missing from it. That is wider
+# than the ratchet's extension list on purpose, and the difference is
+# what this script is for above 1,500 lines as well as below it. That is also
 # why this list is the thing to revisit when a new tracked format
 # lands: a generated artefact or a binary fixture belongs here, under
 # the block's exemption for generated files and data tables. Workflow
