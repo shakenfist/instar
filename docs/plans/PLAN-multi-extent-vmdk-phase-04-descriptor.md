@@ -1,0 +1,518 @@
+# Multi-extent VMDK phase 4: the descriptor emitter
+
+## Status: Planned
+
+Master plan: `PLAN-multi-extent-vmdk.md`.
+
+## Planning effort
+
+Medium. Every byte this phase emits was measured by phase 1 and is
+committed in `tests/golden/qemu-create-pins.json`, and the crate that
+should hold the emitter already holds three like it, so neither the
+target nor the home is a judgement call. Two things kept it above
+mechanical: the buffer contract the existing emitters carry is unusual
+and load-bearing (decision 2), and the oracle this phase tests against
+is a hand-copied literal, which makes "the emitter agrees with the
+test" worth nothing unless something independent ties the literal to
+the pin (decision 8).
+
+The master plan's Planning effort paragraph did not name phase 4 at
+all. Corrected at source to medium as part of this phase's planning
+commit.
+
+## Decisions already taken by the operator
+
+From the master plan, resolved 2026-11-16: sequential extent rotation
+rather than simultaneous output devices (question 1), and the read-side
+ceiling inside this plan as phase 3 (question 2).
+
+Neither binds this phase. Rotation is a write-path mechanism and this
+phase writes no bytes to any file; phase 3 is landed and its parser is
+what reads this phase's output back in a test.
+
+**Open question 3 is not resolved, and this phase turns on it.** It
+asks whether multi-extent output emits qemu's `ddb.*` lines; the master
+plan recommends yes for the new subformats and no retrofit of the old
+ones, and the phase intent says phase 4 "carries the `ddb.*` decision
+from open question 3". Decision 4 below adopts that recommendation and
+states its cost. It is the first item of the back brief, because
+reversing it later is six lines of emitter and one table of literals,
+and reversing it after phase 5 ships a user-visible subformat is a
+changed output format.
+
+Open questions 4 and 5 -- extent path derivation and whether instar
+imposes an extent-count limit -- are reserved to the operator in the
+master plan and are **deliberately not needed here**. Decisions 5 and 6
+scope the emitter so that it answers neither: it is handed a decomposed
+stem and formats names from it, and it imposes no count of its own.
+Phase 5 is the phase that cannot start until both are resolved.
+
+## Scope
+
+In:
+
+* `src/crates/vmdk`: a `no_std`, panic-free emitter for the
+  `twoGbMaxExtentSparse` and `twoGbMaxExtentFlat` descriptor files,
+  including the `ddb.*` block.
+* The pure function from a virtual size to a split geometry: extent
+  count, each extent's sector count, and the CHS triple the `ddb.*`
+  lines carry.
+* The `-s%03d` / `-f%03d` extent-name rule, formatted from a
+  decomposed output stem.
+* Unit tests whose expected bytes come from the pinned qemu
+  descriptors, and a check that ties those literals to the pin file.
+* Reading the emitter's own output back through phase 3's
+  `parse_descriptor_extents`.
+* Filing the `ddb.*` retrofit issue the master plan's open question 3
+  asks this phase to file, and the issue for the four duplicated
+  descriptor builders the survey found.
+* `docs/vmdk/vmdk-extents.md`: the naming rule and the geometry
+  derivation, as format reference.
+
+Out:
+
+* Any `create` or `convert` wiring, any CLI `subformat=` value, any
+  `CreateConfig` change. The emitter ships with no production caller;
+  phase 5 is its first.
+* Extent paths on a filesystem, and what happens when a target
+  already exists (open question 4, phase 5).
+* Any instar-side extent-count or size limit (open question 5, phase
+  5).
+* Sparse extent binary headers, grain directories and grain tables
+  (phases 9 and 10). The survey measured that a split-sparse extent's
+  reserved descriptor region is written as zeros, so no second
+  descriptor is emitted anywhere; see below.
+* Retrofitting `ddb.*` onto `monolithicSparse`, `streamOptimized` and
+  `monolithicFlat`. An issue, not a change.
+* Unifying the four existing descriptor builders. An issue, not a
+  change.
+* A random `CID`. instar writes the constant `fffffffe` everywhere and
+  this phase does the same; the divergence is already documented.
+* `twoGbMaxExtent*` as a backing file, excluded by the master plan.
+
+## What the survey found
+
+Checked against the tree at `394302f8`, with phase 3 landed as
+`64e6fbc6`.
+
+### The bytes are already pinned, and nothing has to run qemu
+
+Phase 1 added ten `vmdk-multi-{sparse,flat}-*` cases to
+`tests/golden/qemu-create-pins.json`, over all 80 static builds. Each
+case records the descriptor text with the CID and extent names
+replaced by placeholders, the extent names, the extent file lengths,
+and a parsed structure. The sizes covered are 1 MiB, 2 GiB, 2049 MiB,
+4 GiB, 5 GiB and 21 GiB in both subformats, plus a pre-existing-extent
+case in each.
+
+Every case has exactly two version groups, split at 6.2.0, and the
+only difference is one line: `ddb.toolsVersion = "2147483647"`.
+`tests/test_qemu_create_pins.py` already asserts that this is the one
+boundary (`VMDK_MULTI_LAST_OLD`, `VMDK_MULTI_FIRST_NEW`), so a future
+qemu change in this area fails a test rather than going unnoticed.
+
+The 6.2.0-and-later descriptor, for 5 GiB sparse:
+
+```
+# Disk DescriptorFile
+version=1
+CID=<hex>
+parentCID=ffffffff
+createType="twoGbMaxExtentSparse"
+
+# Extent description
+RW 4194304 SPARSE "<stem>-s001.vmdk"
+RW 4194304 SPARSE "<stem>-s002.vmdk"
+RW 2097152 SPARSE "<stem>-s003.vmdk"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = "4"
+ddb.geometry.cylinders = "10402"
+ddb.geometry.heads = "16"
+ddb.geometry.sectors = "63"
+ddb.adapterType = "ide"
+ddb.toolsVersion = "2147483647"
+```
+
+The flat form differs in four places and no others: `createType`, the
+`FLAT` keyword, a trailing ` 0` start offset on each extent line, and
+`-f%03d` in place of `-s%03d`.
+
+### The geometry rule, including the part the plan did not raise
+
+`heads` is always 16 and `sectors` always 63. `cylinders` is
+`total_sectors / (16 * 63)`, truncating. Confirmed against five pinned
+sizes: 2048 sectors gives 2, 4194304 gives 4161, 4196352 gives 4163,
+8388608 gives 8322, 10485760 gives 10402, 44040192 gives 43690.
+
+The question the master plan did not raise is whether qemu clamps
+`cylinders` to the 16-bit 65535 a real CHS geometry allows. It does
+not, and no new measurement was needed to find out: phase 2's
+`custom/format-coverage/vmdk-split-sparse-33g.vmdk` is qemu-written
+and carries `ddb.geometry.cylinders = "68656"`, which is exactly
+69206016 / 1008. So the derivation is a plain truncating divide with no
+cap, and the 33 GiB fixture is a committed witness for a value past the
+16-bit boundary.
+
+### The buffer contract is deliberate, documented and in use
+
+All four existing descriptor builders share one `put` closure that
+advances its cursor past the end of the buffer but copies only when the
+write fits, so the return value is the length the descriptor *needs*
+whatever buffer it was given. That is `snprintf` semantics, and it is
+relied on: `vmdk_flat_descriptor` in `src/vmm/src/main.rs:16988` calls
+`vmdk::build_flat_descriptor(&mut [], ...)` to measure, allocates, and
+calls it again to write, with a comment saying so.
+
+This matters because the one thing a split descriptor makes unbounded
+is its length. A caller that writes without measuring gets a silently
+truncated descriptor today for a fixed-length descriptor that always
+fits; for 64 extents it gets a file that names some of its extents.
+
+### "One emitter used by both" is not what this phase inherits
+
+The master plan's phase intent says "one `no_std`, panic-free emitter
+in the crates that writes a multi-extent descriptor from a geometry,
+used by both create and convert". The second half describes a
+destination, not a starting point. Today there are four builders in two
+crates:
+
+| Builder | File | Writes |
+|---|---|---|
+| `build_descriptor` | `src/crates/vmdk/src/lib.rs:226` | monolithicSparse |
+| `build_flat_descriptor` | `src/crates/vmdk/src/lib.rs:266` | monolithicFlat |
+| `build_streamoptimized_descriptor` | `src/crates/vmdk/src/lib.rs:186` | streamOptimized |
+| `build_vmdk_descriptor_with_backing` | `src/crates/create/src/lib.rs:1024` | either sparse kind, with a parent |
+
+The fourth re-implements the first; its own comment says why ("the
+stock builder hardcodes parentCID=FFFFFFFF and has no hook for the
+parent filename"), and it carries a second copy of `format_u64` named
+`format_u64_decimal`. Unifying them would touch every VMDK instar
+writes and is not this phase's business. Step 4e files it.
+
+### qemu writes the same `ddb.*` block for monolithicFlat
+
+Which means instar's monolithicFlat output diverges from qemu's today,
+not merely inconsistently with its own future output. `vmdk-flat-64M`
+pins the full `ddb.*` block with `cylinders = "130"`, by the same rule.
+The divergence is documented, in `docs/quirks.md` ("VMDK descriptors
+omit qemu's DDB lines") and in `docs/create.md`'s Future work, and
+`PLAN-bat-population.md` carries it as future work too.
+
+What does not exist is a GitHub issue: `gh issue list --search ddb
+--state all` returns nothing. So the issue open question 3 asks this
+phase to file is genuinely still to file, and the retrofit that
+eventually closes it has to rewrite that `docs/quirks.md` section as
+well as the descriptors.
+
+### The naming rule already has an implementation to factor
+
+`vmdk_flat_extent_path` in `src/vmm/src/main.rs:16934` implements
+qemu's `filename_decompose` (cited to `block/vmdk.c:2279-2316`): take
+the basename after the last `/`, split it at its last `.`, and join
+`<prefix>` + suffix + `<postfix>`. It also refuses a name that is not
+UTF-8 or that holds `"`, CR or LF, which qemu writes verbatim --
+instar's addition, because the descriptor records the name as a quoted
+string on a line of text.
+
+The split rule is that same decompose with `-s%03d` or `-f%03d` in
+place of `-flat`. So this phase factors a rule rather than inventing
+one, and the refusal above is a property phase 5 inherits, not
+something to re-decide.
+
+### `%03d` is a floor, not a cap
+
+Phase 1's probe for open question 5 measured four builds writing 1000
+extents at 2000 GiB with the thousandth line verbatim `RW 4194304
+SPARSE "image-s1000.vmdk"`, and 16384 extents at 32 TiB. So the width
+is a minimum and the index runs past three digits unpadded.
+
+### A split-sparse extent's reserved descriptor region is zeros
+
+Measured for this plan, on `vmdk-split-sparse-33g-s001.vmdk`: the
+VMDK4 header gives `descriptor_offset_sectors = 1` and
+`descriptor_size_sectors = 20`, and all 10240 bytes of that region are
+zero. qemu reserves the space in every split-sparse extent and writes
+nothing into it. So the only descriptor text a split image contains is
+the standalone descriptor file, and this phase's emitter is never
+asked for a second, embedded copy. Phase 10 needs the same fact when
+it writes those headers.
+
+### Rust-side golden literals are the house pattern, and unguarded
+
+`src/crates/create/tests/round_trip.rs:2190` compares instar's fixed
+VHDX against values "copied from `tests/golden/qemu-create-pins.json`,
+whose every pinned qemu build agrees on them", with each table row
+naming its pin case, and states the reason the file is not read
+directly: "the workspace has no JSON parser, so a change to the pins
+has to be copied here by hand". Nothing checks that copy. No Python
+test in `tests/` reads a `.rs` file, so there is no precedent for the
+guard decision 8 adds, and no precedent against it.
+
+### Everything else the phase intent claims is true
+
+`src/crates/vmdk` is `#![no_std]` with no `alloc`. `vmdk_subformat` in
+`shared::CreateConfig` is a `u8` carrying 0, 1 and 2 today, so adding
+values is a later phase's change and not one this phase needs.
+`parse_descriptor_extents` and `MAX_EXTENTS` exist from phase 3 and can
+read this phase's output back.
+
+## Decisions
+
+**1. The emitter lives in `src/crates/vmdk`, as one function over a
+kind parameter.** `build_split_descriptor(buf, offset, &SplitLayout)
+-> usize`, with the subformat a field of the layout. The two
+subformats differ in four places and nowhere else, so two functions
+would be two copies of the `ddb.*` block and the extent loop. The
+crate is already the home of the other three emitters, it is `no_std`
+with no `alloc`, and both the host (phase 5) and the guest (phases 10
+and 11) can link it.
+
+**2. Keep the measure-then-write buffer contract; do not return a
+`Result`.** The function returns the length the descriptor needs, and
+copies only the prefix that fits. Three reasons: it is the contract of
+all four existing builders, so a fifth with different semantics would
+leave two contracts in one crate; it is what the one live host caller
+is written against, with a comment saying so; and `snprintf` semantics
+are a correct API rather than a workaround -- the hazard is a caller
+that ignores the return value, not the contract.
+
+The cost is real and worth stating. Today no caller can get it wrong,
+because every descriptor is a fixed length that fits any buffer anyone
+would pass. A split descriptor is as long as its extent count makes
+it, so from this phase on a caller that does not measure writes a file
+that names some of its extents and no error is raised. The mitigations
+are in the definition of done: the written length must equal the
+measured length at 1, 2, 17 and 1000 extents, a test must assert that a
+one-byte-short buffer produces the needed length and a truncated
+prefix rather than a panic or an overrun, and phase 5's plan must state
+that its caller measures first.
+
+**3. Geometry is computed from the size, not passed in.**
+`split_layout(virtual_size_bytes, kind, prefix, postfix) ->
+SplitLayout` yields the total sector count, the extent count, each
+extent's sector count, and the CHS triple. All of it is a pure
+function of the size, every pinned case agrees, and letting a caller
+supply `cylinders` invites two callers deriving it differently -- which
+is how instar came to have four descriptor builders. `heads` and
+`sectors` are the constants 16 and 63; `cylinders` truncates and is
+not clamped, which the 33 GiB fixture witnesses at 68656.
+
+**4. Emit the 6.2.0-and-later `ddb.*` set, including
+`ddb.toolsVersion = "2147483647"`, unconditionally.** This adopts the
+master plan's recommendation on open question 3.
+
+Reasoning: 76 of the 80 pinned builds write that set, the pinned 10.2.0
+build is the oracle this plan targets throughout, and the descriptor is
+compared byte-for-byte, so omitting six lines means either a weaker
+oracle or a documented divergence on output that does not exist yet.
+
+Not making it conditional on a version, although instar has a
+version-profile mechanism: `resolve_output_profile` in
+`src/vmm/src/main.rs:14063` says it is "shared by every subcommand
+whose output is version-dependent -- `info`, `map` and `snapshot`".
+That mechanism shapes *reported* output, not written image bytes, and
+`create` does not take `--qemu-version` at all. Inventing a first
+image-bytes version knob for six lines would be a larger change than
+this phase, and a worse default than matching current qemu.
+
+The cost: instar's VMDK descriptors become inconsistent with each
+other -- the new subformats carry `ddb.*`, the three old ones do not --
+until the retrofit lands. The master plan already accepts this and
+assigns the documentation to phase 17. A second, smaller cost: output
+for a 6.0.x or 6.1.x target carries one line that version never wrote.
+Nothing in instar targets a qemu version for written bytes today, so
+there is nothing for that to break, but it is a divergence and phase 17
+should list it rather than only the `ddb.*` inconsistency.
+
+**5. The emitter derives extent names from a decomposed stem.** It
+takes `prefix` and `postfix` byte slices -- the output basename split
+at its last dot, exactly as `vmdk_flat_extent_path` splits it -- and
+formats `<prefix>-s001<postfix>` itself. It is handed neither a path
+nor a list of names.
+
+Reasoning: the name is a qemu-parity fact that appears in the bytes
+this function emits, so it belongs next to them and should be testable
+without a filesystem. The *path* the caller opens, and what the caller
+does about a name that is not UTF-8 or that holds a quote, stay with
+the caller -- which is open question 4, and phase 5's.
+
+**6. The emitter imposes no extent-count limit.** The index formats at
+minimum width three, zero-padded, and runs past three digits unpadded,
+matching the measured `image-s1000.vmdk`. Any instar limit is open
+question 5 and belongs where a refusal can be raised before a file is
+opened, which is phase 5.
+
+Note the asymmetry this leaves, deliberately: instar will be able to
+*write* a descriptor with more extents than it can *read*, because the
+read side is capped at `MAX_CHAIN_EXTENTS` (64) by the size of the
+guest config page. Phase 5 is where that becomes a user-visible
+decision and it is listed in the master plan's Future work. It is
+recorded here so phase 5's planner does not meet it as a surprise.
+
+**7. `CID=fffffffe`, as every other instar VMDK.** qemu writes a
+random CID, which cannot be matched; the pin replaces it with a
+placeholder for exactly that reason. Parity with instar's own output is
+worth more than a pretence of parity with qemu's randomness, and the
+divergence is already documented in `docs/quirks.md` against #566.
+
+**8. The oracle is the pin file, copied into Rust literals, with a new
+Python guard tying the two together.** The literals follow the house
+pattern and its stated reason. The guard is a Python test that, for
+every `vmdk-multi-*` pin case, re-derives the descriptor text the
+6.2.0-and-later group records and asserts it appears verbatim in the
+Rust test source.
+
+Reasoning: without it, the phase's whole oracle is a copy a sub-agent
+made, and the most likely way for this phase to be wrong is for the
+same agent to derive both the emitter and its expectations from the
+same misreading. The guard is the only part of the verification that
+an emitter bug cannot also satisfy. Scoped to the split literals;
+extending it to the VHDX literals it would also fit goes to Future
+work rather than growing this phase.
+
+**9. No user-visible change, so no user documentation beyond format
+reference.** `docs/vmdk/vmdk-extents.md` gains the split naming rule
+and the geometry derivation, because they are facts about the format
+that a human reading that page wants. `docs/quirks.md`,
+`docs/create.md` and `docs/format-coverage.md` change in phase 5, when
+a split subformat first becomes reachable from the command line.
+There is no changelog to add an entry to: the repository keeps none,
+and a `no-changelog` pre-commit hook over `git ls-files` stops one
+coming back, because older plans in `docs/plans/` still say to write
+one. Release notes go on the GitHub release; see "Releases" in
+`docs/development.md`.
+
+## Step plan
+
+| Step | Effort | Model | Isolation | Brief for sub-agent |
+|------|--------|-------|-----------|---------------------|
+| 4a | medium | sonnet | none | **The split layout.** In `src/crates/vmdk/src/lib.rs`, add `pub enum SplitKind { Sparse, Flat }`, `pub struct SplitLayout` and `pub fn split_layout(virtual_size_bytes: u64, kind: SplitKind) -> SplitLayout`. The layout carries `total_sectors` (`virtual_size_bytes` rounded up to 512), `extent_count`, `last_extent_sectors`, `cylinders`, `heads`, `sectors` and `kind`. Extents are 4194304 sectors (2 GiB) each except the last, which is the remainder; a size that is an exact multiple of 2 GiB gives a whole number of full extents and no short one (`vmdk-multi-sparse-2G` pins one extent of 4194304, not two). `heads = 16`, `sectors = 63`, `cylinders = total_sectors / (16 * 63)` truncating, **not clamped to 65535**. Add a `sectors_of_extent(index) -> u64` accessor so callers never re-derive the short last extent. The crate is `#![no_std]` with no `alloc` and no panics: no indexing that can panic, no `unwrap`, and the division is by a non-zero constant. Unit tests must cover, with the pin case named in a comment on each: 1 MiB (1 extent, 2048 sectors, cylinders 2), 2 GiB (1, 4194304, 4161), 2049 MiB (2, last 2048, 4163), 4 GiB (2, 4194304, 8322), 5 GiB (3, last 2097152, 10402), 21 GiB (11, last 2097152, 43690), and 33 GiB (17, last 2097152, **cylinders 68656**, from `custom/format-coverage/vmdk-split-sparse-33g.vmdk`, which is the witness that cylinders is not clamped). Also test a size of 0 and a size that is not a multiple of 512, and say in a comment what the chosen answer is and that no pin covers it. Commit subject: `Derive a split VMDK's extent and CHS geometry.` |
+| 4b | medium | sonnet | none | **The emitter.** In the same file, add `pub fn build_split_descriptor(buf: &mut [u8], offset: usize, layout: &SplitLayout, prefix: &[u8], postfix: &[u8]) -> usize`. Follow `build_flat_descriptor` at `src/crates/vmdk/src/lib.rs:266` exactly for structure and for the `put` closure: advance the cursor past the end of the buffer, copy only when the write fits, return the needed length. **Do not return a `Result` and do not change the existing builders** -- see decision 2; the host caller at `src/vmm/src/main.rs:16988` measures with an empty slice and depends on this. Emit, in order: the five fixed header lines with `CID=fffffffe` and `parentCID=ffffffff`; `createType="twoGbMaxExtentSparse"` or `..Flat`; a blank line; `# Extent description`; one line per extent, `RW <sectors> SPARSE "<name>"` or `RW <sectors> FLAT "<name>" 0`; a blank line; `# The Disk Data Base`; `#DDB`; a blank line; then `ddb.virtualHWVersion = "4"`, `ddb.geometry.cylinders = "<n>"`, `ddb.geometry.heads = "16"`, `ddb.geometry.sectors = "63"`, `ddb.adapterType = "ide"`, `ddb.toolsVersion = "2147483647"`. Note the blank line after `#DDB`, which the existing single-extent emitters do not have because they stop there. Extent names are `<prefix>-s<NNN><postfix>` for sparse and `-f<NNN>` for flat, where `<NNN>` is the 1-based index formatted at **minimum** width 3, zero-padded, running to four or more digits past 999 (qemu writes `image-s1000.vmdk` verbatim; measured in phase 1 on four builds). Reuse `format_u64` for the sector counts and cylinders; add a small zero-padded formatter for the index rather than widening `format_u64`. Unit tests here cover only mechanics, not parity, which is step 4c's job: that the measured length equals the written length for 1, 2, 17 and 1000 extents; that a buffer one byte short returns the same needed length and leaves the first `len - 1` bytes equal to the full output's prefix, with no panic; and that a zero-length buffer writes nothing. Commit subject: `Emit twoGbMaxExtent VMDK descriptors.` |
+| 4c | medium | sonnet | none | **Parity against the pin.** Add unit tests that compare `build_split_descriptor`'s output byte-for-byte with what qemu writes. **Derive every expected byte from `tests/golden/qemu-create-pins.json`, and do not read the emitter's output to decide what to expect** -- an expectation copied from the thing under test proves nothing. For each of the ten `vmdk-multi-sparse-*` and `vmdk-multi-flat-*` cases, take the last version group (6.2.0 to 10.2.0), substitute `image` for `$STEM`, `fffffffe` for `$CID` and the case's `extent_names` for `$EXTENT<n>`, and assert the emitter produces exactly that text for the case's size with `prefix = b"image"` and `postfix = b".vmdk"`. Follow the pattern and the comment style of `src/crates/create/tests/round_trip.rs:2180-2250`: a table of cases, each row naming the pin case it came from, and a comment stating that the crate tests cannot read the pin file because the workspace has no JSON parser, so the literals are copied by hand and `tests/test_vmdk_split_descriptor_pins.py` guards the copy. Add one more test that is not from the pin: emit the 17-extent 33 GiB sparse descriptor with `prefix = b"vmdk-split-sparse-33g"` and compare it with the committed descriptor of `custom/format-coverage/vmdk-split-sparse-33g.vmdk`, with its CID line replaced -- that fixture is qemu-written and is the only committed witness past 16 extents and past 65535 cylinders. Finally, round-trip: feed the emitter's output to phase 3's `parse_descriptor_extents` and assert the extent count, each kind, each sector count and each filename come back. Commit subject: `Pin the split descriptors against qemu's.` |
+| 4d | medium | sonnet | none | **Guard the copy.** Add `tests/test_vmdk_split_descriptor_pins.py`: for every pin case whose name starts `vmdk-multi-`, read the last version group's `descriptor` from `tests/golden/qemu-create-pins.json` via `helpers.qemu_pins`, build the text with the same substitutions step 4c used, and assert that text appears verbatim in the Rust test source that holds the literals. Read the `.rs` file as text; no Rust is run. The failure message must say which case drifted, print a unified diff, and name both remedies: re-copy the literal, or re-run `tools/sweep-qemu-create.py` if qemu is what changed. Follow `tests/test_qemu_create_pins.py` for style and for `REPIN_HINT`. Register the file in `tests/manifest.json` if that is how test modules are declared there; check rather than assume. This test is the only part of the phase's verification that a wrong emitter cannot also satisfy, so it must fail if a literal is edited -- prove that by editing one digit, observing the failure, and restoring from a copy rather than with `git checkout`. Commit subject: `Guard the pin literals against drift.` |
+| 4e | low | haiku | none | **File the deferred work and document the rules.** Two GitHub issues. First, the `ddb.*` retrofit for `monolithicSparse`, `streamOptimized` and `monolithicFlat`, which open question 3 asks this phase to file: say that qemu writes the block for every subformat including `monolithicFlat` (pin case `vmdk-flat-64M`, `cylinders = "130"`), that instar omits it everywhere, that the retrofit changes the bytes of every VMDK instar has ever written and churns every VMDK baseline, that `-o adapter_type`, `hwversion` and `toolsversion` are accepted and ignored today, and that `docs/quirks.md`'s "VMDK descriptors omit qemu's DDB lines" section and `docs/create.md`'s Future work entry both have to be rewritten when it lands. Second, the four duplicated descriptor builders listed in this plan's survey table, with `format_u64` / `format_u64_decimal` as the concrete duplication and the create crate's own comment as the reason the fourth exists. Then add both issue numbers to the master plan's Future work, add a Future work entry for extending step 4d's guard to the VHDX literals in `src/crates/create/tests/round_trip.rs`, and add the split naming rule and the geometry derivation to `docs/vmdk/vmdk-extents.md` (naming: qemu's `filename_decompose` plus `-s%03d` / `-f%03d`, minimum width three; geometry: 2 GiB extents with a short last one, heads 16, sectors 63, cylinders a truncating divide by 1008 with no 65535 clamp, witnessed at 68656). Do not create or edit a changelog file: this repository keeps none and the `no-changelog` hook refuses one wherever it is put. Commit subject: `File the DDB retrofit and document the rules.` |
+| 4f | medium | sonnet | none | **Mutation-check the guards.** Extend `tools/mutate-differencing.sh` with one case per property this phase claims a test enforces, following the existing cases' shape (`rust_case`, a `--check-patterns` entry, and `EXPECTED_CASES` bumped to match): drop the `ddb.toolsVersion` line; emit `-f%03d` for a sparse layout; format the index at width 2; stop clamping the last extent to the remainder (make every extent 4194304 sectors); and remove the blank line after `#DDB`. Each must be killed by a named test, and the report must say which test caught each and that no mutant was counted as killed by a skip. Run every mutant under `timeout`. Restore from a copy, never with `git checkout` on a directory. Then re-run the suites the master plan's "Verification that is not optional" requires: `make test-rust`, the integration selection that covers the new Python test, and `scripts/check-binary-sizes.sh` -- the last because this phase adds code to a crate linked into guest operations, and the before and after numbers go in the execution notes. Classify the integration run with `tools/ci/check-stestr-run.sh`, not by reading stestr's totals block. Commit subject: `Mutation-check the descriptor emitter.` |
+
+## Risks and mitigations
+
+**The emitter ships with no caller, so a mistake waits for phase 5.**
+Mitigated by making the parity test the point of the phase rather than
+an afterthought: step 4c compares against ten pinned cases plus a
+qemu-written 17-extent fixture, so a wrong byte fails in this phase's
+own `make test-rust`, not in phase 5's integration run. The management
+session re-runs one case by hand against the pin file before accepting
+4c.
+
+**The oracle is a hand copy, and the same sub-agent could get the
+emitter and its expectations wrong the same way.** Mitigated by step
+4d, which derives the expectation from the pin file independently of
+any Rust, and by running 4c and 4d as separate sub-agents with 4c's
+brief forbidding it to derive expectations from the emitter's output.
+Checked by the management session: edit one digit of a literal and
+confirm 4d fails naming that case.
+
+**The buffer contract is a loaded gun once descriptors are
+unbounded.** Mitigated by decision 2's three tests, and by a note this
+plan leaves for phase 5: its caller measures first, and the management
+session checks that before accepting phase 5's step that opens the
+descriptor file. Not fully mitigated, and honestly so -- the existing
+host helper's check is a `debug_assert_eq!`, which release builds drop.
+Changing that is the duplicated-builders issue's business, not this
+phase's.
+
+**Scope pull toward unifying the four builders.** Mitigated by making
+it an issue in step 4e and by naming it in Scope's Out list, so a
+reviewer who raises it has an answer in the plan rather than a round of
+review.
+
+**The 6.0.x/6.1.x divergence decision 4 accepts could be read as an
+oversight.** Mitigated by stating it in the plan, in the commit
+message for 4b, and in the Future work entry phase 17 will document
+from.
+
+## Definition of done
+
+Falsifiable; each is checkable by someone who did not do the work.
+
+1. `split_layout` returns the pinned extent count, last-extent sector
+   count and cylinder value for all seven sizes listed in step 4a,
+   including `cylinders = 68656` for 33 GiB, and each test names the
+   pin case or fixture it came from.
+2. `build_split_descriptor`'s output is byte-identical to the
+   6.2.0-and-later pinned descriptor for all ten `vmdk-multi-*` cases,
+   with `$STEM`, `$CID` and `$EXTENT<n>` substituted.
+3. Emitting the 33 GiB sparse descriptor with that fixture's stem
+   reproduces `custom/format-coverage/vmdk-split-sparse-33g.vmdk`'s
+   committed text, CID line excepted.
+4. `parse_descriptor_extents` reads the emitter's output back and
+   agrees on the extent count, every kind, every sector count and
+   every filename.
+5. The measured length equals the written length for 1, 2, 17 and 1000
+   extents; a buffer one byte short returns the same needed length,
+   leaves a prefix of the full output, and does not panic; a
+   zero-length buffer writes nothing.
+6. The 1000-extent descriptor's thousandth extent line reads `RW
+   4194304 SPARSE "image-s1000.vmdk"`, matching phase 1's measurement
+   verbatim.
+7. `tests/test_vmdk_split_descriptor_pins.py` passes, and editing one
+   digit of one Rust literal makes it fail naming that case. The edit
+   was made, the failure observed, and the file restored from a copy.
+8. The existing emitters are unchanged: `git diff` touches no line of
+   `build_descriptor`, `build_flat_descriptor`,
+   `build_streamoptimized_descriptor` or
+   `build_vmdk_descriptor_with_backing`.
+9. No `create`, `convert`, CLI or `CreateConfig` change: `git diff
+   --stat` lists no file under `src/operations/`, and `shared`'s
+   `vmdk_subformat` still carries three values.
+10. Two issues exist, with the content step 4e specifies, and both
+    numbers appear in the master plan's Future work.
+11. `docs/vmdk/vmdk-extents.md` states the naming rule and the
+    geometry derivation, including that cylinders is not clamped.
+12. Five mutants, one per property in step 4f, each killed by a named
+    test, none counted as killed by a skip or a timeout that was
+    really a hang.
+13. `scripts/check-binary-sizes.sh` passes, with the before and after
+    numbers in the execution notes.
+14. `pre-commit run --all-files` passes with the new files `git add`ed
+    first, and `make test-rust` reports 0 failures with the count
+    checked. The integration selection covering the new Python test is
+    classified by `tools/ci/check-stestr-run.sh`, not by reading
+    stestr's totals block or trusting an exit code.
+
+## Back brief
+
+Answer these before step 4a starts.
+
+1. **Open question 3, which this phase turns on.** Decision 4 adopts
+   the master plan's recommendation: emit the 6.2.0-and-later `ddb.*`
+   set unconditionally on the new subformats, and file the retrofit of
+   the old three as an issue rather than doing it. Confirm, or say
+   which part to change. The two live alternatives are to emit no
+   `ddb.*` at all, which keeps instar's four descriptor forms
+   consistent with each other and takes a documented divergence from
+   qemu on brand-new output, and to retrofit all four subformats at
+   once, which churns every VMDK baseline and wants its own
+   differential-fuzz exposure.
+2. **Decision 2's buffer contract.** Keeping `snprintf` semantics
+   rather than returning a `Result` is the choice a reviewer is most
+   likely to argue with, because it keeps a silent-truncation path
+   alive at exactly the moment descriptors stop being a fixed length.
+   Confirm, or say that the new emitter should return a `Result` and
+   accept two contracts in one crate until the duplicated-builders
+   issue unifies them.
+3. **The guard in step 4d.** A Python test that reads a Rust source
+   file is new in this repository. Confirm that is acceptable, or say
+   to drop it and accept the hand copy as the house pattern does
+   today.
+4. **Decision 6's asymmetry.** instar will be able to write more
+   extents than it can read, with the write side uncapped here and the
+   read side capped at 64 by the guest config page. Confirm that
+   deciding instar's write-side limit is phase 5's, under open
+   question 5, rather than something this phase should settle.
+
+## Execution notes
+
+Filled in as the phase runs.
