@@ -335,13 +335,27 @@ protection or a second one.
     debugs the mechanism for the first time.
 
 14. **A remote store refuses writes rather than silently dropping
-    them.** `Storage::Remote` makes `write_at` and `sync` return an
-    `io::Error` naming the input as read-only, `is_sparse()` false,
-    and `size()` the advertised capacity. Nothing in this phase can
-    reach those paths -- the device is built read-only -- so the
-    refusal is there for phase 7, when an operation with an output
-    gets a remote input and a wrong turn would otherwise write into
-    a `None`.
+    them.** `Storage::Remote` makes `write_at` return an `io::Error`
+    naming the input as read-only, `is_sparse()` false, and `size()`
+    the advertised capacity. Nothing in this phase can reach
+    `write_at` -- the device is built read-only -- so the refusal is
+    there for phase 7, when an operation with an output gets a remote
+    input and a wrong turn would otherwise write into a `None`.
+
+    **Corrected during step 3c's review: `sync` succeeds, it does not
+    refuse.** This decision originally refused both. A guest's
+    `VIRTIO_BLK_T_FLUSH` reaches `BackingStore::sync` through the
+    `FLUSH` arm of `VirtioBlockDevice::process_request`, which --
+    unlike the `OUT` arm beside it -- has no `read_only` guard, and a
+    read-only *local* store answers it by `fsync`-ing a descriptor
+    with nothing dirty, which succeeds. Refusing on a remote store
+    would therefore make a device fail a request the same device
+    backed by a local file satisfies, which is the one divergence this
+    phase exists to avoid. Nothing on this side buffers a byte that a
+    success could be lying about: the protocol only reads. The guest's
+    `flush()` in `src/core/src/virtio.rs` is what sends it, and
+    `bench` carries an `ERROR_IO_FLUSH`, so this is reachable code in
+    the operations phase 7 adds rather than a hypothetical.
 
 ## Steps
 
@@ -477,6 +491,32 @@ Four things worth recording:
   `instar-fetch` lookup away from the profile directory cargo links
   workspace binaries into. Not finding it panics, naming the paths
   tried and the command to run; it never skips.
+
+**Step 3c.** `make test-rust`: 3129 passed, 0 failed, 3 ignored
+(the three ignored predate this phase). `pre-commit run --all-files`:
+all ten hooks pass. The step's own mutation check, on a scratch copy,
+replaced the delegation in the `Remote` read arm with `buf.fill(0)`
+and both of the agreement tests failed; it restored from the copy
+rather than with `git checkout`.
+
+Two things worth recording:
+
+* **`sync` on a remote store succeeds rather than refusing**, which
+  decision 14 now records and originally had backwards. The step
+  implemented the decision as written and said in its report that
+  nothing calls `sync` on an input today; the review found that a
+  guest FLUSH does reach it, with no `read_only` guard on that arm,
+  so the refusal was a divergence from the local store that a guest
+  could trigger. Changed in the management session, along with the
+  test, which now asserts that a local and a remote store answer a
+  flush the same way instead of asserting the refusal.
+* **The test helpers live in one place.** `fetcher_binary`, with its
+  panic-rather-than-skip behaviour, plus `pattern`, `write_fixture`
+  and a `spawn_test_fetcher` that bounds every remote read at ten
+  seconds, moved from `fetch.rs`'s `mod tests` into a
+  `#[cfg(test)] pub(crate) mod test_support` at module level, so the
+  backing store's tests share them rather than carrying a second copy
+  that could lose the panic.
 
 ## Mutation results
 

@@ -509,8 +509,93 @@ fn spawn_fetcher_binary(fetcher: &Path, path: &Path) -> io::Result<RemoteSource>
     Ok(source)
 }
 
+/// Helpers for any module's tests that need a real fetcher.
+///
+/// They live outside `mod tests` because the backing store's tests need them
+/// too, and a second copy of the search below is how the two would come to
+/// disagree: the one property that matters about it -- that a missing fetcher
+/// fails loudly rather than skipping -- is exactly the one a divergent copy
+/// would lose, and it would lose it silently, as a green run.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// How long a read is given in a test before it is a failure.
+    ///
+    /// Shorter than the client's operational default, because a test that
+    /// hangs for a minute is still a test that hangs.
+    pub(crate) const TEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The byte a fixture holds at `offset`, so that a read answered from the
+    /// wrong offset -- or from the wrong descriptor -- is a mismatch rather
+    /// than a buffer of zeros that happens to agree.
+    pub(crate) fn pattern(offset: u64) -> u8 {
+        (offset.wrapping_mul(31).wrapping_add(offset >> 9) & 0xff) as u8
+    }
+
+    /// Write a fixture of `len` bytes of [`pattern`] at `path`.
+    pub(crate) fn write_fixture(path: &Path, len: u64) {
+        let bytes: Vec<u8> = (0..len).map(pattern).collect();
+        std::fs::write(path, &bytes).expect("writing the fixture");
+    }
+
+    /// The `instar-fetch` binary for a test to spawn.
+    ///
+    /// `instar-fetch` is a different package, so `CARGO_BIN_EXE_` -- which
+    /// cargo defines only for a package's own integration tests -- does not
+    /// exist here. What does exist is this test binary's own path, and cargo
+    /// links every workspace binary into the profile directory above
+    /// wherever it put the test binary: that has been `target/<profile>/deps`
+    /// and is `target/<profile>/build/<package>/<hash>/out` on the toolchain
+    /// this is pinned to, so the depth is not something to hardcode. Every
+    /// ancestor is searched instead, nearest first, which finds the right
+    /// profile's fetcher whichever layout the toolchain uses.
+    /// `INSTAR_BIN_DIR` is honoured first, exactly as the resolver instar
+    /// uses in production honours it.
+    ///
+    /// Not finding it fails and never skips. A test that skips when its
+    /// subject is missing is a green run that proved nothing, so this panics
+    /// and names the command that builds what is missing.
+    pub(crate) fn fetcher_binary() -> PathBuf {
+        let mut candidates = Vec::new();
+        if let Some(dir) = std::env::var_os("INSTAR_BIN_DIR") {
+            candidates.push(PathBuf::from(dir));
+        }
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        candidates.extend(exe.ancestors().skip(1).map(Path::to_path_buf));
+
+        let mut tried = Vec::new();
+        for dir in candidates {
+            let candidate = dir.join(FETCHER_BINARY);
+            if candidate.is_file() {
+                return candidate;
+            }
+            tried.push(candidate);
+        }
+        panic!(
+            "{FETCHER_BINARY} is at none of {tried:?}; build the workspace with \
+             `make instar`, or point INSTAR_BIN_DIR at the directory holding it, and run \
+             this test again"
+        );
+    }
+
+    /// Start the freshly built fetcher on `path`, with reads bounded so that a
+    /// fetcher which never answers fails the test instead of holding it for
+    /// the client's operational minute.
+    pub(crate) fn spawn_test_fetcher(path: &Path) -> RemoteSource {
+        let mut source =
+            spawn_fetcher_binary(&fetcher_binary(), path).expect("spawn a fetcher on the fixture");
+        source
+            .client_mut()
+            .set_reply_timeout(TEST_READ_TIMEOUT)
+            .expect("a ten-second read timeout is accepted");
+        source
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use std::collections::BTreeSet;
     use std::ffi::CString;
@@ -650,67 +735,8 @@ mod tests {
     /// before the spawn rather than after it.
     const UNSPAWNABLE_FETCHER: &str = "/nonexistent/instar-fetch-that-is-never-spawned";
 
-    /// How long a read is given in a test before it is a failure.
-    ///
-    /// Shorter than the client's operational default, because a test that
-    /// hangs for a minute is still a test that hangs.
-    const TEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
     /// How long after a drop a test waits for the child to be gone.
     const TEST_REAP_WINDOW: Duration = Duration::from_secs(5);
-
-    /// The byte a fixture holds at `offset`, so that a read answered from the
-    /// wrong offset -- or from the wrong descriptor -- is a mismatch rather
-    /// than a buffer of zeros that happens to agree.
-    fn pattern(offset: u64) -> u8 {
-        (offset.wrapping_mul(31).wrapping_add(offset >> 9) & 0xff) as u8
-    }
-
-    /// Write a fixture of `len` bytes of [`pattern`] at `path`.
-    fn write_fixture(path: &Path, len: u64) {
-        let bytes: Vec<u8> = (0..len).map(pattern).collect();
-        std::fs::write(path, &bytes).expect("writing the fixture");
-    }
-
-    /// The `instar-fetch` binary for a test to spawn.
-    ///
-    /// `instar-fetch` is a different package, so `CARGO_BIN_EXE_` -- which
-    /// cargo defines only for a package's own integration tests -- does not
-    /// exist here. What does exist is this test binary's own path, and cargo
-    /// links every workspace binary into the profile directory above
-    /// wherever it put the test binary: that has been `target/<profile>/deps`
-    /// and is `target/<profile>/build/<package>/<hash>/out` on the toolchain
-    /// this is pinned to, so the depth is not something to hardcode. Every
-    /// ancestor is searched instead, nearest first, which finds the right
-    /// profile's fetcher whichever layout the toolchain uses.
-    /// `INSTAR_BIN_DIR` is honoured first, exactly as the resolver instar
-    /// uses in production honours it.
-    ///
-    /// Not finding it fails and never skips. A test that skips when its
-    /// subject is missing is a green run that proved nothing, so this panics
-    /// and names the command that builds what is missing.
-    fn fetcher_binary() -> PathBuf {
-        let mut candidates = Vec::new();
-        if let Some(dir) = std::env::var_os("INSTAR_BIN_DIR") {
-            candidates.push(PathBuf::from(dir));
-        }
-        let exe = std::env::current_exe().expect("this test binary has a path");
-        candidates.extend(exe.ancestors().skip(1).map(Path::to_path_buf));
-
-        let mut tried = Vec::new();
-        for dir in candidates {
-            let candidate = dir.join(FETCHER_BINARY);
-            if candidate.is_file() {
-                return candidate;
-            }
-            tried.push(candidate);
-        }
-        panic!(
-            "{FETCHER_BINARY} is at none of {tried:?}; build the workspace with \
-             `make instar`, or point INSTAR_BIN_DIR at the directory holding it, and run \
-             this test again"
-        );
-    }
 
     #[test]
     fn a_staged_descriptor_is_clear_of_the_childs_numbers() {
@@ -743,11 +769,7 @@ mod tests {
         // Not a multiple of any block size in play, so the last read of the
         // file is a partial one.
         write_fixture(&path, 70_001);
-        let mut source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
-        source
-            .client_mut()
-            .set_reply_timeout(TEST_READ_TIMEOUT)
-            .expect("a ten-second read timeout is accepted");
+        let mut source = spawn_test_fetcher(&path);
 
         let local = File::open(&path).expect("open the fixture locally");
         for (offset, len) in [(0u64, 512usize), (512, 4096), (65_536, 4_465), (0, 70_001)] {
