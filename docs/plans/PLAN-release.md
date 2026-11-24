@@ -47,7 +47,7 @@ blockers, and holding this plan open for them was what kept it
 marked in-progress long after it was finished.
 
 Per-release execution lives in its own plan
-([`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md), `PLAN-release-v0.3.md`, future
+([`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md), [`PLAN-release-v0.3.md`](https://github.com/shakenfist/instar/blob/8871b068fc3a997bf930c5f59509cdd5246aa8df/docs/plans/PLAN-release-v0.3.md), future
 `PLAN-release-vN.M.md`). Future releases need this plan only as
 background; they do not reopen it.
 
