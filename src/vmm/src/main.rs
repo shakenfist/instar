@@ -24,6 +24,7 @@ mod chain;
 mod config;
 mod error;
 mod escape;
+mod fetch;
 mod io_thread;
 mod ioevent;
 mod kvm_stats;

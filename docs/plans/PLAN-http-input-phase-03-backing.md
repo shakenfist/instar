@@ -364,6 +364,33 @@ count after each step, the integration suite's `Ran: N` line as read,
 the kvm-ioctls `O_CLOEXEC` answer from step 3b, and anything a step
 found that the plan got wrong.
 
+Implementation began 2026-11-25 (AEDT). The back brief's three gates
+were agreed as planned before any step ran: decision 5, `info` alone
+rather than every read-only operation; decisions 7 and 12, the reap in
+a `Drop` bounded at two seconds and then `SIGKILL`, with the child's
+two descriptors at 3 and 4; and decision 9's refusal table, refusing
+every scheme but `file` by name. The implementing session was also
+given permission to push the branch and open the pull request once the
+phase is done, which it otherwise would not have.
+
+**Step 3a.** `make test-rust`: 3116 passed, 0 failed, of which 20 are
+`fetch::tests`. `pre-commit run --all-files`: all ten hooks pass.
+Three things worth recording:
+
+* The module needs `#[allow(dead_code)]` on `InputSource` and
+  `classify_input` until step 3d calls them, since the binary's
+  dead-code lint rejects an unused public item in a binary crate.
+  Step 3d removes both.
+* `file:/tmp/x`, with one slash, classifies as a **path**, because
+  decision 9's rule is `://`. RFC 8089 permits that form, so a URL
+  some tools accept reports a missing file. Left as decided rather
+  than silently widened; adding it is one branch in `classify_input`
+  if it ever matters.
+* A `%` escape, a `?`, a `#` and a NUL are refused anywhere after
+  `file://` rather than only within the path, which is wider than
+  decision 10's wording and the same thing in practice: none of them
+  is legitimate in an authority either.
+
 ## Mutation results
 
 Filled in by step 3e. Three mutations, each naming the test that
