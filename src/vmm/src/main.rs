@@ -3863,7 +3863,8 @@ fn print_info_result_json(
     println!("}}");
 }
 
-/// Get the directory containing the instar guest binaries (.bin files).
+/// Get the directory containing the files instar loads or spawns at runtime:
+/// the guest binaries (.bin files) and the `instar-fetch` helper.
 ///
 /// Resolution order:
 ///   1. `INSTAR_BIN_DIR` environment variable, if set (testing/override).
@@ -3872,9 +3873,12 @@ fn print_info_result_json(
 ///      `src/target/release/`).
 ///   3. `/usr/lib/instar` (system install via .deb/.rpm).
 ///
-/// The first candidate that contains `core.bin` wins. If none does,
-/// the executable directory is returned so the subsequent load error
-/// reports the developer-mode path that most users expect.
+/// The first candidate that contains `core.bin` wins. `core.bin` stays the
+/// sentinel for the whole set, the fetcher included, because every build and
+/// every package puts them all in one directory and it is the one file no
+/// operation can run without. If no candidate has it, the executable
+/// directory is returned so the subsequent load error reports the
+/// developer-mode path that most users expect.
 fn get_binary_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("INSTAR_BIN_DIR") {
         return std::path::PathBuf::from(dir);
@@ -3897,7 +3901,7 @@ fn get_binary_dir() -> std::path::PathBuf {
     exe_dir
 }
 
-/// Get the path to a guest binary by file name.
+/// Get the path to one of those runtime files by name.
 fn get_binary_path(name: &str) -> std::path::PathBuf {
     get_binary_dir().join(name)
 }

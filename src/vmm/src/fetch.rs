@@ -1,4 +1,5 @@
-//! Telling a URL from a path on an instar input.
+//! Telling a URL from a path on an instar input, and serving a local one
+//! through a fetcher.
 //!
 //! An input argument is either a filesystem path, exactly as it has always
 //! been, or a URL that names where the bytes live. Deciding which has to happen
@@ -18,9 +19,41 @@
 //! rest of RFC 3986 would be machinery nothing uses. A real parser belongs
 //! with the first protocol that needs one.
 //!
-//! Nothing here opens a file or starts a process; it only classifies a string.
+//! # The fetcher that serves an input
+//!
+//! Classifying a string opens nothing and starts nothing. Serving the input it
+//! names does both: [`spawn_file_fetcher`] opens the file with the invoking
+//! user's authority, starts `instar-fetch` with that descriptor and one end of
+//! a `SOCK_SEQPACKET` socketpair, and returns a [`RemoteSource`] owning the
+//! child and the client to it together.
+//!
+//! Three things about that child are worth saying here rather than leaving to
+//! be inferred:
+//!
+//! * **It is started before `/dev/kvm` is opened.** A child cannot inherit a
+//!   descriptor its parent has not opened, so the ordering is a guarantee that
+//!   does not depend on anyone remembering a flag. The KVM crate does open
+//!   `/dev/kvm` close-on-exec, so this is the second protection rather than
+//!   the only one -- but it is the one that costs nothing and cannot be
+//!   changed by a dependency bump.
+//! * **It holds five descriptors and no more:** the three standard ones, its
+//!   socket, and the file. Everything it is handed is something a future
+//!   sandbox would otherwise have to take back off it.
+//! * **It is reaped by a `Drop`,** not by a call at the end of an operation,
+//!   because the paths that most need reaping are the ones nobody writes
+//!   down. `std::process::exit` is the one path a `Drop` cannot cover, so an
+//!   operation serving a remote input returns its errors through `main`.
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use fetch_protocol::{FetchClient, SeqPacketSocket};
 
 /// What an input argument turned out to be.
 // Exercised by its tests before any operation calls it, so the binary's
@@ -147,9 +180,344 @@ pub fn classify_input(arg: &str) -> Result<InputSource, String> {
     }
 }
 
+/// The fetcher's file name, resolved from the directory instar loads its
+/// runtime files out of.
+const FETCHER_BINARY: &str = "instar-fetch";
+
+/// Where the child finds the socket it answers on.
+///
+/// This and [`CHILD_FILE_FD`] are the two numbers passed on the fetcher's
+/// command line, and -- with the three standard descriptors -- the only ones
+/// it is meant to hold. A fetcher that was handed anything else would be a
+/// process holding privilege nobody intended it to have, and the sandbox that
+/// will one day confine it would have to be built around that hole.
+const CHILD_SOCKET_FD: RawFd = 3;
+
+/// Where the child finds the already-open file whose bytes it serves.
+const CHILD_FILE_FD: RawFd = 4;
+
+/// The lowest descriptor number the parent stages a copy on before the fork.
+///
+/// Above both of the child's, which is the entire point: see
+/// [`stage_clear_of_child_fds`].
+const FIRST_STAGING_FD: RawFd = CHILD_FILE_FD + 1;
+
+/// How long a fetcher is given to notice its socket has closed and exit by
+/// itself before it is killed.
+///
+/// A fetcher that needs the kill is a bug in the fetcher. The bound is here
+/// because the alternative is worse: a reap that waits for ever turns that
+/// bug into every instar run hanging as it exits.
+// Read only by the reap below, which the dead-code lint cannot see as
+// reachable while nothing yet builds a `RemoteSource` outside a test.
+#[allow(dead_code)]
+const REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the reap looks to see whether the child has gone.
+#[allow(dead_code)] // As above.
+const REAP_POLL: Duration = Duration::from_millis(10);
+
+/// Duplicate `fd` onto a descriptor number at or above [`FIRST_STAGING_FD`],
+/// close-on-exec.
+///
+/// This exists because the two descriptors the child needs are very likely to
+/// be sitting already on the two numbers they have to end up on. The image is
+/// opened first and takes the lowest free number, typically 3; the socketpair
+/// is created next and takes 4 and 5. A `dup2` of the socket onto 3 would
+/// then close the image in the child, and a `dup2` of the image onto 4 would
+/// close the socket -- and no ordering of the two calls escapes it, because
+/// each one's target is the other's source. Both would leave the child
+/// serving the wrong descriptor rather than failing outright, which is the
+/// kind of mistake that survives a passing test.
+///
+/// Staging both copies out of the way first makes the two `dup2` calls in the
+/// child independent of each other and of whatever the parent's descriptor
+/// table happens to look like. The staged copies are close-on-exec, so they
+/// are gone before the fetcher's first instruction: what crosses the `exec`
+/// is the pair of copies `dup2` made, which are not.
+fn stage_clear_of_child_fds(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC duplicates the descriptor onto the lowest free
+    // number at or above its argument and returns it. The borrowed descriptor
+    // is open for the whole call, and the result is checked before it is
+    // adopted.
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, FIRST_STAGING_FD) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl reported success, so raw is a fresh descriptor this
+    // process owns and nothing else holds a copy of.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Clear `O_NONBLOCK` from a descriptor, leaving its other flags alone.
+fn clear_nonblock(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: F_GETFL takes no further argument and returns the file status
+    // flags; the result is checked before it is used.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL takes an int of file status flags, here the ones just
+    // read with one bit cleared. The result is checked.
+    let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Open `path` read-only for a fetcher to serve, refusing anything that is
+/// not a regular file.
+///
+/// Resolving the path is an exercise of the invoking user's authority, so it
+/// happens here and the open descriptor is what the child is given. The
+/// refusal is written here too, for the same reason: this side has the path
+/// the user typed and can say something about it. The fetcher refuses a
+/// non-regular descriptor as well, but by then the user's error would be a
+/// failed init on a socket, which says nothing about which input was wrong.
+///
+/// `O_NONBLOCK` is on the open because a FIFO opened read-only blocks until
+/// someone opens its write end, which would turn "instar cannot read a FIFO"
+/// into a hang; `O_NOCTTY` stops a terminal becoming this process's
+/// controlling one. Neither flag means anything for a regular file, and
+/// `O_NONBLOCK` is cleared once the file is known to be one, so what crosses
+/// the `exec` is an ordinary blocking read-only descriptor.
+fn open_regular_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("instar cannot open {}: {err}", path.display()),
+            )
+        })?;
+    // Asked of the descriptor rather than of the path, so the answer
+    // describes the file that was opened and will be served rather than
+    // whatever the path named a moment ago.
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "instar cannot read {}: it is not a regular file, so it has no size to \
+                 advertise and cannot answer a read at an offset",
+                path.display()
+            ),
+        ));
+    }
+    clear_nonblock(file.as_fd())?;
+    Ok(file)
+}
+
+/// A fetcher serving one input, and the client that talks to it.
+///
+/// The two are owned together because they are one lifetime: the client is
+/// the only way to reach the child, and closing the client's socket is how
+/// the child is told to stop. Dropping this does both, in that order, so no
+/// caller has to remember to -- which is what makes the child reaped on the
+/// paths nobody writes down, a `?` out of the middle of an operation or a
+/// panic in the vCPU loop. The one path a `Drop` cannot cover is
+/// `std::process::exit`, so an operation that serves a remote input must
+/// return its errors through `main` instead of exiting under them.
+// Nothing calls this yet: the backing store learns to read through it, and
+// `instar info` learns to open one, in the two changes that follow this one.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct RemoteSource {
+    /// The fetcher. Nothing else reaps it: `Child`'s own drop deliberately
+    /// does not wait, so this type's `Drop` is the difference between an
+    /// exited child and a zombie on every run.
+    child: Child,
+    /// The client. In an `Option` only so that `Drop` can close the socket
+    /// before waiting for the child that is reading it; it is `Some` for the
+    /// whole of the value's useful life, and `None` only while it is being
+    /// torn down or if the init exchange never completed.
+    client: Option<FetchClient>,
+}
+
+#[allow(dead_code)]
+impl RemoteSource {
+    /// The client, for reading the input's bytes.
+    pub fn client_mut(&mut self) -> &mut FetchClient {
+        self.client
+            .as_mut()
+            .expect("the client is taken only while the source is being dropped")
+    }
+
+    /// The size of the input in bytes, as the fetcher advertised it at init.
+    ///
+    /// This, rather than a `stat` of the path, is the number a device built
+    /// on this source should be given: it is the only size a fetcher reading
+    /// from somewhere other than a local file will be able to report, so
+    /// taking it from the protocol now is what keeps this code honest while
+    /// there is still a local file to check it against.
+    pub fn capacity(&self) -> u64 {
+        self.client
+            .as_ref()
+            .expect("the client is taken only while the source is being dropped")
+            .capacity()
+    }
+
+    /// The fetcher's process id, for diagnostics and for the tests that
+    /// inspect what the child holds.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for RemoteSource {
+    fn drop(&mut self) {
+        // Closing the socket is how the fetcher is asked to stop: its `recv`
+        // returns zero and it exits zero. Nothing is sent to it, because a
+        // message would need an answer and the point here is to stop waiting
+        // on this child, not to start.
+        let _ = self.client.take();
+
+        let started = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(err) => {
+                    // Nothing useful is left to do: the child cannot be
+                    // waited for, so it also cannot be confirmed killed.
+                    eprintln!(
+                        "instar: could not wait for the fetcher (pid {}): {err}",
+                        self.child.id()
+                    );
+                    return;
+                }
+            }
+            if started.elapsed() >= REAP_GRACE {
+                break;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+
+        let pid = self.child.id();
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            // Unreachable: the pid came from this process's own fork. There
+            // is no safe fallback, because a wrong pid_t is another process.
+            eprintln!("instar: the fetcher's pid {pid} is not a pid this process can signal");
+            return;
+        };
+        // SAFETY: raw_pid is this process's own child and has not been
+        // waited for, so the kernel still holds the pid against it and it
+        // cannot have been reused by something else.
+        unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+        eprintln!(
+            "instar: the fetcher (pid {pid}) ignored its closed socket for {:?}; killed it",
+            started.elapsed()
+        );
+        // Bounded by the SIGKILL above, which nothing can block or ignore.
+        let _ = self.child.wait();
+    }
+}
+
+/// Start a fetcher serving the file at `path`, and return it together with a
+/// client that has completed the init exchange.
+///
+/// The fetcher is resolved out of the directory instar loads its runtime
+/// files from, which is where the developer build and both packages put it.
+///
+/// Call this before opening `/dev/kvm`. A child cannot inherit a descriptor
+/// its parent has not opened yet, so the ordering is a guarantee that holds
+/// whatever flags someone else's `open` chooses, and it costs nothing:
+/// nothing in an operation needs the VM before it has its input.
+#[allow(dead_code)] // Until an operation opens a remote input.
+pub fn spawn_file_fetcher(path: &Path) -> io::Result<RemoteSource> {
+    spawn_fetcher_binary(&crate::get_binary_path(FETCHER_BINARY), path)
+}
+
+/// Start `fetcher` serving the file at `path`.
+///
+/// Separate from [`spawn_file_fetcher`] so that a test can run the binary it
+/// has just built, rather than the one an installed instar would resolve to.
+fn spawn_fetcher_binary(fetcher: &Path, path: &Path) -> io::Result<RemoteSource> {
+    // Opened, checked and refused before anything is spawned, so that a bad
+    // input costs nothing and is reported in terms of the path the user gave.
+    let file = open_regular_file(path)?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+
+    // Staged clear of the numbers they have to land on, so that the two dup2
+    // calls after the fork cannot overwrite one of these descriptors with
+    // the other.
+    let staged_socket = stage_clear_of_child_fds(theirs.as_fd())?;
+    let staged_file = stage_clear_of_child_fds(file.as_fd())?;
+    let staged_socket_fd = staged_socket.as_raw_fd();
+    let staged_file_fd = staged_file.as_raw_fd();
+
+    let mut command = Command::new(fetcher);
+    command
+        .arg(CHILD_SOCKET_FD.to_string())
+        .arg(CHILD_FILE_FD.to_string())
+        // The child is assumed hostile, and instar's stdout is the output a
+        // user pipes into something else: a fetcher that could write to it
+        // could put text into a JSON document the user trusts. It has no use
+        // for stdin either. Its stderr is inherited, because its diagnostics
+        // are the only thing it can say that is not a status code, and they
+        // are worth having in a failing run's output.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // SAFETY: the closure runs in the child between `fork` and `exec`, where
+    // only async-signal-safe work is permitted: a thread holding a lock in
+    // the parent did not come across the fork, so taking that lock here
+    // would deadlock a process that can never be released. It therefore
+    // calls `dup2` twice and nothing else. It captures two descriptor
+    // numbers by value, allocates nothing, locks nothing and formats
+    // nothing; `io::Error::last_os_error` only records errno, and the
+    // message for it is rendered by the parent.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(staged_socket_fd, CHILD_SOCKET_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(staged_file_fd, CHILD_FILE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("instar could not start {}: {err}", fetcher.display()),
+        )
+    })?;
+
+    // The fork has taken its copies, so the parent closes all four of its
+    // own. The child's socket end matters most: another copy of it open here
+    // would keep the child's `recv` from ever seeing the connection close,
+    // which is how it is told to exit.
+    drop(staged_socket);
+    drop(staged_file);
+    drop(theirs);
+    drop(file);
+
+    // From here on the child is alive and has to be reaped on every path
+    // out, so it is owned by a RemoteSource before the first thing that can
+    // fail. The init exchange is that thing: if it fails, this value is
+    // dropped on the way out, which closes what is left of the socket and
+    // waits for the child.
+    let mut source = RemoteSource {
+        child,
+        client: None,
+    };
+    source.client = Some(FetchClient::new(ours)?);
+    Ok(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileExt;
+
+    use tempfile::tempdir;
 
     fn file_url(arg: &str) -> PathBuf {
         match classify_input(arg) {
@@ -273,5 +641,251 @@ mod tests {
     #[test]
     fn empty_argument_is_a_path() {
         path("");
+    }
+
+    /// A fetcher path that cannot be spawned.
+    ///
+    /// Used by the tests that assert an input is refused: with a fetcher that
+    /// could never start, a refusal naming the input proves the check happens
+    /// before the spawn rather than after it.
+    const UNSPAWNABLE_FETCHER: &str = "/nonexistent/instar-fetch-that-is-never-spawned";
+
+    /// How long a read is given in a test before it is a failure.
+    ///
+    /// Shorter than the client's operational default, because a test that
+    /// hangs for a minute is still a test that hangs.
+    const TEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How long after a drop a test waits for the child to be gone.
+    const TEST_REAP_WINDOW: Duration = Duration::from_secs(5);
+
+    /// The byte a fixture holds at `offset`, so that a read answered from the
+    /// wrong offset -- or from the wrong descriptor -- is a mismatch rather
+    /// than a buffer of zeros that happens to agree.
+    fn pattern(offset: u64) -> u8 {
+        (offset.wrapping_mul(31).wrapping_add(offset >> 9) & 0xff) as u8
+    }
+
+    /// Write a fixture of `len` bytes of [`pattern`] at `path`.
+    fn write_fixture(path: &Path, len: u64) {
+        let bytes: Vec<u8> = (0..len).map(pattern).collect();
+        std::fs::write(path, &bytes).expect("writing the fixture");
+    }
+
+    /// The `instar-fetch` binary for a test to spawn.
+    ///
+    /// `instar-fetch` is a different package, so `CARGO_BIN_EXE_` -- which
+    /// cargo defines only for a package's own integration tests -- does not
+    /// exist here. What does exist is this test binary's own path, and cargo
+    /// links every workspace binary into the profile directory above
+    /// wherever it put the test binary: that has been `target/<profile>/deps`
+    /// and is `target/<profile>/build/<package>/<hash>/out` on the toolchain
+    /// this is pinned to, so the depth is not something to hardcode. Every
+    /// ancestor is searched instead, nearest first, which finds the right
+    /// profile's fetcher whichever layout the toolchain uses.
+    /// `INSTAR_BIN_DIR` is honoured first, exactly as the resolver instar
+    /// uses in production honours it.
+    ///
+    /// Not finding it fails and never skips. A test that skips when its
+    /// subject is missing is a green run that proved nothing, so this panics
+    /// and names the command that builds what is missing.
+    fn fetcher_binary() -> PathBuf {
+        let mut candidates = Vec::new();
+        if let Some(dir) = std::env::var_os("INSTAR_BIN_DIR") {
+            candidates.push(PathBuf::from(dir));
+        }
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        candidates.extend(exe.ancestors().skip(1).map(Path::to_path_buf));
+
+        let mut tried = Vec::new();
+        for dir in candidates {
+            let candidate = dir.join(FETCHER_BINARY);
+            if candidate.is_file() {
+                return candidate;
+            }
+            tried.push(candidate);
+        }
+        panic!(
+            "{FETCHER_BINARY} is at none of {tried:?}; build the workspace with \
+             `make instar`, or point INSTAR_BIN_DIR at the directory holding it, and run \
+             this test again"
+        );
+    }
+
+    #[test]
+    fn a_staged_descriptor_is_clear_of_the_childs_numbers() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 64);
+        let file = File::open(&path).expect("open the fixture");
+
+        let staged = stage_clear_of_child_fds(file.as_fd()).expect("stage the descriptor");
+        assert!(
+            staged.as_raw_fd() >= FIRST_STAGING_FD,
+            "a staged copy on descriptor {} is still in the way of the two the child is \
+             given, so a dup2 onto one of them could close the other",
+            staged.as_raw_fd()
+        );
+
+        // And it is a copy of the same file, not merely some descriptor: one
+        // that read something else would have the child serving the wrong
+        // bytes rather than failing.
+        let staged_file = File::from(staged);
+        let mut byte = [0u8; 1];
+        FileExt::read_exact_at(&staged_file, &mut byte, 7).expect("read through the staged copy");
+        assert_eq!(byte[0], pattern(7));
+    }
+
+    #[test]
+    fn a_remote_read_matches_a_local_pread() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        // Not a multiple of any block size in play, so the last read of the
+        // file is a partial one.
+        write_fixture(&path, 70_001);
+        let mut source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        source
+            .client_mut()
+            .set_reply_timeout(TEST_READ_TIMEOUT)
+            .expect("a ten-second read timeout is accepted");
+
+        let local = File::open(&path).expect("open the fixture locally");
+        for (offset, len) in [(0u64, 512usize), (512, 4096), (65_536, 4_465), (0, 70_001)] {
+            let mut through_the_socket = vec![0u8; len];
+            source
+                .client_mut()
+                .read_at(offset, &mut through_the_socket)
+                .expect("the fetcher answers a read inside the file");
+            let mut locally = vec![0u8; len];
+            FileExt::read_exact_at(&local, &mut locally, offset).expect("pread the fixture");
+            assert_eq!(
+                through_the_socket, locally,
+                "the {len} bytes at offset {offset} differ between the fetcher and a pread"
+            );
+        }
+    }
+
+    #[test]
+    fn the_advertised_capacity_is_the_hosts_file_length() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 70_001);
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        let length = std::fs::metadata(&path).expect("stat the fixture").len();
+        assert_eq!(
+            source.capacity(),
+            length,
+            "the capacity from the init reply disagrees with the host's own file length"
+        );
+    }
+
+    #[test]
+    fn the_child_holds_exactly_the_five_descriptors_it_needs() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+
+        // The whole set, not the absence of one descriptor: the failure this
+        // guards against is the child holding something nobody meant to give
+        // it, which an assertion about particular numbers would not see.
+        let fds: BTreeSet<RawFd> = std::fs::read_dir(format!("/proc/{}/fd", source.pid()))
+            .expect("a live fetcher has a /proc/<pid>/fd")
+            .map(|entry| {
+                entry
+                    .expect("a /proc/<pid>/fd entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<RawFd>()
+                    .expect("a descriptor is named by its number")
+            })
+            .collect();
+        assert_eq!(
+            fds,
+            BTreeSet::from([0, 1, 2, CHILD_SOCKET_FD, CHILD_FILE_FD]),
+            "the fetcher holds descriptors it was not given"
+        );
+    }
+
+    #[test]
+    fn dropping_the_source_reaps_the_child() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        let pid = source.pid();
+
+        let dropped_at = Instant::now();
+        drop(source);
+        let reap_took = dropped_at.elapsed();
+        assert!(
+            reap_took < REAP_GRACE,
+            "the reap took {reap_took:?}, the whole grace period, so the fetcher (pid {pid}) \
+             had to be killed instead of exiting when its socket closed"
+        );
+
+        // The pid is free once it has been waited for, so in principle
+        // something could take it; nothing in this process forks while this
+        // test runs, and the window is microseconds.
+        let signal_pid = libc::pid_t::try_from(pid).expect("a pid fits a pid_t");
+        let deadline = Instant::now() + TEST_REAP_WINDOW;
+        loop {
+            // SAFETY: signal 0 makes the permission checks and delivers
+            // nothing, so this only asks whether the pid still exists.
+            let ret = unsafe { libc::kill(signal_pid, 0) };
+            if ret < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fetcher (pid {pid}) was still there {TEST_REAP_WINDOW:?} after its \
+                 source was dropped"
+            );
+            std::thread::sleep(REAP_POLL);
+        }
+    }
+
+    #[test]
+    fn a_fifo_is_refused_before_anything_is_spawned() {
+        let dir = tempdir().expect("a temporary directory");
+        let fifo = dir.path().join("pipe");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).expect("a path without a NUL");
+        // SAFETY: the path is a NUL-terminated C string that outlives the
+        // call, and the result is checked.
+        let made = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo failed: {}", io::Error::last_os_error());
+
+        // Reaching this with a fetcher that cannot be spawned is the point:
+        // the refusal has to come from the input, not from the child.
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &fifo)
+            .expect_err("a FIFO cannot be served");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "a FIFO was refused for the wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_refused_before_anything_is_spawned() {
+        let dir = tempdir().expect("a temporary directory");
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), dir.path())
+            .expect_err("a directory cannot be served");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "a directory was refused for the wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_input_is_refused_naming_the_path() {
+        let dir = tempdir().expect("a temporary directory");
+        let absent = dir.path().join("absent.raw");
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &absent)
+            .expect_err("a missing file cannot be served");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(&absent.display().to_string()),
+            "the refusal does not name the input: {err}"
+        );
     }
 }
