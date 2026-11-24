@@ -1696,7 +1696,9 @@ for _target in _CONSISTENCY_TARGETS:
 
 
 # ----------------------------------------------------------------------
-# Large-image grows (followup-01: targeted refcount-block pre-pass).
+# Large-image grows, which the targeted refcount-block pre-pass made
+# possible: the staging budget is a bounded set of blocks rather than
+# every non-zero one, so a grow is not limited by the image size.
 # ----------------------------------------------------------------------
 #
 # Before the targeted pre-pass, the guest staged every non-zero

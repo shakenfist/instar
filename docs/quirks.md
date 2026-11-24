@@ -1875,7 +1875,7 @@ walk. Caught and fixed during development.
 
 ### qcow2 grow has no image-size ceiling; qcow2 shrink does
 
-After followup-01, qcow2 *grow* is bounded only by what the
+qcow2 *grow* is bounded only by what the
 filesystem can hold — the guest's targeted pre-pass stages a
 small bounded set of refcount blocks (≤ 16) regardless of
 image size. Tested end-to-end through 1 TiB → 2 TiB in 163 ms.

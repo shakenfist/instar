@@ -103,7 +103,7 @@ pub(crate) fn compute_append_requirements(
 }
 
 // ----------------------------------------------------------------
-// Targeted refcount-block pre-pass query (followup-01).
+// Targeted refcount-block pre-pass query.
 // ----------------------------------------------------------------
 
 /// Implementation of [`crate::compute_qcow2_grow_query`].  Mirrors
@@ -2073,7 +2073,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // compute_grow_query unit tests (followup-01).
+    // compute_grow_query unit tests.
     // ------------------------------------------------------------------
 
     /// Build a `Qcow2ResizeGrowQuery` for a small synthetic qcow2

@@ -689,7 +689,7 @@ pub fn plan_resize_vhdx<'a>(
 }
 
 // ============================================================================
-// Targeted qcow2 grow pre-pass query (followup-01)
+// Targeted qcow2 grow pre-pass query
 // ============================================================================
 
 /// Classification of a qcow2 grow request.

@@ -2252,8 +2252,8 @@ def _resize_option_picker(rng):
             # create-time options needed beyond what the qcow2
             # branch already accumulated.
         else:
-            # qcow2 grow sizes include 256M / 1G after followup-01
-            # lifted the stage-all refcount-block ceiling; both
+            # qcow2 grow sizes include 256M / 1G: the targeted
+            # pre-pass lifted the stage-all refcount-block ceiling; both
             # tools handle these sparse-only-file sizes in well
             # under the differential harness's 30s timeout.
             start = rng.choice(['1M', '4M', '16M', '256M'])
