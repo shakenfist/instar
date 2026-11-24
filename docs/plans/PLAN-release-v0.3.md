@@ -22,7 +22,7 @@ research as needed to give a confident answer. Flag any
 uncertainty explicitly rather than guessing.
 
 This is the **release execution plan** for v0.3.0, modelled on
-`PLAN-release-v0.2.md` (Complete; tagged 2026-05-09). The release
+[`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md) (Complete; tagged 2026-05-09). The release
 machinery — `make release`, `make check-version`, `make package`,
 `.github/workflows/release.yml`, Sigstore tag signing gated on
 the `release` GitHub environment — has run end-to-end exactly
@@ -281,7 +281,7 @@ When this plan is committed:
   subcommand roster", status "Drafted, not started", phases
   "(no phase files; sequential gates)".
 * **`docs/plans/order.yml`** — add `- PLAN-release-v0.3.md:
-  Release v0.3.0` after the `PLAN-release-v0.2.md` entry.
+  Release v0.3.0` after the [`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md) entry.
 
 When v0.3.0 ships, update the status in both this file and
 `index.md` to Complete.

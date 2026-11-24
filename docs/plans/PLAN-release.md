@@ -27,7 +27,7 @@ has since been exercised a second time end-to-end by v0.3.0
   and the documented tag-and-push sequence. v0.2.0 and v0.3.0 both
   went out through it.
 * **Phase 5 (pre-release audit)** — discharged as a v0.2.0 gate;
-  the execution record is in `PLAN-release-v0.2.md`. The recurring
+  the execution record is in [`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md). The recurring
   items have since become standing CI rather than per-release
   checklists: `cargo audit` runs in `supply-chain.yml`, clippy in
   `lint.yml`, the functional suite in `functional-tests.yml`, and
@@ -47,7 +47,7 @@ blockers, and holding this plan open for them was what kept it
 marked in-progress long after it was finished.
 
 Per-release execution lives in its own plan
-(`PLAN-release-v0.2.md`, `PLAN-release-v0.3.md`, future
+([`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md), `PLAN-release-v0.3.md`, future
 `PLAN-release-vN.M.md`). Future releases need this plan only as
 background; they do not reopen it.
 
@@ -303,7 +303,7 @@ The README already exists and is comprehensive but needs an
 
 Discharged as a v0.2.0 gate — the execution record, including which
 items passed and which were carried forward, is in
-`PLAN-release-v0.2.md`. The recurring items are now standing CI
+[`PLAN-release-v0.2.md`](https://github.com/shakenfist/instar/blob/1da53abcad83f6bf5f289a07e67bfad4493aa648/docs/plans/PLAN-release-v0.2.md). The recurring items are now standing CI
 (see the Status section). The checklist below is retained as the
 historical statement of what the gate required.
 
