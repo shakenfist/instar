@@ -296,9 +296,19 @@ it, so from this phase on a caller that does not measure writes a file
 that names some of its extents and no error is raised. The mitigations
 are in the definition of done: the written length must equal the
 measured length at 1, 2, 17 and 1000 extents, a test must assert that a
-one-byte-short buffer produces the needed length and a truncated
-prefix rather than a panic or an overrun, and phase 5's plan must state
-that its caller measures first.
+one-byte-short buffer produces the needed length rather than a panic or
+an overrun, and phase 5's plan must state that its caller measures
+first.
+
+Note what "truncated" means here, because the first draft of this plan
+got it wrong and step 4b's tests corrected it. A `put` copies all of
+its bytes or none of them, so a short buffer does not hold the first
+`len - 1` bytes of the descriptor: it holds every line that fitted
+whole, and nothing of the line that did not. That is the behaviour of
+all four existing builders too. It makes a silently truncated
+descriptor *more* likely to parse as valid, not less, since it ends at
+a line boundary -- which is a reason the caller must measure, not a
+reason to prefer byte-level truncation.
 
 **3. Geometry is computed from the size, not passed in.**
 `split_layout(virtual_size_bytes, kind) -> SplitLayout` yields the
@@ -354,6 +364,15 @@ minimum width three, zero-padded, and runs past three digits unpadded,
 matching the measured `image-s1000.vmdk`. Any instar limit is open
 question 5 and belongs where a refusal can be raised before a file is
 opened, which is phase 5.
+
+There is a second consequence, found by step 4b: the emitter loops once
+per extent, so a `u64::MAX` virtual size means 2^33 iterations. It
+neither panics nor overflows, but it would run for hours. Phase 5's
+caller therefore has to bound the size *before* it measures, not only
+before it writes -- the measuring pass walks every extent too. That is
+the same refusal open question 5 asks phase 5 to decide, so it costs
+phase 5 nothing extra, but it is a correctness requirement on the
+caller rather than a nicety.
 
 Note the asymmetry this leaves, deliberately: instar will be able to
 *write* a descriptor with more extents than it can *read*, because the
@@ -461,9 +480,13 @@ Falsifiable; each is checkable by someone who did not do the work.
    agrees on the extent count, every kind, every sector count and
    every filename.
 5. The measured length equals the written length for 1, 2, 17 and 1000
-   extents; a buffer one byte short returns the same needed length,
-   leaves a prefix of the full output, and does not panic; a
-   zero-length buffer writes nothing.
+   extents. A buffer one byte short returns the same needed length and
+   does not panic, and the bytes it holds are a prefix of the full
+   output ending at the last write that fitted **whole** -- a `put` is
+   all-or-nothing, so the final line is skipped entirely rather than
+   truncated, and the byte past what was copied is left as the caller
+   had it. A zero-length buffer, and an offset past the end of the
+   buffer, write nothing and still measure.
 6. The 1000-extent descriptor's thousandth extent line reads `RW
    4194304 SPARSE "image-s1000.vmdk"`, matching phase 1's measurement
    verbatim.
@@ -558,6 +581,31 @@ were kept: public extent-size, heads and sectors constants that the
 emitter needs; `sectors_of_extent` as a method; and tests for the
 extent sectors summing to the total, the subformat passing through,
 and a `u64::MAX` size not overflowing.
+
+**Step 4b, 2026-11-24.** `build_split_descriptor` and a private
+zero-padding formatter, with five mechanics tests. 3109 passed, 0
+failed, 3 ignored over 83 test binaries on the committed tree, re-run
+by the management session rather than taken from the report;
+`pre-commit run --all-files` 9 of 9. Verified independently of the
+report: the emitted 5 GiB sparse descriptor is byte-identical to the
+426 bytes `vmdk-multi-sparse-5G` records, compared by extracting the
+Rust literal from the test and the expectation from the pin file, and
+both diff hunks are pure insertions so the three existing builders
+are provably untouched.
+
+**Two more facts this plan had wrong, corrected above at source.**
+Definition of done item 5 and decision 2's mitigation both described a
+short buffer as holding the first `len - 1` bytes of the descriptor.
+It does not: a `put` is all-or-nothing, so the last line is skipped
+whole. Step 4b's test asserts the real behaviour and says so in a
+comment rather than bending to the plan's wording, which is what
+surfaced it. Had the plan not been corrected, item 5 would have been
+ticked at the end of the phase on a false reading of a passing test.
+
+Decision 6 also now records the cost of leaving the emitter
+unbounded, which step 4b's author raised: the emit loop runs once per
+extent, so phase 5 must bound the virtual size before the *measuring*
+pass, not just before the write.
 
 **Four facts this plan had wrong, corrected above at source.** Step
 4a found the first: decision 3 wrote `split_layout` as taking
