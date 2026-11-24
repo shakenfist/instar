@@ -414,6 +414,115 @@ fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[pos..20]
 }
 
+/// Format `val` in decimal, left-padded with zeros to at least `min_width`
+/// digits, in a fixed buffer. Returns a slice of the formatted digits.
+///
+/// The width is a floor, not a cap: a value with more digits than
+/// `min_width` is written in full, which is what qemu does for the
+/// thousandth extent of a split image (`image-s1000.vmdk`). A
+/// `min_width` over 20 is treated as 20.
+fn format_u64_padded(mut val: u64, min_width: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let width = if min_width > 20 { 20 } else { min_width };
+    let mut pos = 20;
+    while val > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    while 20 - pos < width {
+        pos -= 1;
+        buf[pos] = b'0';
+    }
+    if pos == 20 {
+        pos = 19;
+        buf[pos] = b'0';
+    }
+    &buf[pos..20]
+}
+
+/// Build a `twoGbMaxExtentSparse` or `twoGbMaxExtentFlat` descriptor into
+/// `buf` starting at `offset`. Returns the number of bytes the descriptor
+/// needs.
+///
+/// Like the other descriptor builders this has `snprintf` semantics: the
+/// cursor advances past the end of the buffer but bytes are copied only
+/// when they fit, so the return value is the full length whatever buffer
+/// was given. Call it once with an empty slice to measure, allocate, and
+/// call it again to write. That matters more here than for the
+/// single-extent descriptors, because the length grows with the number of
+/// extents and is not bounded by a constant.
+///
+/// Extent files are named `<prefix>-s<NNN><postfix>` for a sparse layout
+/// and `<prefix>-f<NNN><postfix>` for a flat one, where `NNN` is the
+/// one-based extent number zero-padded to at least three digits. `prefix`
+/// is the base name without extension (e.g. `b"image"`) and `postfix` is
+/// the extension including its dot (e.g. `b".vmdk"`). The geometry is
+/// taken from `layout`, and the `CID` is a fixed value rather than the
+/// random one qemu writes, so output is reproducible.
+pub fn build_split_descriptor(
+    buf: &mut [u8],
+    offset: usize,
+    layout: &SplitLayout,
+    prefix: &[u8],
+    postfix: &[u8],
+) -> usize {
+    let mut pos = offset;
+
+    let mut put = |bytes: &[u8]| {
+        let end = pos.saturating_add(bytes.len());
+        if let Some(dst) = buf.get_mut(pos..end) {
+            dst.copy_from_slice(bytes);
+        }
+        pos = end;
+    };
+
+    let (create_type, keyword, tag, start): (&[u8], &[u8], &[u8], &[u8]) = match layout.kind {
+        SplitKind::Sparse => (b"twoGbMaxExtentSparse", b" SPARSE \"", b"-s", b"\"\n"),
+        SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\" 0\n"),
+    };
+
+    put(b"# Disk DescriptorFile\n");
+    put(b"version=1\n");
+    put(b"CID=fffffffe\n");
+    put(b"parentCID=ffffffff\n");
+    put(b"createType=\"");
+    put(create_type);
+    put(b"\"\n\n");
+    put(b"# Extent description\n");
+
+    let mut num_buf = [0u8; 20];
+    let mut index = 0u64;
+    while index < layout.extent_count {
+        put(b"RW ");
+        put(format_u64(layout.sectors_of_extent(index), &mut num_buf));
+        put(keyword);
+        put(prefix);
+        put(tag);
+        // index < extent_count <= 2^33, so index + 1 cannot overflow.
+        put(format_u64_padded(index + 1, 3, &mut num_buf));
+        put(postfix);
+        put(start);
+        index += 1;
+    }
+
+    put(b"\n# The Disk Data Base\n");
+    put(b"#DDB\n\n");
+    put(b"ddb.virtualHWVersion = \"4\"\n");
+    put(b"ddb.geometry.cylinders = \"");
+    put(format_u64(layout.cylinders, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.geometry.heads = \"");
+    put(format_u64(layout.heads as u64, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.geometry.sectors = \"");
+    put(format_u64(layout.sectors as u64, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.adapterType = \"ide\"\n");
+    put(b"ddb.toolsVersion = \"2147483647\"\n");
+
+    pos.saturating_sub(offset)
+}
+
 /// Build a metadata marker into a 512-byte buffer.
 ///
 /// Used in streamOptimized VMDK output. Each metadata section
@@ -2819,6 +2928,91 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
             l.sectors_of_extent(l.extent_count - 1),
             SPLIT_EXTENT_SECTORS
         );
+    }
+
+    // ====================================================================
+    // build_split_descriptor mechanics tests
+    // ====================================================================
+
+    /// Large enough for the descriptor of a 1000-extent image.
+    const DESC_BUF: usize = 65536;
+
+    fn split_len(extents: u64, kind: SplitKind) -> usize {
+        let layout = split_layout(extents * SPLIT_EXTENT_SECTORS * 512, kind);
+        assert_eq!(layout.extent_count, extents);
+        build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk")
+    }
+
+    #[test]
+    fn split_descriptor_measured_length_equals_written_length() {
+        for kind in [SplitKind::Sparse, SplitKind::Flat] {
+            for extents in [1u64, 2, 17, 1000] {
+                let layout = split_layout(extents * SPLIT_EXTENT_SECTORS * 512, kind);
+                let measured = build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk");
+                assert!(measured < DESC_BUF);
+                let mut buf = [0u8; DESC_BUF];
+                let written = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+                assert_eq!(measured, written, "{extents} extents, {kind:?}");
+                assert_eq!(buf[written - 1], b'\n');
+                assert_eq!(buf[written], 0, "wrote past the reported length");
+            }
+        }
+        assert!(split_len(1000, SplitKind::Sparse) > split_len(17, SplitKind::Sparse));
+    }
+
+    #[test]
+    fn split_descriptor_short_buffer_returns_needed_length() {
+        let layout = split_layout(5 * GIB, SplitKind::Sparse);
+        let mut full = [0u8; 4096];
+        let need = build_split_descriptor(&mut full, 0, &layout, b"image", b".vmdk");
+        assert!(need < full.len());
+
+        let mut short = [0xAAu8; 4096];
+        let got = build_split_descriptor(&mut short[..need - 1], 0, &layout, b"image", b".vmdk");
+        assert_eq!(got, need);
+        // The final write does not fit, so it is skipped entirely and the
+        // buffer is left holding a prefix of the full output.
+        let copied = need - 1 - b"ddb.toolsVersion = \"2147483647\"\n".len();
+        assert_eq!(short[..copied], full[..copied]);
+        assert_eq!(short[need - 1], 0xAA);
+    }
+
+    #[test]
+    fn split_descriptor_empty_buffer_writes_nothing() {
+        let layout = split_layout(5 * GIB, SplitKind::Flat);
+        let need = build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk");
+        assert!(need > 0);
+        // An offset past the end of the buffer is measured, not a panic.
+        let mut buf = [0x55u8; 8];
+        let got = build_split_descriptor(&mut buf, 1 << 20, &layout, b"image", b".vmdk");
+        assert_eq!(got, need);
+        assert_eq!(buf, [0x55u8; 8]);
+    }
+
+    #[test]
+    fn split_descriptor_sparse_5g_text() {
+        let want = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+createType=\"twoGbMaxExtentSparse\"\n\n# Extent description\n\
+RW 4194304 SPARSE \"image-s001.vmdk\"\nRW 4194304 SPARSE \"image-s002.vmdk\"\n\
+RW 2097152 SPARSE \"image-s003.vmdk\"\n\n# The Disk Data Base\n#DDB\n\n\
+ddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\n\
+ddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\n\
+ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
+        let layout = split_layout(5 * GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 2048];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        assert_eq!(&buf[..n], &want[..]);
+    }
+
+    #[test]
+    fn split_descriptor_index_padding_is_a_floor() {
+        let layout = split_layout(1000 * SPLIT_EXTENT_SECTORS * 512, SplitKind::Sparse);
+        let mut buf = [0u8; DESC_BUF];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        let text = &buf[..n];
+        let has = |needle: &[u8]| text.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"\"image-s999.vmdk\""));
+        assert!(has(b"\"image-s1000.vmdk\""));
     }
 }
 
