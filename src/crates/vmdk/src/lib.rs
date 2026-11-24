@@ -3014,6 +3014,542 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
         assert!(has(b"\"image-s999.vmdk\""));
         assert!(has(b"\"image-s1000.vmdk\""));
     }
+
+    // ====================================================================
+    // split descriptor parity with qemu
+    // ====================================================================
+    //
+    // The descriptors below are what `qemu-img create -f vmdk -o
+    // subformat=twoGbMaxExtentSparse|twoGbMaxExtentFlat` writes, copied from
+    // `tests/golden/qemu-create-pins.json`: the 6.2.0-to-10.2.0 version group,
+    // with the CID written as `fffffffe` and the extent names filled in from the
+    // stem `image`. Every pinned qemu build in that range agrees on them, and
+    // each constant names the pin case it came from. The crate tests cannot
+    // read that file (the container mounts only this repository, and the
+    // workspace has no JSON parser), so a change to the pins has to be copied
+    // here by hand; `tests/test_vmdk_split_descriptor_pins.py` guards the copy.
+    //
+    // The literals keep the shape of `FLAT_DESCRIPTOR` above (real newlines,
+    // every line at column zero) so that the guard can find them as text.
+
+    /// Pin case `vmdk-multi-sparse-1M`.
+    const PIN_SPARSE_1M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 2048 SPARSE \"image-s001.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"2\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-2G`.
+    const PIN_SPARSE_2G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4161\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-2049M`.
+    const PIN_SPARSE_2049M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 2048 SPARSE \"image-s002.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4163\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-4G`.
+    const PIN_SPARSE_4G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"8322\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-5G`.
+    const PIN_SPARSE_5G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+RW 2097152 SPARSE \"image-s003.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"10402\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-21G`.
+    const PIN_SPARSE_21G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+RW 4194304 SPARSE \"image-s003.vmdk\"
+RW 4194304 SPARSE \"image-s004.vmdk\"
+RW 4194304 SPARSE \"image-s005.vmdk\"
+RW 4194304 SPARSE \"image-s006.vmdk\"
+RW 4194304 SPARSE \"image-s007.vmdk\"
+RW 4194304 SPARSE \"image-s008.vmdk\"
+RW 4194304 SPARSE \"image-s009.vmdk\"
+RW 4194304 SPARSE \"image-s010.vmdk\"
+RW 2097152 SPARSE \"image-s011.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"43690\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-1M`.
+    const PIN_FLAT_1M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 2048 FLAT \"image-f001.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"2\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-2G`.
+    const PIN_FLAT_2G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4161\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-2049M`.
+    const PIN_FLAT_2049M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 2048 FLAT \"image-f002.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4163\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-4G`.
+    const PIN_FLAT_4G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"8322\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-5G`.
+    const PIN_FLAT_5G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+RW 2097152 FLAT \"image-f003.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"10402\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-21G`.
+    const PIN_FLAT_21G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+RW 4194304 FLAT \"image-f003.vmdk\" 0
+RW 4194304 FLAT \"image-f004.vmdk\" 0
+RW 4194304 FLAT \"image-f005.vmdk\" 0
+RW 4194304 FLAT \"image-f006.vmdk\" 0
+RW 4194304 FLAT \"image-f007.vmdk\" 0
+RW 4194304 FLAT \"image-f008.vmdk\" 0
+RW 4194304 FLAT \"image-f009.vmdk\" 0
+RW 4194304 FLAT \"image-f010.vmdk\" 0
+RW 2097152 FLAT \"image-f011.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"43690\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// The descriptor of `custom/format-coverage/vmdk-split-sparse-33g.vmdk` in
+    /// instar-testdata, written by qemu-img with its `CID=` line replaced.
+    const QEMU_SPLIT_SPARSE_33G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s001.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s002.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s003.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s004.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s005.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s006.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s007.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s008.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s009.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s010.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s011.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s012.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s013.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s014.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s015.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s016.vmdk\"
+RW 2097152 SPARSE \"vmdk-split-sparse-33g-s017.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"68656\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Parity table: (pin case, virtual size in bytes, kind, expected text).
+    ///
+    /// The two existing-extent cases deliberately share the plain 5 GiB
+    /// text: a file already sitting where an extent goes does not change
+    /// what qemu writes in the descriptor. That the two pinned descriptors
+    /// really are identical is checked where the pin file can be read, in
+    /// `tests/test_vmdk_split_descriptor_pins.py`; asserting it here would
+    /// only compare a constant with itself.
+    fn pin_table() -> [(&'static str, u64, SplitKind, &'static str); 14] {
+        [
+            (
+                "vmdk-multi-sparse-1M",
+                1048576,
+                SplitKind::Sparse,
+                PIN_SPARSE_1M,
+            ),
+            (
+                "vmdk-multi-sparse-2G",
+                2147483648,
+                SplitKind::Sparse,
+                PIN_SPARSE_2G,
+            ),
+            (
+                "vmdk-multi-sparse-2049M",
+                2148532224,
+                SplitKind::Sparse,
+                PIN_SPARSE_2049M,
+            ),
+            (
+                "vmdk-multi-sparse-4G",
+                4294967296,
+                SplitKind::Sparse,
+                PIN_SPARSE_4G,
+            ),
+            (
+                "vmdk-multi-sparse-5G",
+                5368709120,
+                SplitKind::Sparse,
+                PIN_SPARSE_5G,
+            ),
+            (
+                "vmdk-multi-sparse-21G",
+                22548578304,
+                SplitKind::Sparse,
+                PIN_SPARSE_21G,
+            ),
+            (
+                "vmdk-multi-sparse-5G-existing-extent",
+                5368709120,
+                SplitKind::Sparse,
+                PIN_SPARSE_5G,
+            ),
+            ("vmdk-multi-flat-1M", 1048576, SplitKind::Flat, PIN_FLAT_1M),
+            (
+                "vmdk-multi-flat-2G",
+                2147483648,
+                SplitKind::Flat,
+                PIN_FLAT_2G,
+            ),
+            (
+                "vmdk-multi-flat-2049M",
+                2148532224,
+                SplitKind::Flat,
+                PIN_FLAT_2049M,
+            ),
+            (
+                "vmdk-multi-flat-4G",
+                4294967296,
+                SplitKind::Flat,
+                PIN_FLAT_4G,
+            ),
+            (
+                "vmdk-multi-flat-5G",
+                5368709120,
+                SplitKind::Flat,
+                PIN_FLAT_5G,
+            ),
+            (
+                "vmdk-multi-flat-21G",
+                22548578304,
+                SplitKind::Flat,
+                PIN_FLAT_21G,
+            ),
+            (
+                "vmdk-multi-flat-5G-existing-extent",
+                5368709120,
+                SplitKind::Flat,
+                PIN_FLAT_5G,
+            ),
+        ]
+    }
+
+    #[test]
+    fn split_descriptor_matches_every_pinned_qemu_descriptor() {
+        for (case, bytes, kind, want) in pin_table() {
+            let layout = split_layout(bytes, kind);
+            let mut buf = [0u8; 4096];
+            let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+            assert!(n <= buf.len(), "{case}: descriptor needs {n} bytes");
+            assert_eq!(
+                core::str::from_utf8(&buf[..n]).unwrap(),
+                want,
+                "descriptor differs from qemu's for pin case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_descriptor_matches_qemu_written_33g_fixture() {
+        // Seventeen extents and 68656 cylinders: past both the sixteen-extent
+        // and the 65535-cylinder points a smaller case cannot reach.
+        let layout = split_layout(33 * GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 4096];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"vmdk-split-sparse-33g", b".vmdk");
+        assert!(n <= buf.len());
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap(),
+            QEMU_SPLIT_SPARSE_33G
+        );
+    }
+
+    /// Build `<stem><letter><NNN>.vmdk` for a 1-based extent index below 1000.
+    fn extent_name<'a>(out: &'a mut [u8; 64], stem: &[u8], letter: u8, index: usize) -> &'a str {
+        let mut n = 0;
+        for part in [
+            stem,
+            &[
+                b'-',
+                letter,
+                b'0' + (index / 100) as u8,
+                b'0' + (index / 10 % 10) as u8,
+                b'0' + (index % 10) as u8,
+            ][..],
+            b".vmdk",
+        ] {
+            out[n..n + part.len()].copy_from_slice(part);
+            n += part.len();
+        }
+        core::str::from_utf8(&out[..n]).unwrap()
+    }
+
+    /// Emit a descriptor, parse it back, and check every extent against the
+    /// shape qemu pins for the size: all extents 4194304 sectors except the
+    /// last, which holds `last` sectors.
+    fn check_round_trip(bytes: u64, kind: SplitKind, stem: &[u8], count: usize, last: u64) {
+        let layout = split_layout(bytes, kind);
+        let mut buf = [0u8; 4096];
+        let n = build_split_descriptor(&mut buf, 0, &layout, stem, b".vmdk");
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        let parsed = parse_descriptor_extents(text).unwrap();
+        assert_eq!(parsed.len(), count);
+        let (want_kind, letter) = match kind {
+            SplitKind::Sparse => (ExtentKind::Sparse, b's'),
+            SplitKind::Flat => (ExtentKind::Flat, b'f'),
+        };
+        for i in 0..count {
+            let e = parsed.get(i).unwrap();
+            let mut name = [0u8; 64];
+            assert_eq!(e.filename, extent_name(&mut name, stem, letter, i + 1));
+            assert_eq!(e.kind, want_kind, "extent {i}");
+            assert_eq!(e.access, ExtentAccess::Rw, "extent {i}");
+            assert_eq!(e.offset_sectors, 0, "extent {i}");
+            let sectors = if i + 1 == count { last } else { 4194304 };
+            assert_eq!(e.size_sectors, sectors, "extent {i}");
+        }
+    }
+
+    #[test]
+    fn split_descriptor_round_trips_through_the_extent_parser() {
+        // 5 GiB: three extents, the last half-sized (pin case
+        // vmdk-multi-sparse-5G / vmdk-multi-flat-5G).
+        check_round_trip(5 * GIB, SplitKind::Sparse, b"image", 3, 2097152);
+        check_round_trip(5 * GIB, SplitKind::Flat, b"image", 3, 2097152);
+        // 21 GiB: eleven extents (pin case vmdk-multi-*-21G).
+        check_round_trip(21 * GIB, SplitKind::Sparse, b"image", 11, 2097152);
+        check_round_trip(21 * GIB, SplitKind::Flat, b"image", 11, 2097152);
+        // 1 MiB: one extent holding 2048 sectors (pin case vmdk-multi-*-1M).
+        check_round_trip(MIB, SplitKind::Sparse, b"image", 1, 2048);
+        // 33 GiB: seventeen extents (vmdk-split-sparse-33g.vmdk).
+        check_round_trip(
+            33 * GIB,
+            SplitKind::Sparse,
+            b"vmdk-split-sparse-33g",
+            17,
+            2097152,
+        );
+    }
 }
 
 #[cfg(test)]
