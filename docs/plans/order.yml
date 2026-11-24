@@ -8,7 +8,6 @@
 - index.md: Plans index
 - PLAN-distro-matrix-ci.md: Distro matrix CI
 - PLAN-release.md: First public release of instar
-- PLAN-audit.md: Security audit
 - PLAN-coverage-fuzzing.md: Coverage-guided fuzzing
 - PLAN-fuzz-autofix.md: Fuzz autofix workflow
 - PLAN-convert-followups.md: Convert follow-ups

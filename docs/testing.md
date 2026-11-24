@@ -1852,7 +1852,10 @@ fails rather than passing.
 
 The project includes a differential fuzzer (`scripts/differential-fuzz.py`)
 that compares instar against qemu-img on randomly generated images. It is
-part of the security audit plan (`PLAN-audit.md`).
+one of the two standing outputs of the security audit, alongside
+coverage-guided fuzzing; both file their own `security-audit` issues
+every night, and [security-audits.md](security-audits.md) records what
+the audit covered and found.
 
 ### How it works
 
@@ -2052,6 +2055,15 @@ the nightly's work bought with about 20 minutes of an `xl` runner per
 merge, from the pool the merge queue waits on. The same reasoning
 removed coverage-guided fuzzing's post-merge run; see "CI integration"
 under Coverage-Guided Fuzzing.
+
+Both fuzzing jobs run on virtual-machine runners (`xl`) and not on
+bare metal, and that is a containment decision rather than a capacity
+one: these are the only jobs in the repository that run an unbounded
+number of randomly generated images, for hours, against a tool that
+writes files and starts VMs. A runaway run on a VM runner costs the
+runner; on bare metal it could cost the host the whole label pool
+depends on. Give a new long-running fuzz job a VM runner for the same
+reason, even where it needs no KVM.
 
 On failure, the workflow uploads logs as artifacts. The nightly and a
 manual run also file GitHub Issues with the `security-audit` label,

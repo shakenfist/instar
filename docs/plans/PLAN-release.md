@@ -41,7 +41,7 @@ has since been exercised a second time end-to-end by v0.3.0
 The "phase 6 coverage fuzzing" referenced by the old status line
 was never a phase of this plan. Coverage-guided fuzzing and the
 security audit are separately registered master plans
-(`PLAN-coverage-fuzzing.md`, `PLAN-audit.md`) that continue on
+(`PLAN-coverage-fuzzing.md`, [`PLAN-audit.md`](https://github.com/shakenfist/instar/blob/8871b068fc3a997bf930c5f59509cdd5246aa8df/docs/plans/PLAN-audit.md)) that continue on
 their own; they are release-quality work, not first-release
 blockers, and holding this plan open for them was what kept it
 marked in-progress long after it was finished.
@@ -309,7 +309,7 @@ historical statement of what the gate required.
 
 Before tagging v0.2.0:
 
-- [ ] Complete VMM boundary audit (PLAN-audit.md Phase 5) --
+- [ ] Complete VMM boundary audit ([PLAN-audit.md](https://github.com/shakenfist/instar/blob/8871b068fc3a997bf930c5f59509cdd5246aa8df/docs/plans/PLAN-audit.md) Phase 5) --
   this is the most important remaining security item
 - [ ] Run `cargo clippy --all-targets` with no warnings
 - [ ] Run `cargo audit` for known vulnerable dependencies
