@@ -4462,6 +4462,15 @@ impl RebaseResult {
     /// record pads to one 8-byte slot, so this is a guard against
     /// a hand-made header rather than a workflow a user meets.
     pub const ERROR_BACKING_FORMAT_SLOT: u32 = 17;
+    /// A member of the old or new chain is a format this build's
+    /// chain reader cannot serve, so the rebase is refused before
+    /// it reads anything. Distinct from
+    /// [`Self::ERROR_UNSUPPORTED_FORMAT`], which is about the
+    /// overlay being acted on, and from
+    /// [`Self::ERROR_PARSE_FAILED`], which this used to be reported
+    /// as -- "the overlay's header could not be parsed", about an
+    /// overlay that parsed fine.
+    pub const ERROR_CHAIN_UNREADABLE: u32 = 18;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -6433,10 +6442,10 @@ mod tests {
     fn rebase_result_error_codes_distinct() {
         // Codes 0..=13 are the planner and guest refusals, 14 the
         // snapshot gate (issue #421), 15 and 16 the qcow2-write
-        // overlay classification codes, and 17 the
-        // backing-format-record width guard. Confirm every code is
-        // distinct so the host's match arms don't accidentally
-        // alias.
+        // overlay classification codes, 17 the backing-format-record
+        // width guard and 18 the unreadable-chain-member refusal.
+        // Confirm every code is distinct so the host's match arms
+        // don't accidentally alias.
         let codes = [
             RebaseResult::ERROR_OK,
             RebaseResult::ERROR_UNSUPPORTED_FORMAT,
@@ -6456,13 +6465,14 @@ mod tests {
             RebaseResult::ERROR_OVERLAY_UNSUPPORTED,
             RebaseResult::ERROR_OVERLAY_INCONSISTENT,
             RebaseResult::ERROR_BACKING_FORMAT_SLOT,
+            RebaseResult::ERROR_CHAIN_UNREADABLE,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=17 numbering.
+        // Confirm contiguous 0..=18 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }

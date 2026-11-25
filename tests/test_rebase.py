@@ -6,7 +6,9 @@ Structurally a sibling of `test_resize.py`'s layout:
   hang the runner overrides (timeouts, default flags) for
   child classes.
 - ``TestRebaseErrorPaths`` pins the host CLI rejection
-  contracts (pre-checks + chain discovery).
+  contracts (pre-checks + chain discovery), and the guest-side
+  refusal of a chain member whose format the chain reader cannot
+  serve (issue #632).
 - ``TestRebaseSuccessPaths`` enumerates the success-path
   contracts. The qcow2 in-place rewrite paths use ``instar
   create`` to build the fixtures; the vmdk path uses
@@ -213,6 +215,54 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
             self.assert_bytes_identical(
                 overlay.read_bytes(), before,
                 'a refused rebase must not touch the qed overlay')
+
+
+    def test_unreadable_chain_member_names_its_own_reason(self):
+        """A VMDK backing is refused as a chain member it cannot read.
+
+        Safe mode reads the old and new chains through the guest's
+        chain reader, which serves qcow2, raw, VHD and VHDX
+        members. A VMDK member is genuinely outside that set, so
+        refusing is right -- but the refusal came out of the
+        per-cluster reader, which could say no more than that a
+        read had failed, and the runner reported it as
+        `ERROR_PARSE_FAILED`: "the overlay's header could not be
+        parsed" (issue #632).
+
+        The control rebases an identically-shaped overlay over a
+        qcow2 backing, which is what makes the claim "the overlay
+        parses fine" a measurement rather than an assertion.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            for args in (['-f', 'vmdk', 'base.vmdk', '1M'],
+                         ['-f', 'qcow2', 'qbase.qcow2', '1M'],
+                         ['-f', 'qcow2', 'nb.qcow2', '1M']):
+                r = subprocess.run(['qemu-img', 'create', *args],
+                                   capture_output=True, text=True,
+                                   timeout=30, cwd=str(td))
+                self.assertEqual(r.returncode, 0, r.stderr)
+            for backing, fmt, name in (('base.vmdk', 'vmdk', 'vmdk.qcow2'),
+                                       ('qbase.qcow2', 'qcow2', 'qc.qcow2')):
+                r = subprocess.run(
+                    ['qemu-img', 'create', '-f', 'qcow2', '-b', backing,
+                     '-F', fmt, name, '1M'],
+                    capture_output=True, text=True, timeout=30, cwd=str(td))
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+            _, stderr, rc = self.run_instar_rebase(
+                td / 'vmdk.qcow2', '-b', 'nb.qcow2', '-F', 'qcow2')
+            self.assertNotEqual(rc, 0, 'expected the vmdk member to be refused')
+            self.assertIn('a backing chain member is a format this build '
+                          'cannot read', stderr, f'unexpected stderr: {stderr}')
+            self.assertNotIn("overlay's header could not be parsed", stderr,
+                             f'refusal still blames the overlay: {stderr}')
+
+            # Same overlay shape, readable member: rebases.
+            _, stderr, rc = self.run_instar_rebase(
+                td / 'qc.qcow2', '-b', 'nb.qcow2', '-F', 'qcow2')
+            self.assertEqual(rc, 0, f'control rebase failed: {stderr!r}')
 
 
 # ----------------------------------------------------------------------

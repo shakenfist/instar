@@ -1282,6 +1282,27 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         );
     }
 
+    // Refuse a chain this build cannot read before staging a byte
+    // of it, and refuse it with a reason of its own. The old
+    // refusal happened inside the per-cluster reader, which had no
+    // way to say more than "the read failed" and so surfaced as a
+    // parse failure blamed on the overlay (issue #632).
+    for (first, count) in [
+        (config.old_chain_first, config.old_chain_count),
+        (config.new_chain_first, config.new_chain_count),
+    ] {
+        if !chain_segment_is_readable(chain_config, first, count) {
+            (call_table.debug_print)(
+                b"rebase: a chain member's format cannot be read by this build\n\0".as_ptr(),
+            );
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_CHAIN_UNREADABLE,
+            );
+        }
+    }
+
     let mut chain_states = qcow2::ChainStates::default();
     let mut bytes_read: u64 = 0;
     if device_count > 0
@@ -1884,6 +1905,50 @@ unsafe fn read_input_byte_range(
 /// initialised for every qcow2 member via
 /// [`qcow2::init_chain_states`]. `out_buf` must point to at
 /// least `cluster_size` writable bytes.
+/// Pre-flight a chain segment: every member must be a format this
+/// build's chain reader can serve.
+///
+/// `#[cfg(feature = ...)]` here would check this *crate's* own
+/// feature table, not qcow2's -- rebase-op declares no such
+/// features itself, so the qcow2 dependency features below are
+/// unconditional for this binary. Without a format's `-input`
+/// feature on that dependency the qcow2 crate falls through to
+/// `read_raw_sectors` for that format, which is wrong for any
+/// image whose data isn't laid out at the guest-virtual offset;
+/// this allowlist is what rebase-op's own Cargo.toml feature list
+/// (`vhd-input`, `vhdx-input`, alongside the qcow2/raw case that
+/// needed no feature at all) actually supports.
+///
+/// It runs once per segment before the comparison loop rather than
+/// per cluster inside the reader, which is what lets the refusal
+/// have a reason of its own. Inside the reader all it could do was
+/// return "the read failed", which the runner reported as
+/// `ERROR_PARSE_FAILED` -- "the overlay's header could not be
+/// parsed", about an overlay that parsed perfectly well (issue
+/// #632).
+///
+/// The guest has no number formatting, so which member it was goes
+/// no further than this: the error code carries the class of
+/// refusal and the host's message names the formats a rebase can
+/// read, which is what the user needs to act.
+unsafe fn chain_segment_is_readable(
+    chain_config: &ChainConfig,
+    chain_first: u32,
+    chain_count: u32,
+) -> bool {
+    for i in 0..chain_count {
+        let idx = (chain_first + i) as usize;
+        if idx >= MAX_CHAIN_DEVICES {
+            return false;
+        }
+        match chain_config.devices[idx].detected_format() {
+            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 unsafe fn read_chain_cluster(
     call_table: &CallTable,
     chain_first: u32,
@@ -1901,30 +1966,6 @@ unsafe fn read_chain_cluster(
         // reader.
         core::ptr::write_bytes(out_buf, 0, cluster_size as usize);
         return true;
-    }
-
-    // Pre-flight: every chain member must be a format the chain
-    // reader can handle in this build. `#[cfg(feature = ...)]`
-    // here would check this *crate's* own feature table, not
-    // qcow2's -- rebase-op declares no such features itself, so
-    // the qcow2 dependency features below are unconditional for
-    // this binary. Without a format's `-input` feature on that
-    // dependency the qcow2 crate falls through to
-    // `read_raw_sectors` for that format, which is wrong for any
-    // image whose data isn't laid out at the guest-virtual
-    // offset; this allowlist is what rebase-op's own Cargo.toml
-    // feature list (`vhd-input`, `vhdx-input`, alongside the
-    // qcow2/raw case that needed no feature at all) actually
-    // supports.
-    for i in 0..chain_count {
-        let idx = (chain_first + i) as usize;
-        if idx >= MAX_CHAIN_DEVICES {
-            return false;
-        }
-        match chain_config.devices[idx].detected_format() {
-            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
-            _ => return false,
-        }
     }
 
     // `compressed_buf` and `staging_buf` are unused for the

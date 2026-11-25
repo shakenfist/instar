@@ -29,9 +29,10 @@ Common options:
                                existing file's magic bytes
   -b, --backing <BACKING>      Required. New backing file path,
                                or empty string ("") to detach.
-  -F, --backing-format <FMT>   qcow2 | vmdk | raw. Optional
-                               format hint for the new backing;
-                               the guest probes it either way.
+  -F, --backing-format <FMT>   qcow2 | vmdk | raw. Optional.
+                               The guest probes the new backing
+                               either way; this is what gets
+                               recorded in the overlay.
   -u, --backing-unsafe         Unsafe (metadata-only) rebase.
                                Trusts the caller that the new
                                backing has the same content as
@@ -145,6 +146,17 @@ verbatim — instar does not canonicalise to absolute paths.
 
 Detach is signalled by `-b ""`. The backing pointer is zeroed
 and the overlay becomes standalone.
+
+A qcow2 overlay also records its backing's *format*, in a header
+extension, and a reader trusts that field over probing the file. So
+a rebase that changes format rewrites it: without `-F`, to the
+format chain discovery found for the new backing; with `-F`, to
+what `-F` says. An overlay that recorded no format keeps recording
+none -- a reader then probes the backing file, as it did before --
+because adding a record means relaying the extension chain out, and
+that is the same deferred work as long-path relocation. A detach
+leaves the record alone: there is no backing left for it to
+describe.
 
 ## Differencing images in the backing chain
 
@@ -302,6 +314,16 @@ not be composed
  succeeds but the resulting overlay has inconsistent
  metadata; the master plan tracks this as a future
  hardening item.
+- **A chain member rebase cannot read is refused by its own
+ reason.** Safe mode reads the old and new chains through the
+ guest's chain reader, which serves qcow2, raw, VHD and VHDX
+ members; a chain holding any other format -- a VMDK backing
+ file, say, which `qemu-img rebase` reads -- is refused before
+ anything is read, with a message naming the formats it can
+ read. It used to be refused inside the per-cluster reader,
+ which could only report that a read had failed, and that
+ surfaced as `ERROR_PARSE_FAILED`: "the overlay's header could
+ not be parsed", about an overlay that parses perfectly well.
 - **External-data-file qcow2 overlays are refused.** Rebase
  refuses any overlay with the `INCOMPAT_EXTERNAL_DATA`
  feature bit set; that's the qcow2 v3 external data file

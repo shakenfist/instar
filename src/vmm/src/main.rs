@@ -11154,7 +11154,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=18); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -11227,6 +11227,13 @@ fn map_rebase_error(code: u32) -> String {
              without moving the extensions behind it. Use -u on an overlay \
              whose recorded format already matches the new backing, or fall \
              back to `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_CHAIN_UNREADABLE => {
+            "a backing chain member is a format this build cannot read \
+             (rebase reads qcow2, raw, VHD and VHDX chain members); the \
+             overlay itself is fine. Use -u for a metadata-only rebase, or \
+             fall back to `qemu-img rebase`"
                 .into()
         }
         c if c == shared::RebaseResult::ERROR_OVERLAY_INCONSISTENT => {
