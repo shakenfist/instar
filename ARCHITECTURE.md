@@ -60,8 +60,16 @@ image, which is the root cause of backing file disclosure attacks (CVE-2015-5163
 CVE-2024-32498).
 
 **Instar's default behavior (secure):** Files without recognized format headers
-must have a valid partition table (MBR or GPT) to be accepted as RAW disk images.
-Files without valid partition tables are rejected as "unknown format."
+must have a valid partition table (MBR or GPT) to be *named* `raw`. A file
+without one is named `unknown` instead, and what each operation does with that
+name is the operation's own decision rather than a project-wide refusal:
+`instar bench` declines such a file when it is the image named on the command
+line, while the chain reader reads a backing member of that shape as raw --
+which is what `qemu-img` does for the whole class, so a chain instar reads is a
+chain qemu-img reads. The defence that stops a backing reference reaching
+`/etc/shadow` is the backing-path allowlist, not this gate; see
+[docs/chain-discovery.md](docs/chain-discovery.md) for the allowlist and
+[docs/security.md](docs/security.md) for the attack class.
 
 **With `--unsafe-quirks`:** Matches qemu-img behavior for compatibility testing.
 This flag should never be used in production.
