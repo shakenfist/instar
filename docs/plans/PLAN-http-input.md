@@ -613,6 +613,18 @@ all of which keep working for a `file://` input because it still
 resolves to a path. That is what makes this phase an oracle and not
 yet the hard problem; phase 5 is where the path goes away.
 
+Built 2026-11-25, with six departures from the phase plan recorded in
+its execution notes. What later phases need from them: `info` is the
+only operation that accepts a URL, so the "read-only operations accept
+a URL" above is phase 7's to finish; a URL is recognised by `://`, so
+`file:/path` with one slash is a path; `--chain` over a URL is refused
+because it would succeed without the fetcher; a remote store answers a
+flush successfully and refuses a write; the child's stdin and stdout
+are `/dev/null` and its stderr follows `--verbose`; and the two
+descriptors are staged clear of 3 and 4 before the fork, which only
+the end-to-end run through the real binary can catch. Its findings for
+phases 4, 5 and 7 are in Future work below.
+
 **4. Confinement.** Landlock, seccomp-bpf, user and mount
 namespaces, rlimits (`RLIMIT_FSIZE` 0 and `RLIMIT_NPROC` 0 are the
 cheap wins), `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE` 0, and
@@ -1177,6 +1189,29 @@ chosen to defer to here, so that we do not forget them.
   phase 6 raising that default is a change to one constant, because
   the headers and the requested buffers are already built for the
   256 KiB maximum.
+
+* **Whatever routes the fetcher's stderr into a log in phase 5 owns a
+  rate a peer sets.** Phase 3 did not solve this; it gated the problem.
+  The child's stderr follows the caller's `--verbose` and is
+  `/dev/null` otherwise, so by default nothing reads it at all. Once
+  the bytes come from a server, one line per refused or non-`Ok`
+  request is a volume the server chooses, and the routing that makes
+  it visible needs a bound or a sample of its own.
+* **kvm-ioctls 0.25.1 opens `/dev/kvm` with `O_CLOEXEC`, for phase 4.**
+  Measured in the registry copy: `Kvm::new()` calls
+  `open_with_cloexec(true)`, which opens with `O_RDWR | O_CLOEXEC`, and
+  the crate offers `open_with_cloexec(false)` for callers who want
+  otherwise. Phase 3 spawns the fetcher before `Kvm::new()`, so the
+  descriptor cannot cross the `exec` for two independent reasons. The
+  ordering is the one instar owns, since the flag is a default in a
+  dependency that a bump could change, so phase 4's descriptor-hygiene
+  test should keep asserting the whole set rather than lean on either.
+* **`run_check` and `compare_images` call `std::process::exit`, which
+  blocks phase 7.** The fetcher is reaped by a `Drop`, and a `Drop`
+  does not run on `exit`. `info` returns its errors through `main`, so
+  phase 3 is unaffected, but a URL cannot be wired into `check` or
+  `compare` until each returns its errors through `main` instead.
+  `panic = "abort"` is set nowhere, so a panic does unwind and reap.
 
 ### Bugs fixed during this work
 
