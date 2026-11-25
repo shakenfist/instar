@@ -31,6 +31,8 @@ Structurally a sibling of `test_resize.py`'s layout:
 - ``TestRebaseOverlayClassification`` pins the typed refusals
   for overlay shapes safe mode cannot write into, and the
   capacity changes of the qcow2-write based runner.
+- ``TestRebaseRecordsBackingFormat`` pins the backing-format
+  header extension a rebase rewrites (issue #972).
 
 Tests run on the host's installed `instar` binary. The
 success-path tests require ``/dev/kvm`` access; the error
@@ -38,6 +40,7 @@ paths don't.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -1571,3 +1574,66 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
                 self.sha256(fixture / 'qemu.raw'),
                 'rebased virtual content must match qemu-img rebase '
                 'across L2 window evictions')
+
+
+# ----------------------------------------------------------------------
+# The backing format the overlay records.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
+    """A rebase that changes format updates what the overlay records.
+
+    A qcow2 overlay names its backing's format in a header
+    extension and a reader trusts it, so an overlay rebased from a
+    qcow2 backing onto a raw one while still recording `qcow2` is
+    one `qemu-img` refuses to open at all -- issue #972. instar
+    kept reading such an overlay, because chain discovery probes
+    each member instead of trusting the record, which is why the
+    suite did not notice: every round-trip fixture rebases qcow2
+    onto qcow2, where the stale record is accidentally right.
+
+    `-u` is the mode that reaches this on its own: it rewrites the
+    reference without opening either chain.
+    """
+
+    def test_unsafe_rebase_records_the_new_backing_format(self):
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(td / 'base.qcow2'), '1M')
+            self.assertEqual(rc, 0, stderr)
+            # Headerless, so there is no signature to probe: the
+            # recorded format is the only thing that says what this
+            # file is.
+            (td / 'nb.raw').write_bytes(os.urandom(1 << 20))
+            overlay = td / 'ovl.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
+                str(overlay), '1M')
+            self.assertEqual(rc, 0, stderr)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', 'nb.raw', '-F', 'raw')
+            self.assertEqual(rc, 0, f'rebase failed: stderr={stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+            info = json.loads(r.stdout)
+            self.assertEqual(info.get('backing-filename'), 'nb.raw')
+            self.assertEqual(
+                info.get('backing-filename-format'), 'raw',
+                'the overlay still records its old backing\'s format')
+
+            # And the whole overlay opens, not just its header: a
+            # record that disagreed with its own length word would
+            # pass the assertion above and fail here.
+            r = subprocess.run(['qemu-img', 'check', str(overlay)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img check: {r.stdout!r} {r.stderr!r}')

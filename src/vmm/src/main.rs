@@ -10201,10 +10201,25 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     let total_input_devices_final = old_chain_input_devices + new_chain_input_devices;
     debug_assert_eq!(total_input_devices_final, total_input_devices);
 
-    // Resolve the new-backing-format hint. None / "" → 0
-    // (auto-detect by the guest probe path). Honour `-F`.
+    // Resolve the new-backing-format hint. Honour `-F`; without it,
+    // state the format chain discovery found for the new backing,
+    // and fall back to 0 (auto-detect by the guest probe path) only
+    // when there is no new chain to have discovered one -- a detach,
+    // or `-u`, which does not open the new backing at all.
+    //
+    // The guest records this in the overlay's backing-format header
+    // extension, so "no format stated" is not free: an overlay
+    // rebased from a qcow2 backing onto a raw one would go on
+    // recording `qcow2`, and a reader that trusts the field refuses
+    // the overlay. Passing what discovery found makes the common
+    // `instar rebase overlay.qcow2 -b new.qcow2`, with no `-F`,
+    // record the truth.
     let new_backing_format_code = match args.backing_format.as_deref() {
-        None => 0u32,
+        None => new_chain_full
+            .as_ref()
+            .and_then(|c| c.images().first())
+            .map(|top| top.format.to_shared_format_u32())
+            .unwrap_or(0u32),
         Some("qcow2") => IMAGE_FORMAT_QCOW2,
         Some("vmdk") => IMAGE_FORMAT_VMDK4,
         Some("raw") => IMAGE_FORMAT_RAW,
@@ -11123,7 +11138,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=16); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -11188,6 +11203,14 @@ fn map_rebase_error(code: u32) -> String {
              (extended L2 entries, or unknown/compression feature bits). \
              Use -u for a metadata-only rebase or fall back to \
              `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_BACKING_FORMAT_SLOT => {
+            "the overlay's recorded backing format cannot be updated in place: \
+             its header extension is a width this rebase cannot rewrite \
+             without moving the extensions behind it. Use -u on an overlay \
+             whose recorded format already matches the new backing, or fall \
+             back to `qemu-img rebase`"
                 .into()
         }
         c if c == shared::RebaseResult::ERROR_OVERLAY_INCONSISTENT => {

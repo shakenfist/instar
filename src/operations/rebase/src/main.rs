@@ -319,6 +319,27 @@ fn map_rebase_error(e: RebaseError) -> u32 {
         RebaseError::DescriptorTooLarge => RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
         RebaseError::ParseFailed => RebaseResult::ERROR_PARSE_FAILED,
         RebaseError::Overflow => RebaseResult::ERROR_INTERNAL_OVERFLOW,
+        RebaseError::BackingFormatSlotTooSmall => RebaseResult::ERROR_BACKING_FORMAT_SLOT,
+    }
+}
+
+/// The driver name to record for the new backing in the
+/// overlay's `EXT_BACKING_FORMAT` extension, as qemu spells it.
+///
+/// Only the formats `-F` accepts are named. The spelling is the
+/// *driver's*, not instar's enum name -- qemu writes `vpc` for
+/// VHD, where `ImageFormat::name()` says `vhd` -- so a format
+/// whose driver spelling this table has not settled returns an
+/// empty name and the planner leaves the record alone, rather
+/// than writing a name no reader would recognise. A host that
+/// states no format at all (`new_backing_format == 0`, the
+/// auto-detect code) lands here too.
+fn backing_format_record_name(format_code: u32) -> &'static [u8] {
+    match ImageFormat::from_u32(format_code) {
+        ImageFormat::Raw => b"raw",
+        ImageFormat::Qcow2 => b"qcow2",
+        ImageFormat::Vmdk4 => b"vmdk",
+        _ => b"",
     }
 }
 
@@ -582,6 +603,7 @@ unsafe fn run_qcow2_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reb
         new_backing_virtual_size: config.overlay_virtual_size,
         new_backing_path,
         detach: config.is_detach(),
+        new_backing_format_name: backing_format_record_name(config.new_backing_format),
     };
 
     let scratch =
@@ -1026,6 +1048,7 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         new_backing_virtual_size: config.overlay_virtual_size,
         new_backing_path,
         detach: config.is_detach(),
+        new_backing_format_name: backing_format_record_name(config.new_backing_format),
     };
 
     let planner_scratch =

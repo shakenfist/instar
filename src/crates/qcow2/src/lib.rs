@@ -530,6 +530,16 @@ impl QcowHeader {
 pub struct HeaderExtensionResults {
     /// Backing format from EXT_BACKING_FORMAT extension.
     pub backing_format: BackingFormat,
+    /// Byte offset of the backing-format name within the header
+    /// buffer (0 if no EXT_BACKING_FORMAT extension found). A
+    /// caller rewriting the recorded format patches here; the
+    /// extension's own length word is the four bytes before it.
+    pub backing_format_offset: usize,
+    /// Length of the backing-format name in bytes (0 if absent).
+    /// The bytes the record occupies are this rounded up to the
+    /// 8-byte boundary the next extension starts on, which is the
+    /// room a rewrite has without relaying out the header.
+    pub backing_format_len: usize,
     /// Byte offset of the data file name within the header buffer
     /// (0 if no DATA extension found).
     pub data_file_name_offset: usize,
@@ -570,6 +580,8 @@ pub struct HeaderExtensionResults {
 pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExtensionResults {
     let mut result = HeaderExtensionResults {
         backing_format: BackingFormat::None,
+        backing_format_offset: 0,
+        backing_format_len: 0,
         data_file_name_offset: 0,
         data_file_name_len: 0,
         luks_header_offset: 0,
@@ -606,6 +618,8 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
         if ext_type == EXT_BACKING_FORMAT && ext_len > 0 {
             let format_bytes = &header[ext_offset + 8..ext_offset + 8 + ext_len];
             result.backing_format = BackingFormat::from_bytes(format_bytes);
+            result.backing_format_offset = ext_offset + 8;
+            result.backing_format_len = ext_len;
         } else if ext_type == EXT_EXTERNAL_DATA_FILE && ext_len > 0 {
             result.data_file_name_offset = ext_offset + 8;
             result.data_file_name_len = ext_len;

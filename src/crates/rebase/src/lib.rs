@@ -111,6 +111,15 @@ pub enum RebaseError {
     /// header bytes. Indicates either a corrupted image or a
     /// host bug. Maps to `RebaseResult::ERROR_PARSE_FAILED`.
     ParseFailed,
+    /// The overlay's `EXT_BACKING_FORMAT` record cannot hold the
+    /// new backing's driver name at its existing padded width, so
+    /// recording the truth would mean moving every header
+    /// extension behind it. Unreachable for the names rebase can
+    /// record -- `raw`, `qcow2` and `vmdk` all pad to one 8-byte
+    /// slot -- so this guards a hand-made header rather than a
+    /// user's workflow. Maps to
+    /// `RebaseResult::ERROR_BACKING_FORMAT_SLOT`.
+    BackingFormatSlotTooSmall,
 }
 
 /// Mode selector for the rebase planners.
