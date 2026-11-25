@@ -179,11 +179,13 @@ being normalised. The full account, including which locator key `info`
 prefers and why the relative case is rendered back, is the "VHD/VHDX
 differencing" section of [quirks.md](quirks.md).
 
-For a qcow2 or VMDK backing reference, `info` and the reading operations
-can still disagree. A name such as `C:\images\base.qcow2` is also a
-legal POSIX file name, and chain discovery treats it as relative: if a
-file of exactly that name sits in the image's directory, `convert` and
-`compare` read it, while `info` reports the reference with no "actual
-path". Making discovery refuse a Windows absolute reference instead
-would change what those operations open, so it is left for its own
-change ([issue #899](https://github.com/shakenfist/instar/issues/899)).
+This holds for a qcow2 or VMDK backing reference too, and `info` and
+the reading operations agree about it. A name such as
+`C:\images\base.qcow2` is also a legal POSIX file name, and chain
+discovery used to join it onto the image's directory: a file of exactly
+that name sitting beside the image was opened as the backing file,
+while `info` reported the reference with no "actual path" and so showed
+nothing of the kind. Discovery now refuses such a reference, naming it,
+and the reading operations open nothing for it -- which is also what
+`qemu-img` does, for its own reason: it reads everything before the
+first colon as a protocol name and reports `Unknown protocol 'C'`.

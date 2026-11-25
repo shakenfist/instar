@@ -54,10 +54,10 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use backing::BackingStore;
 use chain::{
-    check_chain_depth, check_circular_reference, peek_is_qcow2_v3, peek_is_vmdk_descriptor,
-    reference_spells_path, resolve_vmdk_flat_descriptor, validate_backing_path,
-    validate_backing_write_target, BackingChain, ChainError, ChainImage, ExternalDataFile,
-    ImageFormat, InfoOperationResult,
+    check_chain_depth, check_circular_reference, is_windows_absolute_reference, peek_is_qcow2_v3,
+    peek_is_vmdk_descriptor, reference_spells_path, resolve_vmdk_flat_descriptor,
+    validate_backing_path, validate_backing_write_target, BackingChain, ChainError, ChainImage,
+    ExternalDataFile, ImageFormat, InfoOperationResult,
 };
 use escape::{json_escape, terminal_safe, terminal_safe_path};
 use io_thread::{DeviceRole, IoDevice};
@@ -4286,29 +4286,6 @@ impl UnresolvedParent {
             UnresolvedParent::Unresolvable => "could not be resolved",
         }
     }
-}
-
-/// Is this parent reference a Windows absolute path?
-///
-/// True for a drive-letter path (`C:\images\parent.vhdx`, the VHDX
-/// `absolute_win32_path` locator key) and for anything rooted at `\\`
-/// (`\\?\Volume{GUID}\...`, the `volume_path` key, and plain UNC
-/// shares). Both keys reach the host verbatim, in Windows convention,
-/// because that is what the image says and `info` prints what the
-/// image says.
-///
-/// This is a *classification*, never a conversion. The caller uses the
-/// answer to stop walking, and builds no host path from the value. The
-/// VHDX `relative_path` key does not arrive in Windows convention at
-/// all -- the guest renders it into POSIX before reporting it -- so a
-/// `.\parent.vhdx` locator reaches the host as `parent.vhdx` and
-/// resolves like any other relative name.
-fn is_windows_absolute_reference(reference: &str) -> bool {
-    if reference.starts_with(r"\\") {
-        return true;
-    }
-    let bytes = reference.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
 }
 
 /// Is this backing reference absolute, in either convention?

@@ -370,6 +370,14 @@ pub enum ChainError {
     /// Carries the backing image's path and the data file reference as
     /// its header records it, which is untrusted text.
     BackingDataFileUnsupported { image: PathBuf, data_file: String },
+    /// A reference read from an image's header or descriptor is in
+    /// Windows convention (`C:\images\base.qcow2`, `\\server\share`).
+    /// No file on this host is named by it, and the same spelling is
+    /// also a legal POSIX file name, so joining it onto the image's
+    /// directory would open whatever happened to sit there under that
+    /// name (issue #899). Carries the image that records it and the
+    /// reference as recorded, which is untrusted text.
+    WindowsAbsoluteReference { image: PathBuf, reference: String },
     /// I/O error
     IoError(std::io::Error),
 }
@@ -414,6 +422,17 @@ impl std::fmt::Display for ChainError {
                      files are only supported on the top image of a chain",
                     terminal_safe(&image.to_string_lossy()),
                     terminal_safe(data_file)
+                )
+            }
+            ChainError::WindowsAbsoluteReference { image, reference } => {
+                write!(
+                    f,
+                    "{} records a backing reference in Windows convention ({}), which \
+                     names no file on this host; qemu-img refuses it as an unknown \
+                     protocol and instar will not open a POSIX file of that literal \
+                     name instead",
+                    terminal_safe(&image.to_string_lossy()),
+                    terminal_safe(reference)
                 )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),
@@ -912,12 +931,59 @@ pub fn validate_backing_write_target(
     )
 }
 
+/// Is this reference a Windows absolute path?
+///
+/// True for a drive-letter path (`C:\images\parent.vhdx`, the VHDX
+/// `absolute_win32_path` locator key) and for anything rooted at `\\`
+/// (`\\?\Volume{GUID}\...`, the `volume_path` key, and plain UNC
+/// shares). Both keys reach the host verbatim, in Windows convention,
+/// because that is what the image says and `info` prints what the
+/// image says.
+///
+/// This is a *classification*, never a conversion. No caller builds a
+/// host path from the value: a reporting walk uses the answer to stop,
+/// and [`validate_reference`] uses it to refuse. The VHDX
+/// `relative_path` key does not arrive in Windows convention at all --
+/// the guest renders it into POSIX before reporting it -- so a
+/// `.\parent.vhdx` locator reaches the host as `parent.vhdx` and
+/// resolves like any other relative name.
+pub fn is_windows_absolute_reference(reference: &str) -> bool {
+    if reference.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = reference.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
 fn validate_reference(
     parent_image: &Path,
     backing_path: &str,
     security_config: &SecurityConfig,
     fallback: FileNameFallback,
 ) -> Result<PathBuf, ChainError> {
+    // A reference in Windows convention names no file on this host, so
+    // nothing is opened for it. It is refused here rather than joined
+    // onto the image's directory, which is what used to happen: a
+    // drive-letter or UNC reference is also a legal POSIX file name, so
+    // `C:\images\base.qcow2` beside the image was opened as the
+    // backing file while `info` -- which classifies the same string as
+    // absolute, and so prints it with no resolved path -- reported
+    // nothing of the kind. Whoever could write the image's directory
+    // chose what the reading operations opened, and the audit step did
+    // not show it (issue #899).
+    //
+    // qemu-img refuses the same reference, for its own reason: it reads
+    // everything before the first colon as a protocol name and reports
+    // "Unknown protocol 'C'". So this is parity as well as the stricter
+    // of the two available answers, and it leaves `info` and the
+    // reading operations agreeing about what a chain holds.
+    if is_windows_absolute_reference(backing_path) {
+        return Err(ChainError::WindowsAbsoluteReference {
+            image: parent_image.to_path_buf(),
+            reference: backing_path.to_string(),
+        });
+    }
+
     // The image's directory is canonicalised, so that both `$IMAGE_DIR`
     // and the base relative references are joined to are physical paths
     // whose lexical form means what it says. As spelled, a `..` after a

@@ -238,6 +238,7 @@ validating paths before following them.
 | `Chain depth exceeds maximum` | Chain has too many levels | Increase `max-chain-depth` or investigate chain |
 | `Circular reference detected` | Chain loops back to itself | Fix the image chain |
 | `Info operation failed` | Image parsing error | Check if image is corrupted |
+| `records a backing reference in Windows convention` | The image names its backing in Windows convention (`C:\images\base.qcow2`, `\\server\share\base.qcow2`) | Rewrite the reference as a POSIX path, with `instar rebase -u -b`. The same name is also a legal POSIX file name, so instar refuses it rather than opening whatever sits beside the image under that name; `qemu-img` refuses it too, as an unknown protocol |
 
 ## Operations Using Chain Discovery
 
