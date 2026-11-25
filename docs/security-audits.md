@@ -9,16 +9,17 @@ If you discover a security vulnerability in instar, please report it
 via [GitHub Security Advisories](https://github.com/shakenfist/instar/security/advisories/new).
 Do not file public issues for security vulnerabilities.
 
-**What this page records, and what it does not.** It records resolved
-findings: what was audited, with which techniques, at what scale, and
-every bug that was found and fixed. It deliberately does not describe
-an unresolved finding, because a public list of what is currently
-broken is a roadmap for an attacker; those stay in GitHub Security
-Advisory drafts, which are private until published, until there is a
-fix to describe. Findings are tracked as issues and advisories rather
-than in this page or in a plan for a second reason as well: the
-fuzzers file their own, every night, and a file that CI appends to is
-a file that conflicts with itself.
+## What this page records
+
+This page records resolved findings: what was audited, with which
+techniques, at what scale, and every bug that was found and fixed. It
+deliberately does not describe an unresolved finding, because a public
+list of what is currently broken is a roadmap for an attacker; those
+stay in GitHub Security Advisory drafts, which are private until
+published, until there is a fix to describe. Findings are tracked as
+issues and advisories rather than in this page or in a plan for a
+second reason as well: the fuzzers file their own, every night, and a
+file that CI appends to is a file that conflicts with itself.
 
 ## Static analysis and code review
 

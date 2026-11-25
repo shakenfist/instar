@@ -807,7 +807,8 @@ medium / low / informational). For each finding, state
 the file, line, the vulnerability class, and a
 recommended fix.  File any critical or high finding as
 a `security-audit` GitHub issue, per the
-tracking conventions in `docs/security-audits.md`:
+tracking conventions in `docs/security-audits.md`
+("What this page records"):
 findings live in issues and advisories rather than in a
 document, and an unresolved one is not described
 publicly until there is a fix to describe.

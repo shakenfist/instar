@@ -588,7 +588,9 @@ and a version bump pushed straight to `develop` has no such run.
    `make test-rust`, and then asks before it commits `Release 0.2.0.`,
    pushes the branch and opens a pull request. On `N`, or on any
    failure before the push, it deletes the branch and leaves the
-   checkout as it was.
+   checkout as it was. Run `make audit` before proposing: the comment
+   above the `audit` target in the `Makefile` says which `cargo audit`
+   findings block a release and which do not.
 2. **Merge.** Get the pull request reviewed and land it through the
    merge queue like any other change, then wait for the queue's
    `functional-tests.yml` run on the merged commit to finish.
@@ -616,34 +618,6 @@ and a version bump pushed straight to `develop` has no such run.
    `## [Unreleased]`, which
    `git show "$(git log -1 --format=%H --diff-filter=D -- CHANGELOG.md)^:CHANGELOG.md"`
    prints.
-
-### Distribution channels instar does not use
-
-Each of these was considered when the first public release was put
-together and deliberately left out. None is blocked on effort alone,
-so a proposal to add one should start from the reason it is absent.
-
-- **crates.io, for the format crates.** The six format crates are
-  marked `publish = false`. They are not a general-purpose parser
-  API: they expose the bare-metal call-table ABI the guest
-  operations are built against, with the allocation and panic
-  discipline that implies. Publishing them usefully means designing
-  and maintaining a wrapper layer first, which is a project of its
-  own rather than a packaging step.
-- **cargo-dist and release-plz.** Both model a build that is
-  `cargo build` on a hosted runner. instar's is Docker plus a pinned
-  nightly plus a bare-metal cross-compile, with the guest binaries
-  converted to flat images and size-checked against the guest memory
-  map, so the parts these tools automate are the parts that are not
-  the hard ones here.
-- **A Homebrew tap.** instar needs `/dev/kvm`, so there is no macOS
-  build to tap.
-- **musl static builds, and aarch64 packages.** Neither is planned.
-  The glibc floor, not linking, is what decides which distributions
-  the release runs on -- see "Do not bump the release image's base"
-  above -- and aarch64 waits on test hardware, since a package built
-  for an architecture nothing in CI can boot is a claim rather than a
-  release.
 
 `ci-gate` checks that `functional-tests.yml` succeeded on the tagged
 commit, in its merge queue run. A run started by hand, as
@@ -717,6 +691,34 @@ first. The version the tag must name is `src/vmm/Cargo.toml`'s;
 the same version. Bump with it, never with `tools/release-version.sh
 set`, which changes only `src/vmm/Cargo.toml` and would leave the
 other crates behind.
+
+### Distribution channels instar does not use
+
+Each of these was considered when the first public release was put
+together and deliberately left out. None is blocked on effort alone,
+so a proposal to add one should start from the reason it is absent.
+
+- **crates.io, for the format crates.** The six format crates are
+  marked `publish = false`. They are not a general-purpose parser
+  API: they expose the bare-metal call-table ABI the guest
+  operations are built against, with the allocation and panic
+  discipline that implies. Publishing them usefully means designing
+  and maintaining a wrapper layer first, which is a project of its
+  own rather than a packaging step.
+- **cargo-dist and release-plz.** Both model a build that is
+  `cargo build` on a hosted runner. instar's is Docker plus a pinned
+  nightly plus a bare-metal cross-compile, with the guest binaries
+  converted to flat images and size-checked against the guest memory
+  map, so the parts these tools automate are the parts that are not
+  the hard ones here.
+- **A Homebrew tap.** instar needs `/dev/kvm`, so there is no macOS
+  build to tap.
+- **musl static builds, and aarch64 packages.** Neither is planned.
+  The glibc floor, not linking, is what decides which distributions
+  the release runs on -- see "Do not bump the release image's base"
+  above -- and aarch64 waits on test hardware, since a package built
+  for an architecture nothing in CI can boot is a claim rather than a
+  release.
 
 ## GitHub automation
 

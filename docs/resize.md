@@ -123,27 +123,29 @@ bytes from 5246976 to the end of that cluster under both tools. A grow
 zero-check covers.
 
 **Image-size ceiling.** qcow2 grow is bounded only by what the
-filesystem can hold — the targeted refcount-block
-pre-pass keeps the guest's metadata staging budget O(1) blocks
-regardless of image size. Tested end-to-end through 1 TiB → 2 TiB
-in under 200 ms (`tests/test_resize.py:TestResizeLargeImages`).
-qcow2 shrink retains the older "stage every non-zero refcount
-block" pre-pass and so retains a per-cluster-size ceiling
-(~128 GiB at the default 64 KiB cluster); lifting it is the next
-follow-up in the Future-work section below. Raw / vmdk / vpc /
-vhdx have no analogous metadata-staging step and are bounded
-only by filesystem capacity.
+filesystem can hold — the targeted refcount-block pre-pass keeps the
+guest's metadata staging budget O(1) blocks regardless of image size.
+Tested end-to-end through 1 TiB → 2 TiB in under 200 ms
+(`tests/test_resize.py:TestResizeLargeImages`). qcow2 shrink retains
+the older "stage every non-zero refcount block" pre-pass and so
+retains a per-cluster-size ceiling (~128 GiB at the default 64 KiB
+cluster); lifting it is the next follow-up in the Future-work section
+below. Raw / vmdk / vpc / vhdx have no analogous metadata-staging step
+and are bounded only by filesystem capacity.
 
 Two things about that pre-pass are deliberate, and both are easy to
-undo by accident. The grow flavour is decided from the header's
-scalar fields alone -- cluster size, refcount width, the current and
-new virtual sizes, the L1 entry count and table offset, the refcount
-table's cluster count -- and from no refcount-block content. That is
-what makes the targeted staging possible at all: the guest can choose
-the flavour, ask which blocks that flavour will touch, and only then
-read them. A change that made the decision depend on block content
-would put the staging back where it started, because the guest would
-have to read blocks to find out which blocks to read.
+undo by accident. The grow flavour is decided from the header's scalar
+fields -- chief among them the cluster size, refcount width, the
+current and new virtual sizes, the current file size (the new L1
+region is appended at EOF, so it decides which refcount blocks the
+flavour touches), the L1 entry count and table offset, and the
+refcount table's offset and cluster count -- plus the refcount
+*table*, and from no refcount-block content. That is what makes the
+targeted staging possible at all: the guest can choose the flavour,
+ask which blocks that flavour will touch, and only then read them. A
+change that made the decision depend on block content would put the
+staging back where it started, because the guest would have to read
+blocks to find out which blocks to read.
 
 And when the planner reports `ScratchTooSmall` for a block the guest
 did not stage, the guest does **not** retry with a wider stage list.
