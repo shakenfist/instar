@@ -184,7 +184,12 @@ fn rebase_records_the_new_backing_format() {
         detach: false,
         new_backing_format_name: b"raw",
     };
-    let mut scratch = vec![0u8; 64 * 1024];
+    // Dirty scratch, because the guest's is: `PLANNER_SCRATCH` is a
+    // fixed region of guest memory that previous work has written to,
+    // never a fresh zeroed allocation. A zero-filled buffer here made
+    // the record's padding look right whether the planner wrote it or
+    // not, which is what the mutation check for that line caught.
+    let mut scratch = vec![0xccu8; 64 * 1024];
     let out = plan_rebase_qcow2(&opts, &mut scratch).expect("rebase plan");
     let plan = match out {
         Qcow2RebaseOutput::Unsafe { plan } => plan,

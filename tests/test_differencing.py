@@ -3516,26 +3516,32 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
             with self.subTest(image=image_id):
                 child = self._substituted_copy(image_id, self._qcow2_parent)
                 stdout, stderr, rc = self.run_instar_info(child, chain=True)
+                # Every excerpt below is bounded. A subTest that
+                # embeds a whole chain listing in each of four
+                # messages, three fixtures over, bursts subunit's
+                # packet limit and takes the stestr worker with it --
+                # which reports as a partial run rather than as this
+                # failure.
                 self.assertEqual(
                     0, rc,
                     f'{image_id}: info --chain must not fail on a chain it '
-                    f'can only report; stdout={stdout[:400]!r} '
-                    f'stderr={stderr[:400]!r}'
+                    f'can only report; stdout={stdout[:200]!r} '
+                    f'stderr={stderr[:200]!r}'
                 )
                 self.assertIn(
                     'Chain: 1 image(s)', stdout,
                     f'{image_id}: the qcow2 standing in for the parent must '
-                    f'not be listed; stdout={stdout!r}'
+                    f'not be listed; stdout={stdout[:200]!r}'
                 )
                 self.assertIn(
                     'qcow2', stderr,
                     f'{image_id}: the reason must name what the parent '
-                    f'turned out to be; stderr={stderr!r}'
+                    f'turned out to be; stderr={stderr[:200]!r}'
                 )
                 self.assertIn(
                     parent_name, stdout,
                     f'{image_id}: the child line must still print the '
-                    f'reference it names; stdout={stdout!r}'
+                    f'reference it names; stdout={stdout[:200]!r}'
                 )
 
     def test_convert_refuses_a_wrong_format_parent(self):
@@ -3555,12 +3561,12 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
                 self.assertIn(
                     'its parent must be', stderr,
                     f'{image_id}: the refusal must say what the parent had '
-                    f'to be; stderr={stderr!r}'
+                    f'to be; stderr={stderr[:200]!r}'
                 )
                 self.assertIn(
                     'is qcow2', stderr,
                     f'{image_id}: the refusal must say what it is instead; '
-                    f'stderr={stderr!r}'
+                    f'stderr={stderr[:200]!r}'
                 )
                 self.assertFalse(
                     out.exists(),
@@ -3583,7 +3589,7 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
                     self.assertIn(
                         'Chain: 2 image(s)', stdout,
                         f'{image_id}: the real parent must still be '
-                        f'listed; stdout={stdout!r}'
+                        f'listed; stdout={stdout[:200]!r}'
                     )
                     out = Path(tmp) / 'out.raw'
                     _, stderr, rc = self.run_instar_convert(

@@ -1693,6 +1693,52 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
                              f'qemu-img check: {r.stdout!r} {r.stderr!r}')
 
 
+    def test_safe_rebase_without_f_records_the_discovered_format(self):
+        """With no `-F`, the record is the format discovery found.
+
+        The `-F`-less invocation is the common one, and the only one
+        the host has to answer for itself: with no hint it states the
+        format chain discovery found for the new backing. Passing the
+        auto-detect code instead would leave the overlay recording its
+        old backing's format, which is #972 reached by another route --
+        and the mutation check for that line is what showed nothing
+        covered it.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(td / 'base.qcow2'), '1M')
+            self.assertEqual(rc, 0, stderr)
+            r = subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x42 0 64k',
+                 str(td / 'base.qcow2')],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # Headerless: discovery names it `unknown`, and the format
+            # the guest is told to read it as is what gets recorded.
+            (td / 'nb.raw').write_bytes(os.urandom(1 << 20))
+            overlay = td / 'ovl.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-b', 'base.qcow2',
+                 '-F', 'qcow2', 'ovl.qcow2', '1M'],
+                capture_output=True, text=True, timeout=30, cwd=str(td))
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            _, stderr, rc = self.run_instar_rebase(overlay, '-b', 'nb.raw')
+            self.assertEqual(rc, 0, f'rebase failed: stderr={stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+            self.assertEqual(
+                json.loads(r.stdout).get('backing-filename-format'), 'raw',
+                'without -F the overlay must record what discovery found')
+
+
 # ----------------------------------------------------------------------
 # Chains holding a member the info gate could not identify.
 # ----------------------------------------------------------------------
