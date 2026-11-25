@@ -684,3 +684,184 @@ class TestInfoMultiFileVmdk(InstarTestBase):
                     f'{image_id}: the image\'s allocation is the sum over '
                     f'the descriptor and every extent'
                 )
+
+
+# One safe image per format for the file-URL comparison below. A URL's
+# bytes reach the guest over a socket from a separate process, while a
+# path's are read from a descriptor the privileged process opened
+# itself, so the spread is across formats rather than across sizes:
+# every format parses its own headers in the guest and so asks for a
+# different set of reads. `vmdk-flat-1m` is here for a second reason --
+# its descriptor is resolved on the host, which is a read of the input
+# that does not go through the socket at all.
+FILE_URL_FIXTURES = (
+    'cirros-qcow2',
+    'hyperv-dynamic-vhd',
+    'qemu-vhdx',
+    'vmdk-flat-1m',
+    'vdi-simple',
+    'raw-mbr-partitioned',
+)
+
+# Every scheme instar recognises and does not serve, plus one it does
+# not recognise at all. Each must be refused by name: until a scheme is
+# served, an input naming it would otherwise be opened as a path and
+# reported as a missing file, which tells the user their file is gone
+# rather than that the feature is not built.
+REFUSED_SCHEMES = ('https', 'http', 's3', 'nbd', 'ftp')
+
+
+class TestInfoFileUrl(InstarTestBase):
+    """`instar info` over a `file://` URL rather than a path.
+
+    A URL is served by a fetcher process holding the image open, which
+    answers reads over a socket; a path is read directly by the
+    privileged process. These pin that the two routes produce the same
+    bytes on stdout for the same file, and that the schemes instar does
+    not serve are refused by name instead of being opened as paths.
+    """
+
+    def _fixture(self, image_id):
+        """Resolve a manifest image, skipping if it is not on disk."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _info(self, target, image=None, output_format=None, chain=False):
+        """Run `info` on a path or URL, as the fixture requires it to be run."""
+        return self.run_instar_info(
+            target,
+            timeout=120,
+            output_format=output_format,
+            unsafe_quirks=bool(image is not None and image.requires_unsafe_quirks),
+            chain=chain,
+        )
+
+    @staticmethod
+    def _targets(path):
+        """The three spellings of one local image: the path and two URL forms."""
+        return (str(path), f'file://{path}', f'file://localhost{path}')
+
+    def test_a_file_url_prints_what_the_path_prints(self):
+        """The path and both `file://` spellings print identical stdout.
+
+        The exit status and the output's length are part of the
+        comparison, not separate checks made somewhere else: two failed
+        runs produce two empty streams that compare equal, so a
+        comparison that cannot tell success from failure proves
+        nothing.
+        """
+        for image_id in FILE_URL_FIXTURES:
+            image = self._fixture(image_id)
+            path = image.path.resolve()
+            for output_format in (None, 'json'):
+                with self.subTest(image=image_id, output=output_format or 'human'):
+                    expected = None
+                    for target in self._targets(path):
+                        stdout, stderr, rc = self._info(target, image, output_format)
+                        self.assertEqual(
+                            0, rc,
+                            f'{image_id}: info {target} exited {rc}; stderr={stderr!r}'
+                        )
+                        self.assertNotEqual(
+                            '', stdout,
+                            f'{image_id}: info {target} exited 0 and printed nothing'
+                        )
+                        if expected is None:
+                            expected = stdout
+                        else:
+                            self.assertEqual(
+                                expected, stdout,
+                                f'{image_id}: info {target} printed something other than '
+                                f'what the plain path printed'
+                            )
+
+    def test_a_default_run_is_silent_on_stderr_either_way(self):
+        """Neither spelling writes anything to stderr by default.
+
+        The fetcher says two things on a run that goes well -- what it
+        is serving, and that its peer closed the socket -- and its
+        stderr is only inherited when the caller asked to be verbose.
+        Reading a local file says nothing at all, so a URL saying two
+        lines would be internal chatter on a successful run that the
+        same command on a path does not print. The two streams are kept
+        apart for this reason: a comparison of the two combined would
+        hide it, and under `--verbose` the diagnostics are there by
+        design.
+        """
+        for image_id in FILE_URL_FIXTURES:
+            image = self._fixture(image_id)
+            path = image.path.resolve()
+            for target in self._targets(path):
+                with self.subTest(image=image_id, target=target):
+                    stdout, stderr, rc = self._info(target, image)
+                    self.assertEqual(0, rc, f'{image_id}: info {target} exited {rc}')
+                    self.assertNotEqual('', stdout, f'{image_id}: info {target} printed nothing')
+                    self.assertEqual(
+                        '', stderr,
+                        f'{image_id}: info {target} wrote to stderr without --verbose'
+                    )
+
+    def test_a_scheme_instar_does_not_serve_is_refused_by_name(self):
+        """Every unserved scheme exits non-zero and names itself."""
+        for scheme in REFUSED_SCHEMES:
+            with self.subTest(scheme=scheme):
+                target = f'{scheme}://example.com/disk.qcow2'
+                stdout, stderr, rc = self._info(target)
+                self.assertNotEqual(
+                    0, rc, f'{target} must not succeed; stdout={stdout!r}'
+                )
+                self.assertEqual('', stdout, f'{target} printed an image report')
+                self.assertIn(
+                    f'{scheme}://', stderr,
+                    f'the refusal of {target} does not name the scheme: {stderr!r}'
+                )
+                self.assertNotIn(
+                    'No such file', stderr,
+                    f'{target} was resolved as a path rather than refused: {stderr!r}'
+                )
+
+    def test_a_file_url_naming_another_host_is_refused(self):
+        """A `file://` URL with a foreign authority is refused, not read.
+
+        The file is the one the rest of this class reads successfully,
+        so what is refused here is the authority and nothing else.
+        """
+        path = self._fixture('cirros-qcow2').path.resolve()
+        stdout, stderr, rc = self._info(f'file://evil.example{path}')
+        self.assertNotEqual(0, rc, f'a foreign host must not be served; stdout={stdout!r}')
+        self.assertEqual('', stdout, 'a foreign host must print no image report')
+        self.assertIn(
+            'localhost', stderr,
+            f'the refusal does not say which hosts are supported: {stderr!r}'
+        )
+
+    def test_chain_over_a_file_url_is_refused_rather_than_resolved(self):
+        """`--chain` with a URL is refused with its own sentence.
+
+        Chain discovery opens every member on the privileged side, so
+        over a URL naming a local file it would succeed without reading
+        a byte through the fetcher: a feature that looks supported and
+        is not. The refusal has to be its own sentence rather than a
+        path error, which is what would happen if the URL string
+        reached the filesystem.
+        """
+        image = self._fixture('cirros-qcow2')
+        path = image.path.resolve()
+        stdout, stderr, rc = self._info(f'file://{path}', image, chain=True)
+        self.assertNotEqual(0, rc, f'--chain over a URL must not succeed; stdout={stdout!r}')
+        self.assertIn(
+            'backing chain', stderr,
+            f'--chain over a URL was refused for the wrong reason: {stderr!r}'
+        )
+        self.assertNotIn(
+            'No such file', stderr,
+            f'the URL reached the filesystem as a path: {stderr!r}'
+        )
+
+        # And the same image without the flag still works, so the
+        # refusal is the flag's and not the URL's.
+        stdout, stderr, rc = self._info(f'file://{path}', image)
+        self.assertEqual(0, rc, f'info over the same URL must still work; stderr={stderr!r}')
+        self.assertNotEqual('', stdout, 'info over the same URL printed nothing')

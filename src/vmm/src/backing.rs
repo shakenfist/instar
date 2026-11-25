@@ -6,11 +6,18 @@
 //!
 //! For output devices, supports "sparse" mode where the file is not
 //! pre-allocated and grows on demand as sectors are written.
+//!
+//! An input need not be a local file at all: a store can instead read through
+//! a fetcher, an unprivileged child process that holds the bytes and answers
+//! one read at a time over a socket. Such a store is read-only, and its size
+//! is the one the fetcher advertised rather than anything this side stats.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::fetch::RemoteSource;
 
 /// One member of a concatenated backing store.
 ///
@@ -39,6 +46,10 @@ struct ConcatMember {
 enum Storage {
     Single(File),
     Concatenated(Vec<ConcatMember>),
+    /// A fetcher holding the bytes, reached one read at a time over a
+    /// socket. Owning the source here is what ties the child's lifetime to
+    /// the device's: when the store goes, so does the process serving it.
+    Remote(RemoteSource),
 }
 
 /// Backing store for virtio-block devices using buffered file I/O.
@@ -220,6 +231,33 @@ impl BackingStore {
         })
     }
 
+    /// Open a read-only backing store whose bytes come from a fetcher.
+    ///
+    /// The capacity is the one the fetcher advertised when the client
+    /// completed its init exchange, not a length this side stat'ed. That is
+    /// the only size a fetcher reading from somewhere other than a local file
+    /// could report, so taking it from the protocol is what keeps this
+    /// honest while there is still a local file to check it against.
+    ///
+    /// `current_size` is the capacity rather than anything smaller: the
+    /// fetcher, not this side, decides what is past the end of the source,
+    /// and the client already answers a read past it with zeros. Nothing
+    /// grows, so the store is not sparse.
+    ///
+    /// Opening cannot fail, because everything that can has already
+    /// happened: the file was opened and refused on this side, the child was
+    /// started, and the init exchange completed, all before a source exists
+    /// to be handed over.
+    pub fn open_remote(source: RemoteSource) -> Self {
+        let capacity = source.capacity();
+        Self {
+            storage: Storage::Remote(source),
+            capacity,
+            current_size: capacity,
+            sparse: false,
+        }
+    }
+
     /// Compute `offset + buf.len()` with overflow checking.
     fn checked_end(offset: u64, len: usize) -> io::Result<u64> {
         offset
@@ -236,6 +274,15 @@ impl BackingStore {
             Storage::Single(file) => file,
             Storage::Concatenated(members) => {
                 return Self::read_concatenated(members, offset, buf);
+            }
+            // Straight to the client, with no bounds logic of its own. The
+            // client already answers a read wholly or partly past the
+            // advertised capacity with zeros, which is the same rule the
+            // single-file arm below applies past the end of its file; a
+            // second implementation of it here could only differ from the
+            // first.
+            Storage::Remote(source) => {
+                return source.client_mut().read_at(offset, buf);
             }
         };
 
@@ -323,6 +370,16 @@ impl BackingStore {
                     "a backing store spanning several files is read-only",
                 ));
             }
+            // Nothing can reach this today: a remote input is attached to a
+            // read-only device. The refusal is here so that the day an
+            // operation with an output is given one, the write fails loudly
+            // rather than being accepted and dropped on the floor.
+            Storage::Remote(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a backing store served by a fetcher is read-only",
+                ));
+            }
         };
 
         // Reject writes beyond the device capacity
@@ -360,6 +417,15 @@ impl BackingStore {
                 }
                 Ok(())
             }
+            // Nothing to sync, so this succeeds rather than refusing. A
+            // guest's FLUSH reaches here whether or not its device is
+            // read-only, and a read-only local store answers it by
+            // fsync-ing a descriptor with nothing dirty on it, which
+            // succeeds. Refusing instead would make a device fail a
+            // request the same device backed by a local file satisfies,
+            // and nothing on this side buffers a byte that a success
+            // could be lying about: the protocol only reads.
+            Storage::Remote(_) => Ok(()),
         }
     }
 
@@ -381,6 +447,12 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    // Shared with the fetch module's own tests rather than copied: the
+    // search for the freshly built fetcher fails loudly when it is missing
+    // instead of skipping, and a second copy of it is how one of the two
+    // would come to skip silently.
+    use crate::fetch::test_support::{pattern, spawn_test_fetcher, write_fixture};
 
     #[test]
     fn test_regular_backing() {
@@ -762,6 +834,123 @@ mod tests {
             "a store with no files must be refused",
         );
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The length of the remote fixtures. Deliberately not a multiple of any
+    /// sector or block size in play, so that the last read of the file is a
+    /// partial one and a read of the final sector runs past the end.
+    const REMOTE_FIXTURE_LEN: u64 = 70_001;
+
+    /// A fixture, a store reading it through a fetcher, and a store reading
+    /// the same file directly, for a test that compares the two.
+    ///
+    /// The directory is returned because dropping it removes the fixture
+    /// from under both stores.
+    fn remote_and_local(dir: &tempfile::TempDir) -> (PathBuf, BackingStore, BackingStore) {
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, REMOTE_FIXTURE_LEN);
+        let remote = BackingStore::open_remote(spawn_test_fetcher(&path));
+        let local = BackingStore::open(&path, true, None, false).expect("open the fixture locally");
+        (path, remote, local)
+    }
+
+    #[test]
+    fn test_remote_agrees_with_a_local_store_at_every_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, mut remote, mut local) = remote_and_local(&dir);
+
+        // Inside the file, on and off a sector boundary; a read larger than
+        // one protocol block, so the client's splitting is exercised; a read
+        // that spans the end of the file; and reads wholly past it, one
+        // starting exactly at the end. The first byte of each buffer is a
+        // non-zero pattern byte wherever the file has one, so a store
+        // answering with zeros would not agree by accident.
+        for (offset, len) in [
+            (0u64, 512usize),
+            (512, 4096),
+            (1, 1023),
+            (0, REMOTE_FIXTURE_LEN as usize),
+            (REMOTE_FIXTURE_LEN - 512, 512),
+            (REMOTE_FIXTURE_LEN - 7, 512),
+            (REMOTE_FIXTURE_LEN, 512),
+            (REMOTE_FIXTURE_LEN + 4096, 64),
+        ] {
+            let mut through_the_fetcher = vec![0xFFu8; len];
+            remote
+                .read_at(offset, &mut through_the_fetcher)
+                .expect("the fetcher answers a read");
+            let mut from_the_file = vec![0xEEu8; len];
+            local
+                .read_at(offset, &mut from_the_file)
+                .expect("the local store answers the same read");
+            assert_eq!(
+                through_the_fetcher, from_the_file,
+                "the {len} bytes at offset {offset} differ between a remote store and a \
+                 local one over the same file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_remote_read_past_the_end_is_zeros_not_an_error() {
+        // The agreement test above would also pass if both stores failed the
+        // same way, so the zero-filling itself is asserted separately: a
+        // guest reading the last sector of a source that is not a sector
+        // multiple is reading past the end of it legally.
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, mut remote, _local) = remote_and_local(&dir);
+
+        let mut buf = [0xFFu8; 16];
+        remote.read_at(REMOTE_FIXTURE_LEN - 8, &mut buf).unwrap();
+        for (i, byte) in buf[..8].iter().enumerate() {
+            assert_eq!(*byte, pattern(REMOTE_FIXTURE_LEN - 8 + i as u64));
+        }
+        assert_eq!(buf[8..], [0u8; 8], "the overhang past the source is zeros");
+
+        let mut buf = [0xFFu8; 16];
+        remote.read_at(REMOTE_FIXTURE_LEN * 2, &mut buf).unwrap();
+        assert_eq!(buf, [0u8; 16], "a read wholly past the source is zeros");
+    }
+
+    #[test]
+    fn test_remote_size_is_the_advertised_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, remote, _local) = remote_and_local(&dir);
+
+        assert_eq!(
+            remote.size(),
+            std::fs::metadata(&path).unwrap().len(),
+            "the size came from somewhere other than the fetcher's init reply"
+        );
+        assert!(!remote.is_sparse(), "a remote store does not grow");
+    }
+
+    #[test]
+    fn test_remote_write_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, mut remote, _local) = remote_and_local(&dir);
+
+        let err = remote.write_at(0, &[1, 2, 3, 4]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("read-only"),
+            "a write to a remote store must say it is read-only: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remote_sync_agrees_with_a_local_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_path, remote, local) = remote_and_local(&dir);
+
+        // The guest's FLUSH has no read-only guard on its way here, so a
+        // remote store that refused it would fail a request the same
+        // device backed by a local file satisfies.
+        assert!(
+            local.sync().is_ok(),
+            "a read-only local store answers a flush, so the remote one must too"
+        );
+        assert!(remote.sync().is_ok(), "a remote store must answer a flush");
     }
 
     #[test]
