@@ -33,6 +33,10 @@ Structurally a sibling of `test_resize.py`'s layout:
   capacity changes of the qcow2-write based runner.
 - ``TestRebaseRecordsBackingFormat`` pins the backing-format
   header extension a rebase rewrites (issue #972).
+- ``TestRebaseUnidentifiedChainMember`` pins the chains that hold
+  a raw image with no partition table -- the shape secure-mode
+  ``info`` names ``unknown`` -- in the old chain and as the new
+  backing (issues #629 and #632).
 
 Tests run on the host's installed `instar` binary. The
 success-path tests require ``/dev/kvm`` access; the error
@@ -1637,3 +1641,164 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
                                capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0,
                              f'qemu-img check: {r.stdout!r} {r.stderr!r}')
+
+
+# ----------------------------------------------------------------------
+# Chains holding a member the info gate could not identify.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseUnidentifiedChainMember(TestRebaseSmoke):
+    """Rebase over, and onto, a raw image with no partition table.
+
+    Secure-mode `info` names such a file `unknown` rather than
+    `raw` -- the gate that stops an arbitrary file being accepted
+    as a disk image -- and chain discovery kept that name for the
+    guest. Rebase's chain reader allowlists the formats it can
+    read and `unknown` was not among them, so it refused the whole
+    run before reading a byte, with the generic
+    unparseable-overlay-header message: issue #629 for a member of
+    the old chain, issue #632 for the new backing.
+
+    Each asserts what the overlay then holds, not exit 0 alone. A
+    chain member read through the wrong arm returns wrong bytes
+    under a success exit, which is the failure the allowlist was
+    there to prevent and is exactly what a passing exit code would
+    hide.
+    """
+
+    def _headerless_raw(self, path, size=1 << 20):
+        """A raw image with no partition table and no magic.
+
+        `os.urandom` rather than a pattern: a file of repeated
+        bytes could match a format probe by accident, and the
+        point of the fixture is that nothing identifies it.
+        """
+        path.write_bytes(os.urandom(size))
+
+    def _overlay_over(self, td, name, backing_name, backing_format):
+        """A qcow2 overlay with one written cluster of its own."""
+        overlay = td / name
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-b', backing_name, '-F', backing_format,
+             str(overlay), '1M'],
+            capture_output=True, text=True, timeout=30, cwd=str(td))
+        self.assertEqual(r.returncode, 0, f'create overlay: {r.stderr!r}')
+        r = subprocess.run(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x77 128k 64k',
+             str(overlay)],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, f'qemu-io write: {r.stderr!r}')
+        return overlay
+
+    def _composed(self, image):
+        """The image's visible content, read back through instar."""
+        out = image.parent / (image.name + '.flat')
+        _, stderr, rc = self.run_instar_convert(image, out)
+        self.assertEqual(rc, 0, f'convert: stderr={stderr!r}')
+        return out.read_bytes()
+
+    def test_safe_rebase_reads_an_unidentified_old_chain_member(self):
+        """Issue #629: the old chain's raw backing is readable.
+
+        The new backing is given the old chain's exact content, so
+        a correct rebase finds the two chains agree and copies
+        nothing; a rebase that misread the raw member finds a
+        difference that is not there and writes those wrong bytes
+        into the overlay, where the content comparison catches it.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._headerless_raw(td / 'base.raw')
+            # Same bytes, qcow2 instead of raw: the chains agree.
+            r = subprocess.run(
+                ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2',
+                 'base.raw', 'nb.qcow2'],
+                capture_output=True, text=True, timeout=60, cwd=str(td))
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            overlay = self._overlay_over(td, 'a.qcow2', 'base.raw', 'raw')
+            before = self._composed(overlay)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'nb.qcow2', '-F', 'qcow2')
+            self.assertEqual(rc, 0, f'rebase refused: stderr={stderr!r}')
+            self.assertEqual(
+                before, self._composed(overlay),
+                'rebase changed the overlay\'s visible content')
+
+            r = subprocess.run(['qemu-img', 'check', str(overlay)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img check: {r.stdout!r} {r.stderr!r}')
+
+    def test_safe_rebase_onto_an_unidentified_new_backing(self):
+        """Issue #632: a raw new backing is readable, and recorded.
+
+        Run against `qemu-img rebase` on an identical overlay: the
+        two must agree on the overlay's visible content, and the
+        rebased overlay must record `raw` as its backing format.
+        Recording the old backing's format instead leaves an
+        overlay qemu-img refuses to open at all, which is how that
+        half of this was found.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(td / 'base.qcow2'), '1M')
+            self.assertEqual(rc, 0, stderr)
+            r = subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x42 0 64k',
+                 str(td / 'base.qcow2')],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self._headerless_raw(td / 'nb.raw')
+
+            mine = self._overlay_over(td, 'mine.qcow2', 'base.qcow2', 'qcow2')
+            theirs = self._overlay_over(td, 'thrs.qcow2', 'base.qcow2', 'qcow2')
+
+            _, stderr, rc = self.run_instar_rebase(
+                mine, '-b', 'nb.raw', '-F', 'raw')
+            self.assertEqual(rc, 0, f'rebase refused: stderr={stderr!r}')
+            r = subprocess.run(
+                ['qemu-img', 'rebase', '-b', 'nb.raw', '-F', 'raw',
+                 str(theirs)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, f'qemu-img rebase: {r.stderr!r}')
+
+            self.assertEqual(
+                self._composed(mine), self._composed(theirs),
+                'instar and qemu-img rebased to different content')
+
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(mine)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+            self.assertEqual(
+                json.loads(r.stdout).get('backing-filename-format'), 'raw',
+                'the rebased overlay records the wrong backing format')
+
+    def test_detach_from_an_unidentified_backing(self):
+        """A raw old chain is read for a detach too.
+
+        Detach keeps every cluster the chain served, so the
+        overlay's content after it must be what the chain showed
+        before -- which means reading the unidentified member.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._headerless_raw(td / 'base.raw')
+            overlay = self._overlay_over(td, 'a.qcow2', 'base.raw', 'raw')
+            before = self._composed(overlay)
+
+            _, stderr, rc = self.run_instar_rebase(overlay, '-b', '')
+            self.assertEqual(rc, 0, f'detach refused: stderr={stderr!r}')
+            self.assertEqual(
+                before, self._composed(overlay),
+                'detach lost content the raw backing was serving')

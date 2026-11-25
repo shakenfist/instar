@@ -5179,8 +5179,14 @@ fn write_chain_device_entries(
         }
 
         let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
+        // `read_format`, not `format`: the guest is being told how to
+        // read these bytes, not what to call them. The two differ only
+        // for a member the secure-mode info gate named `unknown`, which
+        // the guest's chain reader already reads through its raw arm --
+        // so this is what the operations that allowlist their readable
+        // formats needed to see all along.
         guest_mem.write_obj(
-            image.format.to_shared_format_u32(),
+            image.format.read_format().to_shared_format_u32(),
             GuestAddress(dev_offset),
         )?;
         // The flags are the info operation's, which runs on the image's
@@ -8243,6 +8249,16 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
 
     // The discovered top-of-chain format is authoritative; `-f` is only
     // a hint.
+    //
+    // Deliberately `format` and not `read_format`: this is the image the
+    // user named, and a headerless raw file -- one the secure-mode info
+    // gate names `unknown` for want of a partition table -- is refused
+    // as an input rather than benched. That refusal is instar's
+    // registered posture for a named input (the `secure-raw-detection`
+    // entry in `tests/test_bench.py`'s divergence table), not an
+    // accident of this value, so it stays. What `read_format` settles is
+    // how a *backing* member's bytes are read once the posture has
+    // already let the chain be opened.
     let top_format = chain.images()[0].format;
     let top_format_name = top_format.to_string();
 
@@ -10212,13 +10228,13 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // rebased from a qcow2 backing onto a raw one would go on
     // recording `qcow2`, and a reader that trusts the field refuses
     // the overlay. Passing what discovery found makes the common
-    // `instar rebase overlay.qcow2 -b new.qcow2`, with no `-F`,
+    // `instar rebase overlay.qcow2 -b new.raw`, with no `-F`,
     // record the truth.
     let new_backing_format_code = match args.backing_format.as_deref() {
         None => new_chain_full
             .as_ref()
             .and_then(|c| c.images().first())
-            .map(|top| top.format.to_shared_format_u32())
+            .map(|top| top.format.read_format().to_shared_format_u32())
             .unwrap_or(0u32),
         Some("qcow2") => IMAGE_FORMAT_QCOW2,
         Some("vmdk") => IMAGE_FORMAT_VMDK4,

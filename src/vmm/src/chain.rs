@@ -84,6 +84,32 @@ impl ImageFormat {
         matches!(self, ImageFormat::Qcow2 | ImageFormat::Qcow1)
     }
 
+    /// The format the guest should read this image's bytes as.
+    ///
+    /// `Unknown` is the name the secure-mode `info` operation gives a
+    /// file whose header matches no magic and which carries no
+    /// partition table, and the name discovery keeps for an ISO. It is
+    /// a statement about identification, not about layout: the bytes
+    /// are at the guest-virtual offset, which is exactly what raw
+    /// means, and the guest's chain reader has always read such a
+    /// member through its raw arm by falling through its format
+    /// dispatch.
+    ///
+    /// Reporting and reading want different answers here, so they ask
+    /// different questions. `info --chain` prints [`Self::format`]'s
+    /// own name, so an unidentifiable backing file is still listed as
+    /// `unknown` and the listing agrees with `instar info` run on that
+    /// file alone. The guest is told `raw`, because an operation that
+    /// allowlists the formats it can read must see the format it will
+    /// actually use -- `Unknown` failed those allowlists, which refused
+    /// chains the same build reads correctly through `convert`.
+    pub fn read_format(self) -> Self {
+        match self {
+            ImageFormat::Unknown => ImageFormat::Raw,
+            other => other,
+        }
+    }
+
     /// Convert to shared crate's ImageFormat u32 value.
     ///
     /// These values must match `shared::ImageFormat` enum values defined in
@@ -1336,6 +1362,46 @@ mod tests {
             ImageFormat::from_str("unknown_format"),
             ImageFormat::Unknown
         );
+    }
+
+    #[test]
+    fn unknown_is_read_as_raw_and_nothing_else_moves() {
+        // The one remapping: a member the info gate could not identify
+        // is read as raw, which is how the guest's chain reader has
+        // always served it.
+        assert_eq!(ImageFormat::Unknown.read_format(), ImageFormat::Raw);
+        assert_eq!(
+            ImageFormat::Unknown.read_format().to_shared_format_u32(),
+            ImageFormat::Raw.to_shared_format_u32()
+        );
+        // Every other format reads as itself. A format that gained a
+        // remapping here would be read through the wrong arm of the
+        // chain reader, which is a wrong-bytes bug under exit 0, so
+        // this is asserted over the whole enum rather than a sample.
+        for format in [
+            ImageFormat::Raw,
+            ImageFormat::Qcow2,
+            ImageFormat::Qcow1,
+            ImageFormat::Vmdk4,
+            ImageFormat::Vmdk3,
+            ImageFormat::Vhd,
+            ImageFormat::Vhdx,
+            ImageFormat::Vdi,
+            ImageFormat::Parallels,
+            ImageFormat::Luks,
+            ImageFormat::VmdkDescriptor,
+            ImageFormat::Dmg,
+        ] {
+            assert_eq!(format.read_format(), format, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn reporting_keeps_the_name_the_info_gate_gave() {
+        // `info --chain` prints `format`, not `read_format`, so an
+        // unidentifiable backing file is still listed as `unknown` and
+        // the listing agrees with `instar info` on that file alone.
+        assert_eq!(ImageFormat::Unknown.to_string(), "unknown");
     }
 
     #[test]
