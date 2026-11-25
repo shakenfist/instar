@@ -386,7 +386,7 @@ one target directory with different container images.
 | 3b | high | opus | none | **Spawn the fetcher and reap it.** In `src/vmm/src/fetch.rs`, add `pub struct RemoteSource` owning a `std::process::Child` and a `fetch_protocol::FetchClient`, and `pub fn spawn_file_fetcher(path: &Path) -> io::Result<RemoteSource>`. It: resolves the fetcher with `get_binary_path("instar-fetch")` from `main.rs:3899` (see finding 10 -- also fix that function's doc comment, which says it returns the directory of the guest `.bin` files, now that an executable is found through it; the `core.bin` sentinel stays); opens `path` read-only and `fstat`s it, refusing a non-regular file here with a clear message (decision 11); creates the socketpair with `fetch_protocol::SeqPacketSocket::pair()`; spawns the child with `std::process::Command`, `arg("3")`, `arg("4")`, `stderr(Stdio::inherit())`, and a `pre_exec` closure that `dup2`s the child's socket end to 3 and the file to 4 and does nothing else at all -- no allocation, no locks, no formatting, because it runs between `fork` and `exec` (decision 12); drops the parent's copies of the child's two descriptors; and builds the `FetchClient` on the parent's socket end, which performs the init exchange. Expose `client_mut()`, `capacity()` and `pid()`. `impl Drop` per decision 7: drop the socket, `try_wait()` in a poll loop for up to two seconds, then `libc::kill(pid, SIGKILL)` and a blocking `wait()`, printing one line to stderr naming the pid and the elapsed time when it comes to that. **Also, in this step, answer the open question the survey could not**: read kvm-ioctls 0.25's `Kvm::new()` in the devcontainer (`make test-rust` is how you build; the registry is in the container, the host has no toolchain by policy) and record in this plan's execution notes whether it opens `/dev/kvm` with `O_CLOEXEC`. Tests: spawn a real fetcher over a temporary file and read bytes back through `read_at`, comparing against `pread`; assert the client's advertised capacity equals the host's `fstat` length (decision 11); read `/proc/<pid>/fd` while it is alive and assert the descriptor set is exactly `{0,1,2,3,4}` (decision 12); assert that after the `RemoteSource` is dropped, `kill(pid, 0)` fails with `ESRCH` within the bounded window; assert a fifo and a directory are both refused before any spawn. Run every test under a bound so a hang fails rather than runs. Commit subject: `Spawn and reap the fetcher that serves an input.` |
 | 3c | medium | opus | none | **Let a backing store read through a fetcher.** In `src/vmm/src/backing.rs`, add a third variant to the private `enum Storage` at line 40: `Remote(crate::fetch::RemoteSource)`. Add `pub fn open_remote(source: RemoteSource) -> Self`, setting `capacity` and `current_size` to the source's advertised capacity and `sparse` false. In `read_at` (line 231), add the arm beside the existing `Concatenated` early return: delegate straight to the client's `read_at`, with no bounds logic of its own -- `FetchClient::read_at` already zero-fills wholly and partly past the advertised capacity, exactly as the `Single` arm does past the end of its file (finding 8), and duplicating that here would be a second implementation of the same rule. In `write_at` and `sync`, return an `io::Error` naming the input as read-only (decision 14); `is_sparse()` false; `size()` the capacity. Do not introduce a trait, a `dyn` or a public enum: the roughly forty `BackingStore` call sites must not change, and the point of finding 2 is that the polymorphism already exists. Tests: a `Remote` store reads the same bytes as a `Single` store over the same file, including a read spanning the end, a read wholly past it, and offset 0; `write_at` and `sync` on a `Remote` store fail with the read-only error. Commit subject: `Let a backing store read through a fetcher.` |
 | 3d | high | opus | none | **Read `instar info`'s input through the fetcher.** Wire step 3a's classification into `run_info` (`main.rs:14097`). The shape: classify `args.input` early, before the sector-size validation's siblings; for `InputSource::Path` nothing changes at all; for `FileUrl(path)` spawn the fetcher *before* `Kvm::new()` at `main.rs:14232` (decision 6 -- the existing input-open at 14212 is already before it, so the order falls out of putting the spawn there) and build the device from `BackingStore::open_remote` with the capacity from the client rather than from `metadata` (decision 11). The host's `std::fs::metadata` at 14193 stays for `blocks()` and the disk-size column, because a `file://` input still has a path (finding 6) -- say so in a comment naming phase 5 as where that stops being true, without citing this plan or a phase number in the code. Refuse, with a sentence each, the flags that would make the privileged side resolve the URL string as a path: `--chain` (which calls `discover_backing_chain` on the raw input at 14109) and anything else you find on the `info` path that does the same; grep the function for `args.input` and `input_path` and check every use. Confirm `run_info` returns its errors through `main` rather than calling `std::process::exit`, since `Drop` is what reaps the child (decision 8). The falsifiable end state: `instar info file:///path` and `instar info /path` produce byte-identical stdout for the same file, in both `human` and `json` output. Prove it in a Rust test if you can reach it from the binary crate's `#[cfg(test)]` module, and in step 3e's integration test regardless. Commit subject: `Read instar info's input through the fetcher.` |
-| 3e | high | opus | none | **Prove it end to end, and prove the tests bite.** Add tests to the existing `tests/test_info_safe.py` rather than a new module -- a new Python module has to be claimed by a pull-request job in the same commit or `tools/ci/check-test-partition.sh` fails, and adding to a claimed module avoids that entirely; run that script anyway and confirm it exits 0. The tests: for a spread of the fixtures the module already uses, run `instar info` on the path and on `file://` + the absolute path and assert the stdout is byte-identical, for both `--output human` and `--output json`; assert `instar info file://localhost/<abs>` agrees too; assert `instar info https://example.com/x` fails with the scheme refusal and a non-zero exit, and that the message names the scheme; assert `instar info --chain file:///<abs>` fails with the refusal rather than a path error. Find the binary the way the suite already does, never a hardcoded path. Then prove the tests bite: follow the `mutation-check` skill and break three things in turn in a scratch copy, confirming a named test fails for each -- (i) in `RemoteSource::Drop`, delete the wait so the child is never reaped, (ii) in `classify_input`, accept every scheme instead of `file` alone, (iii) in `run_info`, take the device's capacity from the host `metadata` instead of the client's init reply; and (iv) in `spawn_fetcher_binary`, delete the `F_DUPFD_CLOEXEC` staging so the two `dup2` calls run against the raw descriptors. Mutation (iv) is the reason this list is four and not three: step 3b measured that its own spawn tests cannot catch it, because a cargo test binary already holds the low descriptors so the collision never arises, and the end-to-end run through the real binary is the only place the production layout appears. Restore from the copy, never with `git checkout <dir>`; clear `__pycache__` and bump mtimes after restoring a Python file, since CPython trusts a `.pyc` on (mtime, size) at one-second granularity. Record the three mutations and the test that caught each in a `## Mutation results` section of this plan, and record the suite's `Ran: N` line -- read, not inferred from the exit code -- in the execution notes. Classify the integration run with `tools/ci/check-stestr-run.sh`, never the totals block, which prints `Failed: 0` for a run that lost a worker. Commit subject: `Test instar info over a file URL end to end.` |
+| 3e | high | opus | none | **Prove it end to end, and prove the tests bite.** Add tests to the existing `tests/test_info_safe.py` rather than a new module -- a new Python module has to be claimed by a pull-request job in the same commit or `tools/ci/check-test-partition.sh` fails, and adding to a claimed module avoids that entirely; run that script anyway and confirm it exits 0. The tests: for a spread of the fixtures the module already uses, run `instar info` on the path and on `file://` + the absolute path and assert the stdout is byte-identical, for both `--output human` and `--output json`; assert `instar info file://localhost/<abs>` agrees too; assert `instar info https://example.com/x` fails with the scheme refusal and a non-zero exit, and that the message names the scheme; assert `instar info --chain file:///<abs>` fails with the refusal rather than a path error. Find the binary the way the suite already does, never a hardcoded path. Then prove the tests bite: follow the `mutation-check` skill and break four things in turn in a scratch copy, confirming a named test fails for each -- (i) in `RemoteSource::Drop`, delete the wait so the child is never reaped, (ii) in `classify_input`, accept every scheme instead of `file` alone, (iii) in `run_info`, take the device's capacity from the host `metadata` instead of the client's init reply; and (iv) in `spawn_fetcher_binary`, delete the `F_DUPFD_CLOEXEC` staging so the two `dup2` calls run against the raw descriptors. Mutation (iv) is the reason this list is four and not three: step 3b measured that its own spawn tests cannot catch it, because a cargo test binary already holds the low descriptors so the collision never arises, and the end-to-end run through the real binary is the only place the production layout appears. Restore from the copy, never with `git checkout <dir>`; clear `__pycache__` and bump mtimes after restoring a Python file, since CPython trusts a `.pyc` on (mtime, size) at one-second granularity. Record the four mutations and the test that caught each in a `## Mutation results` section of this plan, and any that survives with the reasoning and the measurement rather than a contrived kill, and record the suite's `Ran: N` line -- read, not inferred from the exit code -- in the execution notes. Classify the integration run with `tools/ci/check-stestr-run.sh`, never the totals block, which prints `Failed: 0` for a run that lost a worker. Commit subject: `Test instar info over a file URL end to end.` |
 | 3f | medium | sonnet | none | **Document it, then close the phase.** Documentation first: `docs/info.md` (or whichever page documents `instar info`'s arguments -- find it, do not guess) gains what a `file://` input is and what is refused and why; `docs/crates/fetch-protocol.md` gains a section on the lifecycle this phase added -- who spawns, which descriptors cross the `exec`, who reaps and when -- since that page is the protocol's home and the lifecycle is now part of it; `docs/index.md` needs no new entry unless you add a page. Check whether `AGENTS.md` needs anything: it should not, unless the `pre_exec` constraint of decision 12 counts as a convention an agent cannot infer, which is a judgement call -- make it and say which way. Then close the phase: fold this phase's findings back into `PLAN-http-input.md` -- the stderr rate note of decision 13 and finding 6's three host-side reads go in Future work for phase 5, and record whether kvm-ioctls sets `O_CLOEXEC` as a fact phase 4 will want. Check that the corrections this phase's survey made at source are still there and still accurate (findings 1 and 2, in both the phase 3 section and Future work). Confirm `git diff origin/develop...HEAD -- src/ docs/ tests/ .github/ ':!docs/plans' \| grep -nE 'PLAN-\|[Pp]hase [0-9]\|step 3[a-f]'` prints nothing. Confirm `cargo tree -p instar` names no third-party crate it does not name on `develop`. Do not change the Execution table's status for this phase; the next phase's first commit closes it out. Commit subject: `Record phase 3's findings in the master plan.` |
 
 ## Risks and mitigations
@@ -590,10 +590,85 @@ Four things worth recording:
   reporting sites in `run_info` now take the resolved path; the `debug!`
   line still logs `args.input`, which is what the user typed.
 
+**Step 3e.** `make test-rust`: 3129 passed, 0 failed, 3 ignored --
+unchanged, because this step adds no Rust test. `pre-commit run
+--all-files`: all ten hooks pass. `tools/ci/check-test-partition.sh`
+exits 0: the five new tests join `tests/test_info_safe.py`, which
+`integration-core` already claims, so no workflow needed editing, and
+the distro-matrix halves still cover the baseline exactly.
+
+The integration run, read rather than inferred. The whole module:
+**`Ran: 1169 tests in 199.4555 sec`, 1169 passed, 0 failed, 0 skipped**,
+classified by `tools/ci/check-stestr-run.sh` as "1169 of 1169 tests
+executed, 0 skipped, against 20 discovered; no worker lost". The five
+new tests on their own: **`Ran: 5 tests in 5.8500 sec`**, all passed,
+likewise classified clean. The discovered count is 20 against 1169
+executed because `TestInfoSafe`'s profile-by-image scenarios are
+multiplied inside the worker rather than at listing time, which is why
+the guard is told the listing's count and compares it as a floor.
+
+Three things worth recording:
+
+* **A failing `subTest` makes a run look truncated.** The mutant runs
+  that caught the removed descriptor staging reported the two
+  `subTest`-bearing tests as `inprogress` with an elapsed time of
+  `N/A`, and `check-stestr-run.sh` refused the run as PARTIAL for the
+  lost-worker signature rather than reporting three clean failures.
+  The run still exits non-zero, so nothing passes that should fail, and
+  it is not new -- `TestInfoMultiFileVmdk` and the chain tests use
+  `subTest` the same way -- but the guard cannot classify a failing run
+  whose failures came out of a `subTest`, only a passing one. Worth
+  knowing before reading a red CI log and concluding a worker died.
+* **The comparison carries the exit status and the output's length.**
+  Two failed runs produce two empty streams that compare equal, so each
+  of the three spellings is asserted to exit 0 and to have printed
+  something as part of the comparison, not in a separate test. The
+  removed-staging mutant is what this caught: every URL run exited 1
+  with an empty stdout, which a bare equality of stdout would have
+  passed.
+* **The two streams are kept apart.** `test_a_default_run_is_silent_on_stderr_either_way`
+  asserts a default run says nothing on stderr for the path and for both
+  URL spellings, which is what stops decision 13's gating regressing. A
+  comparison of the two streams combined would both hide that and break
+  under `--verbose`, where the fetcher's two lines are there by design.
+
 ## Mutation results
 
-Filled in by step 3e. Three mutations, each naming the test that
-caught it.
+Four mutations, applied one at a time to a scratch copy of the tree and
+restored from that copy rather than with `git checkout`, since the
+working tree holds uncommitted work of its own. The script that applies
+and restores them is kept with the step's logs, because the plan asks
+for it to be carried across rounds.
+
+| Mutation | The edit | What failed |
+|---|---|---|
+| The missing reap | `RemoteSource::Drop` keeps closing the socket and nothing else: the `try_wait` poll loop, the `SIGKILL` and the blocking `wait` are all deleted | `fetch::tests::dropping_the_source_reaps_the_child`, the only failure in `make test-rust`: "the fetcher (pid N) was still there 5s after its source was dropped". The child does exit when its socket closes, so what the test catches is the zombie it becomes when nobody waits for it -- `kill(pid, 0)` still succeeds against a pid the kernel is holding for an unreaped child |
+| The scheme check | `classify_input` takes the `file` branch for every scheme, by testing `!scheme.is_empty()` instead of `scheme == "file"` | Three unit tests, `fetch::tests::https_refused_by_name`, `fetch::tests::scheme_case_is_folded_for_refusal` and `fetch::tests::unknown_scheme_refused_by_name`. The integration test `test_a_scheme_instar_does_not_serve_is_refused_by_name` is the same assertion through the real binary |
+| The capacity's source | `run_info` builds the device with the host's `metadata` length rather than the capacity from the client's init reply | **Nothing. It survives, and it is meant to.** See below |
+| The removed descriptor staging | `spawn_fetcher_binary` passes the raw socket and file descriptors to the `pre_exec` closure, dropping both `F_DUPFD_CLOEXEC` copies | Three integration tests: `test_a_file_url_prints_what_the_path_prints`, `test_a_default_run_is_silent_on_stderr_either_way` and `test_chain_over_a_file_url_is_refused_rather_than_resolved`. Every URL run exits 1 with `ConnectionReset`, which is the collision step 3b predicted: the `dup2` of the socket onto 3 closes the image, the `dup2` of the image onto 4 copies the socket again, and the fetcher dies on a descriptor that is not a regular file. `make test-rust` passes all of `fetch::tests` with this mutation applied, exactly as step 3b measured |
+
+**The capacity's source is unkillable in this phase, and no test was
+written to pretend otherwise.** For a `file://` input the two
+expressions are the same number by construction: the fetcher's capacity
+is `metadata.len()` of the descriptor it was handed, and the host's
+`metadata` is a `stat` of the same file moments earlier. Swapping one
+for the other changes no byte of output, so no comparison of outputs can
+see it. Measured rather than argued: with the mutation applied, the five
+integration tests pass (`Ran: 5`, 0 failed) and `make test-rust` passes
+3129 tests, the same counts as the unmutated tree. The only way to make
+them differ is to grow the file between the `stat` and the spawn, which
+is a test whose only purpose would be to fail.
+
+What enforces the choice instead is two things. First,
+`fetch::tests::the_advertised_capacity_is_the_hosts_file_length`
+asserts the equality directly, which is the cross-check decision 11
+asked for -- it is a statement about the protocol, and it is worth more
+than a test of which expression `run_info` happens to use. Second, in
+phase 5 there is no `metadata` to fall back on: an input with no local
+path cannot be `stat`ed, so the mutation will not compile there, and the
+only size available is the advertised one. The decision is therefore
+load-bearing for the phase after this one rather than for this one, and
+recording it as a survivor is the honest result.
 
 ## Definition of done
 
