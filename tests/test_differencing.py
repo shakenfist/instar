@@ -3474,6 +3474,127 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                         )
 
 
+class TestDifferencingParentWrongFormat(DifferencingTestBase):
+    """The parent resolved, and is not the format the child requires.
+
+    Both specifications require a differencing child's parent to be the
+    same format as the child. The walk never checked, so a child whose
+    parent file had been replaced by a qcow2 was listed as having a
+    qcow2 parent and `convert` of that chain exited 0 -- a chain no
+    reader should accept, read through the parent arm of a different
+    format (issue #608).
+
+    `TestDifferencingParentAbsent` pins what happens when the parent is
+    not there; this pins the step after it, where the parent resolved
+    and then turned out to be unusable. The two halves split the same
+    way: a reporting walk ends its listing with the reason on stderr and
+    still exits 0, because `info` must not turn a listing into a failure,
+    while an operation that was going to read the parent refuses and
+    names both images.
+    """
+
+    def _substituted_copy(self, image_id, write_parent):
+        """Copy a child alone, then write `write_parent(path)` at its parent."""
+        source = self.differencing_image(image_id)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        child = Path(tmp) / source.name
+        shutil.copy2(source, child)
+        write_parent(Path(tmp) / CHAIN_FIXTURE_PARENT[image_id])
+        return child
+
+    def _qcow2_parent(self, path):
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', str(path), '16M'],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, f'qemu-img create: {r.stderr!r}')
+
+    def test_info_chain_ends_the_listing_at_a_wrong_format_parent(self):
+        """The listing stops at the child, exits 0, and says why."""
+        self._require_qemu_img()
+        for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                child = self._substituted_copy(image_id, self._qcow2_parent)
+                stdout, stderr, rc = self.run_instar_info(child, chain=True)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info --chain must not fail on a chain it '
+                    f'can only report; stdout={stdout[:400]!r} '
+                    f'stderr={stderr[:400]!r}'
+                )
+                self.assertIn(
+                    'Chain: 1 image(s)', stdout,
+                    f'{image_id}: the qcow2 standing in for the parent must '
+                    f'not be listed; stdout={stdout!r}'
+                )
+                self.assertIn(
+                    'qcow2', stderr,
+                    f'{image_id}: the reason must name what the parent '
+                    f'turned out to be; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    parent_name, stdout,
+                    f'{image_id}: the child line must still print the '
+                    f'reference it names; stdout={stdout!r}'
+                )
+
+    def test_convert_refuses_a_wrong_format_parent(self):
+        """convert names both images and writes nothing."""
+        self._require_qemu_img()
+        for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                child = self._substituted_copy(image_id, self._qcow2_parent)
+                out = child.parent / 'out.raw'
+                stdout, stderr, rc = self.run_instar_convert(
+                    child, out, output_format='raw')
+                self.assertEqual(
+                    1, rc,
+                    f'{image_id}: convert exited {rc} on a cross-format '
+                    f'chain; stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                )
+                self.assertIn(
+                    'its parent must be', stderr,
+                    f'{image_id}: the refusal must say what the parent had '
+                    f'to be; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'is qcow2', stderr,
+                    f'{image_id}: the refusal must say what it is instead; '
+                    f'stderr={stderr!r}'
+                )
+                self.assertFalse(
+                    out.exists(),
+                    f'{image_id}: a refused convert must leave no output'
+                )
+
+    def test_the_real_parent_still_composes(self):
+        """The control: the same child over its own parent reads.
+
+        Without this, every assertion above would also pass if the walk
+        had simply stopped resolving differencing parents at all.
+        """
+        for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                with tempfile.TemporaryDirectory() as tmp:
+                    child = self.chain_copy(image_id, tmp)
+                    stdout, stderr, rc = self.run_instar_info(
+                        child, chain=True)
+                    self.assertEqual(0, rc, f'{image_id}: {stderr!r}')
+                    self.assertIn(
+                        'Chain: 2 image(s)', stdout,
+                        f'{image_id}: the real parent must still be '
+                        f'listed; stdout={stdout!r}'
+                    )
+                    out = Path(tmp) / 'out.raw'
+                    _, stderr, rc = self.run_instar_convert(
+                        child, out, output_format='raw')
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert of the real chain failed: '
+                        f'{stderr!r}'
+                    )
+
+
 class TestDifferencingNegativeControls(DifferencingTestBase):
     """The chains' plain dynamic base disks must keep working.
 

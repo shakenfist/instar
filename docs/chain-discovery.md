@@ -347,28 +347,46 @@ takes the same-name fallback described under Path Validation), because
 proving otherwise would mean probing outside the allowlist. See
 [issue #611](https://github.com/shakenfist/instar/issues/611).
 
-The fail-soft covers *resolving* the parent reference, and nothing
-beyond it. Once a parent resolves, it is read like any other chain
-member and the ordinary rules apply, so a malformed cross-format chain
-— a VHD or VHDX child naming a parent that is not itself a VHD or VHDX
-— can still end in a non-zero exit:
+The fail-soft covers resolving the parent reference and one step past
+it: a parent that resolved and then turned out to be unusable. Both
+specifications require a differencing child's parent to be the same
+format as the child, which instar now checks — before the parent is
+listed, and before it is attached as a device. Measured against
+`vhd-diff-child-aligned.vhd` with a file of the parent's name
+substituted:
 
-| Resolved parent | `info --chain` |
-|---|---|
-| a VHD or VHDX, as the format requires | lists it, exits 0 |
-| an unidentifiable file | lists it as `unknown`, exits 0 |
-| a self-contained qcow2 | lists it as `qcow2`, exits 0 |
-| a qcow2 whose own backing file is missing | **exits non-zero** |
-| a detected-but-unsupported format such as qed | **exits non-zero** |
+| Resolved parent | `info --chain` | an operation that reads it |
+|---|---|---|
+| a VHD or VHDX, as the format requires | lists it, exits 0 | reads it |
+| a self-contained qcow2 | ends the listing at the child, exits 0 | refuses, naming both images |
+| an unidentifiable file | ends the listing at the child, exits 0 | refuses, naming both images |
+| a qcow2 whose own backing file is missing | ends the listing at the child, exits 0 | refuses, naming both images |
+| a detected-but-unsupported format such as qed | ends the listing at the child, exits 0 | refuses, as it does at any chain position |
 
-The last two are the pre-existing rules for those formats reached at any
-chain position, not a new behaviour: a qcow2 chain is not fail-soft, and
-a detected-but-unsupported format is refused wherever it appears. Note
-also that instar does not check that a resolved parent has the same
-format as its child, though the VHD and VHDX specifications require it —
-so the third row lists a qcow2 as a VHD's parent without complaint.
-Tracked as
-[issue #608](https://github.com/shakenfist/instar/issues/608).
+```
+$ instar info --chain child.vhd
+Chain: 1 image(s)
+  [0] /abs/path/child.vhd (vpc) -> vhd-diff-parent.vhd
+      ...
+instar: backing chain stops at /abs/path/child.vhd: its parent
+/abs/path/vhd-diff-parent.vhd is qcow2, and a differencing vpc child's
+parent must be vpc too
+
+$ instar convert -O raw child.vhd out.raw
+Error: "error discovering backing chain for child.vhd: /abs/path/child.vhd
+is a differencing vpc image, so its parent must be vpc too, but
+/abs/path/vhd-diff-parent.vhd is qcow2"
+```
+
+The last three rows used to exit non-zero for `info --chain`, and the
+first two of them used to be *listed*: a qcow2 was reported as a VHD's
+parent and `convert` of that chain exited 0, composing a qcow2's bytes
+through the VHD parent arm
+([issue #608](https://github.com/shakenfist/instar/issues/608)). The
+softening is confined to a differencing link, like the resolution
+fail-soft above it: a qcow2 chain whose own backing file is missing
+still exits non-zero for every caller, because that is not a
+differencing hop and those formats compose.
 
 `instar info` reports and refuses nothing (see [info.md](info.md)), so
 `info --chain` exiting non-zero because a parent happened to be absent

@@ -378,6 +378,18 @@ pub enum ChainError {
     /// name (issue #899). Carries the image that records it and the
     /// reference as recorded, which is untrusted text.
     WindowsAbsoluteReference { image: PathBuf, reference: String },
+    /// A differencing VHD or VHDX child's parent resolved to an image
+    /// of a different format. Both specifications require the parent
+    /// to be the same format as the child, and a reader that composes
+    /// the chain would otherwise read the parent's bytes through the
+    /// child format's parent arm (issue #608). A reporting walk ends
+    /// its listing instead of raising this.
+    DifferencingParentFormat {
+        child: PathBuf,
+        child_format: String,
+        parent: PathBuf,
+        parent_format: String,
+    },
     /// I/O error
     IoError(std::io::Error),
 }
@@ -433,6 +445,23 @@ impl std::fmt::Display for ChainError {
                      name instead",
                     terminal_safe(&image.to_string_lossy()),
                     terminal_safe(reference)
+                )
+            }
+            ChainError::DifferencingParentFormat {
+                child,
+                child_format,
+                parent,
+                parent_format,
+            } => {
+                write!(
+                    f,
+                    "{} is a differencing {} image, so its parent must be {} too, but \
+                     {} is {}",
+                    terminal_safe(&child.to_string_lossy()),
+                    child_format,
+                    child_format,
+                    terminal_safe(&parent.to_string_lossy()),
+                    parent_format
                 )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),

@@ -4301,6 +4301,38 @@ fn backing_reference_is_absolute(reference: &str) -> bool {
     Path::new(reference).is_absolute() || is_windows_absolute_reference(reference)
 }
 
+/// The stderr line a reporting walk prints when it stops at a
+/// differencing parent it cannot use, or `None` when the caller is not
+/// a reporting one and the condition must be an error instead.
+///
+/// The fail-soft already covers *resolving* a differencing parent;
+/// this extends it by one step, to a parent that resolved and then
+/// turned out to be unusable. The argument is the same one: `info`
+/// reports and refuses nothing, so a listing must not become a
+/// non-zero exit because a parent was replaced by the wrong file. The
+/// listing ends at the child, whose own line still prints the
+/// reference it named, and the reason goes to stderr.
+///
+/// `what` completes the sentence "the parent ...", and is already
+/// terminal-safe at every call site.
+fn differencing_listing_stops(
+    chain_use: ChainUse,
+    differencing_child: &Option<(std::path::PathBuf, ImageFormat)>,
+    parent: &Path,
+    what: &str,
+) -> Option<String> {
+    let (child, _child_format) = differencing_child.as_ref()?;
+    if chain_use != ChainUse::Report {
+        return None;
+    }
+    Some(format!(
+        "instar: backing chain stops at {}: its parent {} {}",
+        terminal_safe_path(child),
+        terminal_safe_path(parent),
+        what
+    ))
+}
+
 /// Resolve a differencing parent for a caller that only reports the
 /// chain, classifying each failure rather than propagating it.
 ///
@@ -4391,6 +4423,15 @@ fn discover_backing_chain(
     let mut current = top_image
         .canonicalize()
         .map_err(|e| ChainError::PathResolutionError(format!("{}: {}", top_image.display(), e)))?;
+    // Set when the hop that produced `current` left a differencing VHD
+    // or VHDX, to that child's own format and path. The VHD and VHDX
+    // specifications require a differencing child's parent to be the
+    // same format as the child, and the walk never checked: a VHD child
+    // whose parent file had been replaced by a qcow2 was listed as
+    // having a qcow2 parent, and `convert` of that chain exited 0
+    // (issue #608). Carrying the link is what lets the next iteration
+    // judge the parent it is about to examine.
+    let mut differencing_child: Option<(std::path::PathBuf, ImageFormat)> = None;
 
     loop {
         // Check for circular references
@@ -4460,8 +4501,27 @@ fn discover_backing_chain(
 
         // Run the sandboxed info operation
         // Always use secure mode (unsafe_quirks=false) for backing chain discovery
-        let info_result = execute_info_operation(&current, sector_size, false)
-            .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
+        //
+        // Past a differencing link, a reporting walk ends the listing
+        // rather than the command, as it already does for a parent it
+        // could not resolve. `info` reports and refuses nothing, and a
+        // parent that resolved but cannot be described is the same kind
+        // of dead end as one that did not resolve.
+        let info_result = match execute_info_operation(&current, sector_size, false) {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(reason) = differencing_listing_stops(
+                    chain_use,
+                    &differencing_child,
+                    &current,
+                    &format!("could not be described by the info operation: {e}"),
+                ) {
+                    eprintln!("{reason}");
+                    break;
+                }
+                return Err(ChainError::InfoOperationFailed(e.to_string()));
+            }
+        };
 
         // Refuse detected-but-unsupported input formats instead of
         // silently reading them as raw. The guest info op can *name* and
@@ -4489,6 +4549,18 @@ fn discover_backing_chain(
             ImageFormat::Unknown
         ) && !matches!(info_result.format.as_str(), "raw" | "unknown" | "iso")
         {
+            if let Some(reason) = differencing_listing_stops(
+                chain_use,
+                &differencing_child,
+                &current,
+                &format!(
+                    "is {}, a format detected but not supported for reading",
+                    terminal_safe(&info_result.format)
+                ),
+            ) {
+                eprintln!("{reason}");
+                break;
+            }
             return Err(ChainError::UnsupportedInputFormat(
                 info_result.format.clone(),
             ));
@@ -4569,6 +4641,34 @@ fn discover_backing_chain(
         } else {
             info_result.virtual_size
         };
+        // A differencing child's parent must be the same format as the
+        // child. Checked here, before the member is listed or attached:
+        // listing a qcow2 as a VHD's parent misdescribes the chain, and
+        // composing one reads a qcow2's bytes through the VHD parent
+        // arm, which exited 0 on a chain no reader should accept.
+        if let Some((child, child_format)) = &differencing_child {
+            if image_format != *child_format {
+                if let Some(reason) = differencing_listing_stops(
+                    chain_use,
+                    &differencing_child,
+                    &current,
+                    &format!(
+                        "is {image_format}, and a differencing {child_format} \
+                         child's parent must be {child_format} too"
+                    ),
+                ) {
+                    eprintln!("{reason}");
+                    break;
+                }
+                return Err(ChainError::DifferencingParentFormat {
+                    child: child.clone(),
+                    child_format: child_format.to_string(),
+                    parent: current.clone(),
+                    parent_format: image_format.to_string(),
+                });
+            }
+        }
+
         let chain_image = ChainImage {
             path: current.clone(),
             format: image_format,
@@ -4668,6 +4768,16 @@ fn discover_backing_chain(
                 // the policy of the image it is leaving.
                 let leaving_vhd_family =
                     matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
+
+                // Only a VHD-family hop carries the same-format
+                // requirement, so every other hop clears it: a qcow2
+                // reached through a VHD link has whatever parent its own
+                // header names, and that is not a differencing link.
+                differencing_child = if leaving_vhd_family {
+                    Some((current.clone(), image_format))
+                } else {
+                    None
+                };
 
                 match classify_parent_walk(chain_use, differencing_composition, leaving_vhd_family)
                 {
