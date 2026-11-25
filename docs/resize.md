@@ -148,9 +148,9 @@ staging back where it started, because the guest would have to read
 blocks to find out which blocks to read.
 
 And when the planner reports `ScratchTooSmall` for a block the guest
-did not stage, the guest does **not** retry with a wider stage list.
-The planner's own comment suggests a host retry, and that path was
-considered and rejected: the block-identification helper is the single
+did not stage, neither the guest nor the host retries with a wider
+stage list. That path was considered and rejected: the
+block-identification helper is the single
 source of truth for what a flavour touches, so a `ScratchTooSmall`
 from it is a bug in that helper, and a fallback that quietly stages
 everything would turn each such bug into a silent return of the

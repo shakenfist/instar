@@ -975,8 +975,9 @@ a syscall.
 ## Why the guest ops carry `#[inline(never)]`, and why the IDT is not a replacement
 
 Several guest operation runners are marked `#[inline(never)]`; the
-comments above the runners in `src/operations/amend`, `bitmap`, `commit`
-and `rebase` say why the attribute is load-bearing. The history is issue
+comments above the runners in, among others, `src/operations/amend`,
+`bitmap`, `commit`, `rebase` and `bench` say why the attribute is
+load-bearing. The history is issue
 [#375](https://github.com/shakenfist/instar/issues/375): built for
 `x86_64-unknown-none` with `opt-level = "z"` and `lto = true`, inlining
 a large runner into the `extern "C"` `_start` produced a miscompiled

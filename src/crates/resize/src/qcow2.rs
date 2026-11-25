@@ -1896,9 +1896,12 @@ fn ensure_block_staged(
             return Ok(());
         }
     }
-    // Block not staged. The guest's pre-pass should have caught
-    // this; surface as ScratchTooSmall so the host can retry
-    // with a wider stage list.
+    // Block not staged. The block-identification helper is the
+    // single source of truth for which blocks a flavour touches, so
+    // this means that helper is wrong (or QCOW2_MAX_REQUIRED_BLOCKS
+    // is too small), not that a caller should restage more. Nothing
+    // retries on it, deliberately: see "Image-size ceiling" in
+    // docs/resize.md.
     Err(ResizeError::ScratchTooSmall)
 }
 

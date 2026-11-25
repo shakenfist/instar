@@ -698,8 +698,8 @@ Each of these was considered when the first public release was put
 together and deliberately left out. None is blocked on effort alone,
 so a proposal to add one should start from the reason it is absent.
 
-- **crates.io, for the format crates.** The six format crates are
-  marked `publish = false`. They are not a general-purpose parser
+- **crates.io, for the format crates.** Every crate under
+  `src/crates/` is marked `publish = false`. They are not a general-purpose parser
   API: they expose the bare-metal call-table ABI the guest
   operations are built against, with the allocation and panic
   discipline that implies. Publishing them usefully means designing
