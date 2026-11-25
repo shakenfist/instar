@@ -56,9 +56,6 @@ use std::time::{Duration, Instant};
 use fetch_protocol::{FetchClient, SeqPacketSocket};
 
 /// What an input argument turned out to be.
-// Exercised by its tests before any operation calls it, so the binary's
-// dead-code lint would otherwise reject the whole module.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum InputSource {
     /// An ordinary filesystem path, to be opened as instar always has.
@@ -162,7 +159,6 @@ fn parse_file_url(rest: &str) -> Result<PathBuf, String> {
 /// The scheme is compared case-insensitively, as RFC 3986 says to. Every URL
 /// scheme other than `file` is refused by name, using the sentence in
 /// [`REFUSED_SCHEMES`] or a generic one for a scheme not in it.
-#[allow(dead_code)] // Called by operations as they learn to read through a URL.
 pub fn classify_input(arg: &str) -> Result<InputSource, String> {
     let Some(len) = url_scheme_len(arg) else {
         return Ok(InputSource::Path(PathBuf::from(arg)));
@@ -208,13 +204,9 @@ const FIRST_STAGING_FD: RawFd = CHILD_FILE_FD + 1;
 /// A fetcher that needs the kill is a bug in the fetcher. The bound is here
 /// because the alternative is worse: a reap that waits for ever turns that
 /// bug into every instar run hanging as it exits.
-// Read only by the reap below, which the dead-code lint cannot see as
-// reachable while nothing yet builds a `RemoteSource` outside a test.
-#[allow(dead_code)]
 const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the reap looks to see whether the child has gone.
-#[allow(dead_code)] // As above.
 const REAP_POLL: Duration = Duration::from_millis(10);
 
 /// Duplicate `fd` onto a descriptor number at or above [`FIRST_STAGING_FD`],
@@ -320,9 +312,6 @@ fn open_regular_file(path: &Path) -> io::Result<File> {
 /// panic in the vCPU loop. The one path a `Drop` cannot cover is
 /// `std::process::exit`, so an operation that serves a remote input must
 /// return its errors through `main` instead of exiting under them.
-// Nothing calls this yet: the backing store learns to read through it, and
-// `instar info` learns to open one, in the two changes that follow this one.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RemoteSource {
     /// The fetcher. Nothing else reaps it: `Child`'s own drop deliberately
@@ -336,7 +325,6 @@ pub struct RemoteSource {
     client: Option<FetchClient>,
 }
 
-#[allow(dead_code)]
 impl RemoteSource {
     /// The client, for reading the input's bytes.
     pub fn client_mut(&mut self) -> &mut FetchClient {
@@ -361,6 +349,9 @@ impl RemoteSource {
 
     /// The fetcher's process id, for diagnostics and for the tests that
     /// inspect what the child holds.
+    // Only the tests ask for it so far; everything else reaches the child
+    // through the client.
+    #[allow(dead_code)]
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -425,16 +416,19 @@ impl Drop for RemoteSource {
 /// its parent has not opened yet, so the ordering is a guarantee that holds
 /// whatever flags someone else's `open` chooses, and it costs nothing:
 /// nothing in an operation needs the VM before it has its input.
-#[allow(dead_code)] // Until an operation opens a remote input.
-pub fn spawn_file_fetcher(path: &Path) -> io::Result<RemoteSource> {
-    spawn_fetcher_binary(&crate::get_binary_path(FETCHER_BINARY), path)
+pub fn spawn_file_fetcher(path: &Path, verbose: bool) -> io::Result<RemoteSource> {
+    spawn_fetcher_binary(&crate::get_binary_path(FETCHER_BINARY), path, verbose)
 }
 
 /// Start `fetcher` serving the file at `path`.
 ///
 /// Separate from [`spawn_file_fetcher`] so that a test can run the binary it
 /// has just built, rather than the one an installed instar would resolve to.
-fn spawn_fetcher_binary(fetcher: &Path, path: &Path) -> io::Result<RemoteSource> {
+fn spawn_fetcher_binary(
+    fetcher: &Path,
+    path: &Path,
+    inherit_stderr: bool,
+) -> io::Result<RemoteSource> {
     // Opened, checked and refused before anything is spawned, so that a bad
     // input costs nothing and is reported in terms of the path the user gave.
     let file = open_regular_file(path)?;
@@ -455,12 +449,24 @@ fn spawn_fetcher_binary(fetcher: &Path, path: &Path) -> io::Result<RemoteSource>
         // The child is assumed hostile, and instar's stdout is the output a
         // user pipes into something else: a fetcher that could write to it
         // could put text into a JSON document the user trusts. It has no use
-        // for stdin either. Its stderr is inherited, because its diagnostics
-        // are the only thing it can say that is not a status code, and they
-        // are worth having in a failing run's output.
+        // for stdin either.
+        //
+        // Its stderr follows the caller's own verbosity. The fetcher says
+        // two things on a run that goes well -- what it is serving, and
+        // that its peer closed the socket -- and an operation reading a
+        // local file says nothing at all on stderr, so inheriting
+        // unconditionally would make the same command noisier for no
+        // reason the user asked for. Its diagnostics are still the only
+        // thing it can say that is not a status code, so a caller that
+        // wants them asks, and every protocol failure reaches the user
+        // anyway as a sentence this side writes from a status.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(if inherit_stderr {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
     // SAFETY: the closure runs in the child between `fork` and `exec`, where
     // only async-signal-safe work is permitted: a thread holding a lock in
     // the parent did not come across the fork, so taking that lock here
@@ -583,8 +589,8 @@ pub(crate) mod test_support {
     /// fetcher which never answers fails the test instead of holding it for
     /// the client's operational minute.
     pub(crate) fn spawn_test_fetcher(path: &Path) -> RemoteSource {
-        let mut source =
-            spawn_fetcher_binary(&fetcher_binary(), path).expect("spawn a fetcher on the fixture");
+        let mut source = spawn_fetcher_binary(&fetcher_binary(), path, true)
+            .expect("spawn a fetcher on the fixture");
         source
             .client_mut()
             .set_reply_timeout(TEST_READ_TIMEOUT)
@@ -792,7 +798,7 @@ mod tests {
         let dir = tempdir().expect("a temporary directory");
         let path = dir.path().join("image.raw");
         write_fixture(&path, 70_001);
-        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path, true).expect("spawn a fetcher");
         let length = std::fs::metadata(&path).expect("stat the fixture").len();
         assert_eq!(
             source.capacity(),
@@ -806,7 +812,7 @@ mod tests {
         let dir = tempdir().expect("a temporary directory");
         let path = dir.path().join("image.raw");
         write_fixture(&path, 4096);
-        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path, true).expect("spawn a fetcher");
 
         // The whole set, not the absence of one descriptor: the failure this
         // guards against is the child holding something nobody meant to give
@@ -834,7 +840,7 @@ mod tests {
         let dir = tempdir().expect("a temporary directory");
         let path = dir.path().join("image.raw");
         write_fixture(&path, 4096);
-        let source = spawn_fetcher_binary(&fetcher_binary(), &path).expect("spawn a fetcher");
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path, true).expect("spawn a fetcher");
         let pid = source.pid();
 
         let dropped_at = Instant::now();
@@ -879,7 +885,7 @@ mod tests {
 
         // Reaching this with a fetcher that cannot be spawned is the point:
         // the refusal has to come from the input, not from the child.
-        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &fifo)
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &fifo, true)
             .expect_err("a FIFO cannot be served");
         assert!(
             err.to_string().contains("not a regular file"),
@@ -890,7 +896,7 @@ mod tests {
     #[test]
     fn a_directory_is_refused_before_anything_is_spawned() {
         let dir = tempdir().expect("a temporary directory");
-        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), dir.path())
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), dir.path(), true)
             .expect_err("a directory cannot be served");
         assert!(
             err.to_string().contains("not a regular file"),
@@ -902,7 +908,7 @@ mod tests {
     fn a_missing_input_is_refused_naming_the_path() {
         let dir = tempdir().expect("a temporary directory");
         let absent = dir.path().join("absent.raw");
-        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &absent)
+        let err = spawn_fetcher_binary(Path::new(UNSPAWNABLE_FETCHER), &absent, true)
             .expect_err("a missing file cannot be served");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(

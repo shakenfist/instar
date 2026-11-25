@@ -14109,9 +14109,34 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         .into());
     }
 
+    // What the argument is -- a path or a URL -- decides how the device's
+    // bytes are read, and it is settled before anything is opened: an
+    // argument naming a scheme instar does not serve has to say so, rather
+    // than being opened as a path and reported as a missing file.
+    let input_source = fetch::classify_input(&args.input)?;
+    // A URL naming a local file still resolves to a path, and that path is
+    // what every host-side read of the input below uses.
+    let input_path: &Path = match &input_source {
+        fetch::InputSource::Path(path) | fetch::InputSource::FileUrl(path) => path,
+    };
+    // The name the result is reported under. It is the path in both cases,
+    // never the URL, because the printer canonicalises it: a URL and the
+    // path it names have to produce the same output, down to the byte.
+    let input_display = input_path.to_string_lossy().into_owned();
+
     // Handle --chain flag: discover and display backing file chain
     if args.chain {
-        let input_path = Path::new(&args.input);
+        // Refused for a URL rather than served. Chain discovery walks from
+        // the image to its parents and opens each one on this side, so with
+        // a URL naming a local file it would succeed while never reading a
+        // byte through the fetcher -- a feature that looks supported and is
+        // not. Discovering a chain through a fetcher is its own piece of
+        // work.
+        if matches!(input_source, fetch::InputSource::FileUrl(_)) {
+            return Err(
+                "instar cannot discover a backing chain over a URL yet; pass a local path".into(),
+            );
+        }
         let security_config = config::load_config().config.security;
 
         // `info` composes nothing, so it states no composition
@@ -14182,12 +14207,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // The resolved descriptor (when present) is also threaded into
     // JSON info output so each flat extent appears as a separate
     // child entry, matching qemu-img.
-    let input_path_for_preflight = Path::new(&args.input);
     let vmdk_flat_resolved: Option<crate::chain::ResolvedVmdkDescriptor> =
-        if peek_is_vmdk_descriptor(input_path_for_preflight).unwrap_or(false) {
+        if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
             let security_config = config::load_config().config.security;
             Some(
-                resolve_vmdk_flat_descriptor(input_path_for_preflight, &security_config)
+                resolve_vmdk_flat_descriptor(input_path, &security_config)
                     .map_err(|e| format!("error resolving VMDK descriptor: {e}"))?,
             )
         } else {
@@ -14195,7 +14219,14 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         };
 
     // Get input file metadata (size and disk blocks)
-    let input_metadata = std::fs::metadata(&args.input)?;
+    //
+    // This is read on this side, of the path, because the disk-size column
+    // is the file's allocation -- `st_blocks` -- and nothing a byte server
+    // reports stands in for it. It is also the first thing an input with no
+    // local path at all will not have: the apparent size can come from the
+    // advertised capacity, but the allocation cannot, so each of these reads
+    // then has to be derived from the protocol or refused.
+    let input_metadata = std::fs::metadata(input_path)?;
     let input_size = input_metadata.len();
     // Get disk blocks allocated (for sparse file disk size calculation)
     #[cfg(unix)]
@@ -14213,8 +14244,32 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         args.sector_size
     );
 
-    // Open backing store (input only, read-only)
-    let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
+    // Open backing store (input only, read-only).
+    //
+    // A URL is served by a fetcher, started here. That is before
+    // `/dev/kvm` is opened, which is the ordering that matters: a child
+    // cannot inherit a descriptor its parent has not opened yet, so none of
+    // the VM's descriptors can cross the `exec` whatever flags they were
+    // opened with. The fetcher is owned by the store from here on, and the
+    // store by the device, so whichever way this function returns -- an
+    // error out of the middle of it, or a panic in the vCPU loop -- the
+    // child is waited for as the device is dropped.
+    //
+    // The device's size is the capacity the fetcher advertised, not the
+    // length stat'ed above: the advertised capacity is the only size a
+    // fetcher reading from somewhere other than a local file could report,
+    // and taking it from the protocol while there is still a local file to
+    // check it against is what keeps this honest.
+    let (input_backing, device_size) = match &input_source {
+        fetch::InputSource::Path(path) => {
+            (BackingStore::open(path, true, None, false)?, input_size)
+        }
+        fetch::InputSource::FileUrl(path) => {
+            let fetcher = fetch::spawn_file_fetcher(path, verbose)?;
+            let capacity = fetcher.capacity();
+            (BackingStore::open_remote(fetcher), capacity)
+        }
+    };
 
     // Parse --max-guest-memory for LUKS v2 Argon2id support
     let guest_mem_size: u64 = if let Some(ref mem_str) = args.max_guest_memory {
@@ -14366,7 +14421,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let input_vq = device_vq_base(0);
     let input_device = VirtioBlockDevice::new(
         input_backing,
-        input_size,
+        device_size,
         args.sector_size as u64,
         true, // read-only
         input_mmio,
@@ -14476,7 +14531,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                                 saw_info_result = true;
                                 print_info_result(
                                     &msg,
-                                    &args.input,
+                                    &input_display,
                                     input_size,
                                     input_disk_blocks,
                                     args.ignore_quirks,
@@ -14588,7 +14643,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         return Err(error.into());
     }
     if !saw_info_result {
-        return Err(info_without_a_result(&serial_decoder, &args.input).into());
+        return Err(info_without_a_result(&serial_decoder, &input_display).into());
     }
 
     Ok(())

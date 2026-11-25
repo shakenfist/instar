@@ -248,9 +248,6 @@ impl BackingStore {
     /// happened: the file was opened and refused on this side, the child was
     /// started, and the init exchange completed, all before a source exists
     /// to be handed over.
-    // Nothing builds one yet. The operation that opens a remote input is the
-    // change that follows this one.
-    #[allow(dead_code)]
     pub fn open_remote(source: RemoteSource) -> Self {
         let capacity = source.capacity();
         Self {

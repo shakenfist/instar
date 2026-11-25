@@ -334,6 +334,20 @@ protection or a second one.
     failing test's output, which is worth a lot in the phase that
     debugs the mechanism for the first time.
 
+    **Corrected during step 3d's review, on the operator's call: the
+    child's stderr follows the caller's `--verbose`.** Inherited
+    unconditionally it is not only a diagnostic channel, because the
+    fetcher says two things on a run that goes *well* -- what it is
+    serving, and that its peer closed the socket -- so every
+    `instar info file:///path` printed two lines of internal chatter
+    that the same command on a local path does not print. Measured on
+    a 721 KB qcow2: two lines on stderr for the URL, none for the
+    path, stdout byte-identical either way. The tests still ask for
+    the diagnostics, which is where the reasoning above holds, and an
+    operation passes its own verbosity. Nothing is lost on a failure:
+    the privileged side writes those sentences itself, from a status
+    rather than from the child's text.
+
 14. **A remote store refuses writes rather than silently dropping
     them.** `Storage::Remote` makes `write_at` return an `io::Error`
     naming the input as read-only, `is_sparse()` false, and `size()`
@@ -517,6 +531,64 @@ Two things worth recording:
   `#[cfg(test)] pub(crate) mod test_support` at module level, so the
   backing store's tests share them rather than carrying a second copy
   that could lose the panic.
+
+**Step 3d.** `make test-rust`: 3129 passed, 0 failed, 3 ignored --
+unchanged from step 3c, because this step adds no Rust test: `run_info`
+needs `/dev/kvm`, the guest `.bin` files and stdout, and `make test-rust`'s
+container is given none of them, so the proof is the real binary and step
+3e's integration test. `pre-commit run --all-files`: all ten hooks pass.
+
+The end state, measured with the binary from `make instar` -- which needed
+a `make clean-instar` first, since step 3c's `make test-rust` had left
+dev-image build scripts in `src/target` that the release image cannot run
+(`GLIBC_2.34' not found`). Seven fixtures over five formats, in both
+`--output human` and `--output json`, each run three ways: the path,
+`file://` + the path, and `file://localhost` + the path. **All fourteen
+comparisons byte-identical**, every run exit 0. The fixtures were the
+cirros qcow2, `qcow2_v2.qcow2`, `hyperv2012r2-dynamic.vhd` (vpc),
+`iotest-dynamic-1G.vhdx`, `iotest-version3.vmdk`,
+`vhd-diff-aligned-composed.raw`, and `vmdk-flat-1m.vmdk` -- the last for
+the flat-descriptor preflight, which reads the input on this side and
+agrees too.
+
+Four things worth recording:
+
+* **The reap was exercised on a real error path, not only in a unit test.**
+  `instar info --luks-passphrase-file /nonexistent/pp file://<abs>` fails
+  after the fetcher is running, because the passphrase file is read well
+  past the spawn. The fetcher reported `the peer closed the socket,
+  exiting` and was gone, with `pgrep -x instar-fetch` finding nothing.
+* **A `file://` run wrote two lines to stderr that a path run does
+  not**: the fetcher's `serving N bytes ...` banner and its exit line.
+  Stdout was byte-identical either way, which is what the definition of
+  done asks, but two lines of internal chatter on a successful run is a
+  difference a user sees. Put to the operator during this step's review,
+  who chose to gate the child's stderr on the caller's `--verbose`;
+  decision 13 records it. So a default run is now silent on stderr for
+  both inputs, and step 3e should assert that as well as comparing
+  stdout -- and should still keep the two streams apart, because
+  `--verbose` makes them differ again by design.
+* **`INSTAR_BIN_DIR` pointing at `src/` breaks a `file://` run.** The
+  fetcher is resolved through the directory keyed on `core.bin`, and in a
+  developer tree only `src/target/release/` holds both it and
+  `instar-fetch`. Nothing in the suite or the Makefile sets that variable,
+  so this is a trap for a hand-run reproduction rather than a defect, but
+  it is the one way the resolution of finding 10 can be made to fail.
+* **`run_check` and `compare_images` call `std::process::exit`, which
+  phase 7 inherits as an obstacle.** Nothing on `info`'s path does, so
+  decision 8 holds here, and `panic = "abort"` is set nowhere, so
+  unwinding runs the `Drop`. But two of the operations phase 7 extends
+  exit under their own errors, and a `Drop` does not run on `exit`, so
+  wiring a URL into `check` or `compare` leaks the fetcher until each
+  returns its errors through `main` instead. Found while checking this
+  phase's definition of done rather than by phase 7, which is the
+  cheaper place to find it.
+* **The name `info` reports is the path, never the URL.**
+  `print_info_result` canonicalises what it is handed and derives the
+  image's directory from the result, so handing it the URL would both print
+  the URL and resolve a relative backing file against nonsense. Both
+  reporting sites in `run_info` now take the resolved path; the `debug!`
+  line still logs `args.input`, which is what the user typed.
 
 ## Mutation results
 
