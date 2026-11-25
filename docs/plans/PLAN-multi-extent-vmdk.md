@@ -875,7 +875,7 @@ Filled in as the plan runs. Already known:
   issue.
 
 * Extending phase 4's pin-literal guard,
-  `tests/test_vmdk_split_descriptor_pins.py`, to the VHDX literals in
+  `tools/ci/check-vmdk-split-pins.py`, to the VHDX literals in
   `src/crates/create/tests/round_trip.rs`. Those are copied from the
   same pin file by hand for the same reason -- the Rust workspace has
   no JSON parser -- and nothing checks that copy either. The guard is

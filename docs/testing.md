@@ -161,6 +161,41 @@ writes to a given temporary file is a property of the test that can
 change in an edit the `with` statement never sees.
 `tests/helpers/scratch.py` itself is the one exemption.
 
+**Never build a path into the repository outside `tests/`.** The suite's
+tree is relocatable: `tools/test-package-functional.sh` copies `tests/`
+alone to `/tmp/instar-tests` and runs it there against an installed
+package, with no repository around it. A test that reaches out of
+`tests/` resolves its path against `/tmp` and raises
+`FileNotFoundError`. The PR gate cannot see it, because it runs the
+suite from the checkout where the path exists; only the seven
+`package-matrix` legs can, and two tests reading
+`src/crates/vmdk/src/lib.rs` ejected
+[#968](https://github.com/shakenfist/instar/pull/968) from the queue
+after a green pull request. The `instar-testdata` clone is a sibling of
+the repository rather than part of it, and is addressed through
+`INSTAR_TESTDATA_PATH`, so it is not covered by this rule.
+
+A check that must read the repository's own source belongs in
+`tools/ci` instead, where the whole tree is present and it runs on every
+pull request. `tools/ci/check-vmdk-split-pins.py` is the one moved out
+for this reason: it compares the split VMDK descriptor literals in the
+vmdk crate with `tests/golden/qemu-create-pins.json`, which Rust cannot
+read for want of a JSON parser. Its `--no-fixture` form needs only the
+checkout and runs in `ci-tooling` and as a pre-commit hook; the full
+form also compares the hand-copied 33 GiB descriptor with the committed
+fixture, needs a testdata clone, and runs in `integration-core`. A
+missing clone fails that check rather than passing it quietly, because
+the fixture is the only committed witness past sixteen extents and past
+65535 cylinders.
+
+`tools/ci/check-tests-relocatable.sh` enforces the rule, as a
+pre-commit hook and in the `ci-tooling` job. It matches the pathlib
+join form against the repository's own top-level directories, read from
+git so a new one is covered the day it appears. `tests/base.py` is the
+one exemption: `get_instar_binary` falls back to the build tree at
+`src/target/release/instar`, and only when `INSTAR_BINARY_PATH` is
+unset, which the packaged harness sets to `/usr/bin/instar`.
+
 ## Test Categories
 
 ### Safe Images (`test_info_safe.py`)

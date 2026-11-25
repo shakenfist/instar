@@ -3161,7 +3161,7 @@ ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
     // each constant names the pin case it came from. The crate tests cannot
     // read that file (the container mounts only this repository, and the
     // workspace has no JSON parser), so a change to the pins has to be copied
-    // here by hand; `tests/test_vmdk_split_descriptor_pins.py` guards the copy.
+    // here by hand; `tools/ci/check-vmdk-split-pins.py` guards the copy.
     //
     // The literals keep the shape of `FLAT_DESCRIPTOR` above (real newlines,
     // every line at column zero) so that the guard can find them as text.
@@ -3503,7 +3503,7 @@ ddb.toolsVersion = \"2147483647\"
     /// text: a file already sitting where an extent goes does not change
     /// what qemu writes in the descriptor. That the two pinned descriptors
     /// really are identical is checked where the pin file can be read, in
-    /// `tests/test_vmdk_split_descriptor_pins.py`; asserting it here would
+    /// `tools/ci/check-vmdk-split-pins.py`; asserting it here would
     /// only compare a constant with itself.
     fn pin_table() -> [(&'static str, u64, SplitKind, &'static str); 14] {
         [

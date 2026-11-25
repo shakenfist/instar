@@ -62,6 +62,29 @@ repos:
         pass_filenames: false
         files: ^(tests/.*\.py|tools/ci/check-no-named-temporary-file\.sh)$
 
+      # A test must not build a path into the repository outside tests/:
+      # the package matrix copies tests/ alone to /tmp and runs it there
+      # against an installed package, so the path resolves against /tmp
+      # and raises. The PR gate runs the suite from the checkout and
+      # cannot see it; two such tests ejected #968. Source-level checks
+      # belong in tools/ci, as check-vmdk-split-pins.py now is.
+      - id: tests-relocatable
+        name: Tests build no path outside tests/
+        entry: ./tools/ci/check-tests-relocatable.sh
+        language: script
+        pass_filenames: false
+        files: ^(tests/.*\.py|tools/ci/check-tests-relocatable\.sh)$
+
+      # The vmdk crate holds qemu's split descriptors as Rust literals,
+      # because the Rust workspace has no JSON parser to read the pin
+      # with. Only a text comparison outside Rust can check that copy.
+      - id: vmdk-split-pins
+        name: Split VMDK descriptor literals match the qemu pin
+        entry: ./tools/ci/check-vmdk-split-pins.py --no-fixture
+        language: script
+        pass_filenames: false
+        files: ^(src/crates/vmdk/src/lib\.rs|tests/golden/qemu-create-pins\.json|tools/ci/check-vmdk-split-pins\.py)$
+
       # A line number in documentation goes stale on the next edit to the
       # code it points into, in a change that never touches the document;
       # name the function or class instead. The files are the ones the

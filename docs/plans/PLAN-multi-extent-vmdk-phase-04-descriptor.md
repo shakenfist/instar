@@ -490,11 +490,13 @@ Falsifiable; each is checkable by someone who did not do the work.
 6. The 1000-extent descriptor's thousandth extent line reads `RW
    4194304 SPARSE "image-s1000.vmdk"`, matching phase 1's measurement
    verbatim.
-7. `tests/test_vmdk_split_descriptor_pins.py` passes, asserts the two
-   existing-extent cases' pinned descriptors equal the plain 5 GiB
-   ones, and fails when one digit of one Rust literal is edited, naming
-   that case. The edit
+7. The pin-against-source check passes, asserts the two existing-extent
+   cases' pinned descriptors equal the plain 5 GiB ones, and fails when
+   one digit of one Rust literal is edited, naming that case. The edit
    was made, the failure observed, and the file restored from a copy.
+   This started as `tests/test_vmdk_split_descriptor_pins.py` and is now
+   `tools/ci/check-vmdk-split-pins.py`; the merge queue round below says
+   why it had to move, and the move is what the item means from here on.
 8. The existing emitters are unchanged: `git diff` touches no line of
    `build_descriptor`, `build_flat_descriptor`,
    `build_streamoptimized_descriptor` or
@@ -913,3 +915,70 @@ the right answer and not a pass. The strengthened overrun assertion was
 not mutated, because a sentinel fill checked across the whole tail is
 strictly stronger than a zero fill checked at one index -- there is no
 behaviour the old form caught that the new one does not.
+
+## Merge queue round (2026-11-26, AEDT)
+
+Mikal enqueued the pull request on 2026-11-25. It was ejected the same
+day: all seven `package-matrix` legs failed identically, two tests out
+of 4496, both
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/src/crates/vmdk/src/lib.rs'
+```
+
+`tests/test_vmdk_split_descriptor_pins.py` read the Rust source through
+`Path(__file__).resolve().parent.parent / 'src' / ...`.
+`tools/test-package-functional.sh` copies `tests/` alone to
+`/tmp/instar-tests` and runs it there against an installed package, so
+that expression resolved to `/tmp/src/...`. It was the only test in the
+suite that reached outside `tests/` without an environment guard;
+`tests/base.py`'s build-tree binary fallback is the only other escape,
+and the harness sets `INSTAR_BINARY_PATH=/usr/bin/instar` so it is never
+reached there.
+
+Nothing in review could have caught it, and neither could the pull
+request. `package-matrix` is gated `github.event_name == 'merge_group'`,
+so on a pull request the suite runs from the checkout where `src/`
+exists. The first execution of the test in a relocated tree was the
+queue. The workflow's own header documents this split, and #959 is the
+same shape for a different cause: a convention the PR gate cannot see,
+found by ejecting queued pull requests.
+
+The fix moves the whole module to `tools/ci/check-vmdk-split-pins.py`,
+beside the other source-level guards, and deletes it from `tests/`.
+These were never runtime tests -- all four compared committed text with
+committed text, and none ran instar. The guard takes `--source` and
+`--testdata` so its own test can point it at mutated copies, and
+`--no-fixture` for a job with no testdata clone. An absent clone is a
+failure rather than a quiet pass, which is round 1's item 5 carried over
+intact: the 33 GiB fixture is the only committed witness past sixteen
+extents and past 65535 cylinders.
+
+`tools/ci/check-tests-relocatable.sh` is what stops it recurring. It
+matches the pathlib join form against the repository's top-level
+directories, read from `git ls-tree` rather than written down, and run
+on every pull request and as a pre-commit hook. Checked against the
+tree as it stood before the fix, it reported exactly the one offending
+line and nothing else.
+
+| Check | Result |
+|-------|--------|
+| `tools/ci/check-tests-relocatable.sh` on the pre-fix tree | 1 problem: the `lib.rs` join in the pins test |
+| `tools/ci/check-tests-relocatable.sh` after the move | clean |
+| `tools/ci/test-check-tests-relocatable.sh` | 9 cases, all pass |
+| `tools/ci/test-check-vmdk-split-pins.sh` | 7 cases, all pass |
+| `tools/ci/check-vmdk-split-pins.py --no-fixture` | 14 descriptors match |
+| `tools/ci/check-vmdk-split-pins.py --testdata ...` | 14 descriptors match, fixture literal matches |
+
+Both guards were run against deliberately broken input rather than read:
+a changed `createType` in a copy of `lib.rs`, a renamed fixture
+constant, an empty directory for the clone, an absent source file, and
+for the relocatable guard the #968 line itself, a sibling
+`instar-testdata` path that must pass, a `tests/golden` path that must
+pass, and a bitmap named `'src'` that must not match.
+
+The rebase onto `c43b08f1` conflicted twice in `docs/plans/index.md`,
+both times mechanically: this branch owns the multi-extent row and
+develop owns the http-input row, whose phase 3 landed as #974 while this
+pull request sat in the queue.
+
