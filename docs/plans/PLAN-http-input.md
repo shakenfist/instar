@@ -497,7 +497,7 @@ there is a confined process to put it in.
 |-------|------|--------|--------|
 | 1. Guest I/O wait | [PLAN-http-input-phase-01-guest-wait.md](PLAN-http-input-phase-01-guest-wait.md) | Complete | a8387ffe |
 | 2. Fetch protocol and a file-backed fetcher | [PLAN-http-input-phase-02-protocol.md](PLAN-http-input-phase-02-protocol.md) | Complete | 49d6b9b9 |
-| 3. Remote backing store | [PLAN-http-input-phase-03-backing.md](PLAN-http-input-phase-03-backing.md) | Not started | |
+| 3. Remote backing store | [PLAN-http-input-phase-03-backing.md](PLAN-http-input-phase-03-backing.md) | Complete | c43b08f1 |
 | 4. Confinement | PLAN-http-input-phase-04-confinement.md | Not started | |
 | 5. HTTP backend | PLAN-http-input-phase-05-http.md | Not started | |
 | 6. Cache and prefetch | PLAN-http-input-phase-06-prefetch.md | Not started | |
