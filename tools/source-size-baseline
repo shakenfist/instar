@@ -23,7 +23,7 @@
 3280 src/crates/snapshot/src/qcow2.rs
 5424 src/crates/vhd/src/lib.rs
 9404 src/crates/vhdx/src/lib.rs
-3429 src/crates/vmdk/src/lib.rs
+4504 src/crates/vmdk/src/lib.rs
 1629 src/operations/bench/src/main.rs
 2012 src/operations/bitmap/src/main.rs
 4546 src/operations/check/src/main.rs
@@ -49,4 +49,4 @@
 1623 tests/test_measure.py
 1573 tests/test_rebase.py
 1842 tests/test_resize.py
-3102 tools/mutate-differencing.sh
+3155 tools/mutate-differencing.sh
