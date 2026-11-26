@@ -552,6 +552,55 @@ alternative -- a fetcher that refuses to run unconfined -- would also
 have been defensible, and the choice is one a reviewer should see rather
 than infer.
 
+**The syscall allowlist, measured 2026-11-26.** The window measured is
+every call the release binary makes from the install of the filter to
+the end of the process. Measured, on every run: `recvfrom`, `pread64`,
+`sendto`, `write`, `close`, `exit_group`, `brk`. Measured only with the
+allocator pushed onto mappings by
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=4096`: `mmap`, `munmap`.
+Measured only on a panic, provoked by taking the fetcher's stderr away
+under a diagnostic: `gettid`, `futex`. Margin, never observed and
+allowed as insurance against another libc: `mremap`, `madvise`,
+`getrandom`, `clock_gettime`, `rt_sigreturn`, `restart_syscall`,
+`sigaltstack`, `rseq`.
+
+`close` is the entry the plan's margin did not foresee and the one that
+mattered most: `serve` drops its two `OwnedFd`s after the filter is on,
+so a filter without it would have ended a *successful* run in a signal.
+
+Commands, with the artefacts left in the session scratchpad under
+`p04-step-4c/`: `strace -ff -o m3/trace instar info file://<fixture>`
+and the same with `--verbose`; `python3 hostile.py <instar-fetch> h7
+landlock,seccomp --strace`, repeated as `h8` with the tunable set; then
+`./after-filter.sh` over the resulting traces to take the union of the
+window.
+
+**The hostile-peer rig the row named could not drive a fetcher.**
+`src/fetch/tests/hostile_peer.rs` starts no fetcher -- it exercises the
+decoder -- and the `end_to_end` test binary embeds a container path, so
+neither could be pointed at the host binary. Step 4c wrote a
+fifteen-scenario driver in the scratchpad instead, and measured that the
+fetcher's exit status is identical confined and unconfined in every one
+of them, including a stop and continue, which is what the
+`restart_syscall` entry is for.
+
+**`tgkill` is deliberately absent, so an abort presents as `SIGSYS`.**
+A panic exits with its own status, because `gettid` and `futex` are
+allowed. An abort or a stack overflow raises a signal through `tgkill`,
+and allowing that call would let a fetcher under an attacker's influence
+signal the privileged process that spawned it. The trade is a less
+precise cause of death for a bug that was fatal either way, against not
+handing the untrusted half a way to signal the trusted one.
+
+**The architecture check is proved by interpreting the built program,
+not by making a foreign call.** A real x32 or 32-bit call cannot be made
+from a test in this binary. The filter is instead run over every syscall
+number and both architecture words by a small interpreter in the test,
+which is what catches the mistake that matters here: a jump that lands
+one instruction out allows or kills a call nobody thought to try. The
+five calls that must be absent are still proved by attempting them for
+real.
+
 ## Mutation results
 
 To be filled in by step 4d.

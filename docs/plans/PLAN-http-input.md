@@ -1269,6 +1269,25 @@ chosen to defer to here, so that we do not forget them.
   Worth revisiting if a later backend has to open something, which is
   the case namespaces are actually for; a fetcher that opens nothing
   is not it.
+* **The fetcher panics if its stderr goes away.** Its diagnostics are
+  `eprintln!`, which panics on `EPIPE`, so a caller whose stderr closes
+  while a fetch is in progress turns a diagnostic into a panic and a
+  non-zero exit. Found while measuring the syscall policy in phase 4,
+  which had to allow the panic path's own calls so that the panic
+  presents as a panic rather than as a policy violation. The fix is to
+  write diagnostics in a form that can fail without unwinding; it is
+  not phase 4's, because the behaviour predates it.
+* **The fetcher inherits the caller's environment.** A library named in
+  `LD_PRELOAD` is loaded into the fetcher and can make syscalls no
+  measured allowlist covers, so the fetcher dies on a policy violation
+  under a preloaded library, a sanitiser or a profiler. The caller who
+  set that variable already holds the authority the partition protects,
+  so this is a diagnosability problem rather than a hole -- and the
+  privileged side naming the signal is what makes it diagnosable.
+  Clearing the environment before the `exec` is the obvious answer and
+  was not taken in phase 4, because the fetcher is installed beside
+  libraries a packaged layout may need a path for, and that needs
+  measuring against the packages rather than asserting.
 * **`run_check` and `compare_images` call `std::process::exit`, which
   blocks phase 7.** The fetcher is reaped by a `Drop`, and a `Drop`
   does not run on `exit`. `info` returns its errors through `main`, so

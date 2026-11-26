@@ -238,6 +238,13 @@ const LAYER_NONE: &str = "none";
 /// test assert that it appears nowhere else.
 const LANDLOCK_APPLIED: &str = "has left itself no reachable path";
 
+/// What the report says of the syscall policy once it is in force.
+///
+/// Named for the same reason: it claims a filter is installed, which is true
+/// only of a fetcher that was asked for one and then completed its init
+/// exchange, and a test has to be able to say it appears nowhere else.
+const SECCOMP_APPLIED: &str = "has left itself only the syscalls it serves with";
+
 /// `landlock_create_ruleset`'s version query flag.
 ///
 /// With a null attribute pointer and a zero size it is a question rather
@@ -328,14 +335,12 @@ impl KernelConfinement {
 
     /// One line per layer, for a caller that asked for verbosity.
     ///
-    /// The filesystem line says the fetcher is confined rather than that it
-    /// was asked to be, and it can: the fetcher applies the layers this list
-    /// names before it answers anything, and exits non-zero without
-    /// answering if it cannot apply one of them, so a fetcher that completed
-    /// its init exchange is a fetcher that applied what it was named. These
-    /// lines are printed after that exchange for exactly that reason. The
-    /// syscall line still says what was asked for, because the asking is all
-    /// that happens to it yet.
+    /// The lines say the fetcher is confined rather than that it was asked
+    /// to be, and they can: the fetcher applies the layers this list names
+    /// before it answers anything, and exits non-zero without answering if
+    /// it cannot apply one of them, so a fetcher that completed its init
+    /// exchange is a fetcher that applied what it was named. These lines are
+    /// printed after that exchange for exactly that reason.
     ///
     /// Said on this side because this side is where the answer is known, and
     /// said only under `--verbose` because a default run of an operation
@@ -357,8 +362,8 @@ impl KernelConfinement {
         });
         lines.push(if self.seccomp_kill {
             format!(
-                "instar: this kernel can kill on a {LAYER_SECCOMP} violation, so the fetcher is \
-                 asked to allow itself only the syscalls it serves with"
+                "instar: this kernel can kill on a {LAYER_SECCOMP} violation, and the fetcher \
+                 {SECCOMP_APPLIED}"
             )
         } else {
             format!(
@@ -1360,6 +1365,12 @@ mod tests {
             "the seccomp line does not name the layer: {:?}",
             applied[1]
         );
+        assert!(
+            applied[1].contains(SECCOMP_APPLIED),
+            "the seccomp line does not say the fetcher is confined by it, which is what a \
+             completed init exchange proves: {:?}",
+            applied[1]
+        );
 
         let neither = KernelConfinement {
             landlock_abi: None,
@@ -1373,11 +1384,34 @@ mod tests {
                 "a layer this kernel cannot provide is not reported as missing: {line:?}"
             );
             assert!(
-                !line.contains(LANDLOCK_APPLIED),
+                !line.contains(LANDLOCK_APPLIED) && !line.contains(SECCOMP_APPLIED),
                 "a kernel that cannot provide the layer is reported as though the fetcher had \
                  been confined by it anyway: {line:?}"
             );
         }
+
+        // Each claim belongs to its own layer, so a kernel with one and not
+        // the other must be told so line by line rather than all or nothing.
+        let filesystem_only = KernelConfinement {
+            landlock_abi: Some(1),
+            seccomp_kill: false,
+        }
+        .report();
+        assert!(
+            filesystem_only[0].contains(LANDLOCK_APPLIED)
+                && !filesystem_only[1].contains(SECCOMP_APPLIED),
+            "a kernel with only the filesystem layer is misreported: {filesystem_only:?}"
+        );
+        let syscalls_only = KernelConfinement {
+            landlock_abi: None,
+            seccomp_kill: true,
+        }
+        .report();
+        assert!(
+            !syscalls_only[0].contains(LANDLOCK_APPLIED)
+                && syscalls_only[1].contains(SECCOMP_APPLIED),
+            "a kernel with only the syscall layer is misreported: {syscalls_only:?}"
+        );
     }
 
     #[test]

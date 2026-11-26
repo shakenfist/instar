@@ -591,12 +591,18 @@ jobs:
           # kernel had no Landlock would assert the refusal that kernel is
           # owed instead, and the policy would go untested in a green run.
           # If this job fails on it, the runner is that kernel.
+          #
+          # INSTAR_REQUIRE_SECCOMP does the same for the fetcher's syscall
+          # policy, whose tests would otherwise settle for asserting that
+          # a fetcher asked for the policy refuses to run where the kernel
+          # cannot kill a process for breaking one.
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e HOME=/build \
             -e CARGO_HOME=/build/.cargo \
             -e CARGO_BUILD_JOBS=2 \
             -e INSTAR_REQUIRE_LANDLOCK=1 \
+            -e INSTAR_REQUIRE_SECCOMP=1 \
             -v "$(pwd):/workspace" \
             -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
             -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \

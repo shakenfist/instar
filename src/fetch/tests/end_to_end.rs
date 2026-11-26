@@ -168,12 +168,25 @@ fn dup_above<T: AsRawFd>(source: &T, lowest: RawFd) -> io::Result<OwnedFd> {
 
 /// Spawn the fetcher with `socket` and `file` on the numbers it is told.
 fn spawn_fetcher(socket: SeqPacketSocket, file: &File) -> io::Result<Fetcher> {
+    spawn_fetcher_confined(socket, file, None)
+}
+
+/// Spawn the fetcher, telling it to apply the confinement `layers` names to
+/// itself, or telling it nothing when there is no list.
+fn spawn_fetcher_confined(
+    socket: SeqPacketSocket,
+    file: &File,
+    layers: Option<&str>,
+) -> io::Result<Fetcher> {
     let socket_copy = dup_above(&socket, CHILD_FILE_FD + 1)?;
     let file_copy = dup_above(file, CHILD_FILE_FD + 1)?;
     let socket_raw = socket_copy.as_raw_fd();
     let file_raw = file_copy.as_raw_fd();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_instar-fetch"));
+    if let Some(layers) = layers {
+        command.arg(format!("--confine={layers}"));
+    }
     command
         .arg(CHILD_SOCKET_FD.to_string())
         .arg(CHILD_FILE_FD.to_string())
@@ -232,16 +245,36 @@ impl Rig {
 
     /// A rig serving a file of `len` bytes instead of the usual one.
     fn with_image_len(len: usize) -> io::Result<Self> {
-        Self::build(None, len)
+        Self::build(None, len, None)
     }
 
     /// A rig, optionally asking for `bytes` of socket buffer in both
     /// directions on this side of the pair before the negotiation runs.
     fn with_socket_buffer(bytes: Option<u32>) -> io::Result<Self> {
-        Self::build(bytes, IMAGE_LEN)
+        Self::build(bytes, IMAGE_LEN, None)
     }
 
-    fn build(bytes: Option<u32>, image_len: usize) -> io::Result<Self> {
+    /// A rig whose fetcher is told to apply `layers` to itself.
+    fn confined(layers: &str) -> io::Result<Self> {
+        Self::build(None, IMAGE_LEN, Some(layers))
+    }
+
+    /// Hang up on the fetcher and report how it ended.
+    ///
+    /// Not what `Drop` does: that kills the fetcher so that no test leaves a
+    /// process behind, and a fetcher that was killed has no status of its
+    /// own to check.
+    fn finish(self) -> io::Result<std::process::ExitStatus> {
+        let Rig {
+            client,
+            _fetcher: mut fetcher,
+            ..
+        } = self;
+        drop(client);
+        fetcher.wait()
+    }
+
+    fn build(bytes: Option<u32>, image_len: usize, layers: Option<&str>) -> io::Result<Self> {
         let image = TempImage::new(image_len)?;
         let served = image.open()?;
         let oracle = image.open()?;
@@ -253,7 +286,7 @@ impl Rig {
         }
         let max_datagram = ours.max_datagram()?;
 
-        let fetcher = spawn_fetcher(theirs, &served)?;
+        let fetcher = spawn_fetcher_confined(theirs, &served, layers)?;
         drop(served);
 
         let mut client = FetchClient::new(ours)?;
@@ -595,5 +628,158 @@ fn a_small_socket_buffer_lowers_the_negotiated_block_and_reads_still_split() -> 
     // And the whole file, which at this block size is a few hundred round
     // trips including a ragged last one.
     rig.check(0, IMAGE_LEN);
+    Ok(())
+}
+
+/// The confinement list instar names on this kernel: every layer the kernel
+/// can provide, or `none`.
+///
+/// Asked of the kernel the way instar asks, rather than assumed, so that the
+/// confined tests below run the fetcher exactly as instar would run it here.
+/// A layer the caller demanded and the kernel lacks is a failure instead of
+/// a quietly weaker run, by the same two variables the fetcher's own tests
+/// answer to.
+fn layers_instar_would_name() -> String {
+    // SAFETY: the Landlock version query takes a null attribute pointer, a
+    // zero size and the version flag; in that form the kernel reads nothing
+    // and creates nothing, and returns the ABI it implements.
+    let landlock = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            1_u32,
+        )
+    } > 0;
+    let action = libc::SECCOMP_RET_KILL_PROCESS;
+    // SAFETY: the action-availability question reads the one u32 its third
+    // argument points at, a local that outlives the call, and installs
+    // nothing on this process.
+    let seccomp = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_GET_ACTION_AVAIL,
+            0_usize,
+            std::ptr::addr_of!(action),
+        )
+    } == 0;
+    assert!(
+        landlock || std::env::var_os("INSTAR_REQUIRE_LANDLOCK").is_none(),
+        "INSTAR_REQUIRE_LANDLOCK is set and this kernel has no landlock"
+    );
+    assert!(
+        seccomp || std::env::var_os("INSTAR_REQUIRE_SECCOMP").is_none(),
+        "INSTAR_REQUIRE_SECCOMP is set and this kernel cannot kill on a seccomp violation"
+    );
+    let mut layers = Vec::new();
+    if landlock {
+        layers.push("landlock");
+    }
+    if seccomp {
+        layers.push("seccomp");
+    }
+    if layers.is_empty() {
+        layers.push("none");
+    }
+    layers.join(",")
+}
+
+/// A fetcher confined the way instar confines it still serves every byte,
+/// and then ends with a zero.
+///
+/// The status is the point. A syscall policy that lacked a call the loop
+/// makes would show up in any read; one that lacked a call the fetcher makes
+/// only as it leaves -- closing its descriptors, exiting -- would serve every
+/// byte correctly and then die of a signal, and nothing that only reads from
+/// it would ever notice.
+#[test]
+fn a_fetcher_confined_as_instar_confines_it_serves_every_byte_and_exits_zero() -> io::Result<()> {
+    let layers = layers_instar_would_name();
+    let mut rig = Rig::confined(&layers)?;
+    assert_eq!(rig.client.capacity(), IMAGE_LEN as u64);
+    rig.check(0, IMAGE_LEN);
+    rig.check(0, 1);
+    let block = rig.block();
+    rig.check(77, 2 * block + 123);
+    rig.check(IMAGE_LEN as u64 - 100, 100);
+
+    let status = rig.finish()?;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a fetcher confined by {layers:?} served every byte and then did not exit cleanly: \
+         {status}"
+    );
+    Ok(())
+}
+
+/// The paths a well-behaved peer never drives are confined too, and each of
+/// them makes calls of its own: a refusal is a diagnostic and a reply, and a
+/// refused init is an exit with a status that is not zero. Under a policy
+/// that had been measured only on runs that went well, these would be where
+/// the fetcher died.
+#[test]
+fn a_confined_fetcher_refuses_what_it_should_and_is_not_killed_for_it() -> io::Result<()> {
+    let layers = layers_instar_would_name();
+
+    // A request it must refuse and then carry on from.
+    let image = TempImage::new(IMAGE_LEN)?;
+    let served = image.open()?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+    let max_datagram = ours.max_datagram()?;
+    let mut fetcher = spawn_fetcher_confined(theirs, &served, Some(&layers))?;
+    drop(served);
+    ours.set_recv_timeout(REPLY_TIMEOUT)?;
+    ours.send(&InitRequest::new(max_datagram).encode())?;
+    let mut buf = vec![0u8; READ_REPLY_LEN + MAX_BLOCK_SIZE as usize];
+    let len = ours.recv(&mut buf)?;
+    let init = InitReply::decode(&buf[..len]).expect("the init reply decodes");
+    let block_size = init
+        .accepted_block_size(max_datagram)
+        .expect("a block size");
+
+    let id = 0x2727_2727_2727_2727;
+    let mut overlong = ReadRequest::new(id, 0, 512).encode().to_vec();
+    overlong.resize(overlong.len() + 4096, 0xEE);
+    ours.send(&overlong)?;
+    let len = ours.recv(&mut buf)?;
+    let (reply, _) = ReadReply::decode(&buf[..len], block_size).expect("a reply decodes");
+    assert_eq!(reply.id, id);
+    assert_eq!(reply.status, Status::BadRequest, "{:?}", reply.status);
+
+    // A read that starts where the image ends, which is answered with a
+    // status and a line on the fetcher's stderr.
+    ours.send(&ReadRequest::new(id + 1, IMAGE_LEN as u64, 512).encode())?;
+    let len = ours.recv(&mut buf)?;
+    let (reply, _) = ReadReply::decode(&buf[..len], block_size).expect("a reply decodes");
+    assert_eq!(reply.id, id + 1);
+    assert_eq!(reply.status, Status::OutOfRange, "{:?}", reply.status);
+
+    drop(ours);
+    let status = fetcher.wait()?;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a fetcher confined by {layers:?} refused two requests and then did not exit cleanly: \
+         {status}"
+    );
+
+    // An init it must refuse and then stop on.
+    let served = image.open()?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+    let mut fetcher = spawn_fetcher_confined(theirs, &served, Some(&layers))?;
+    drop(served);
+    ours.set_recv_timeout(REPLY_TIMEOUT)?;
+    ours.send(b"this is not an init request")?;
+    let len = ours.recv(&mut buf)?;
+    let refusal = InitReply::decode(&buf[..len]).expect("the refusal decodes");
+    assert_eq!(refusal.status, Status::BadRequest, "{:?}", refusal.status);
+    let status = fetcher.wait()?;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a fetcher confined by {layers:?} refused an init and did not exit with the status \
+         that says so: {status}"
+    );
     Ok(())
 }

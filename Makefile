@@ -565,6 +565,11 @@ test: test-rust test-integration
 # the fetcher owes that kernel instead of the policy biting, which is a
 # weaker assertion than the one worth having; setting the variable turns
 # that substitution into a failure.
+#
+# INSTAR_REQUIRE_SECCOMP is the same arrangement for the fetcher's syscall
+# policy: on a kernel that cannot kill a process for a violation, the tests
+# assert that a fetcher asked for the policy refuses to run, and setting
+# the variable makes that a failure too.
 test-rust: instar-devcontainer
 	@echo "Running Rust unit tests..."
 	docker run --rm \
@@ -572,6 +577,7 @@ test-rust: instar-devcontainer
 		-e HOME=/build \
 		-e CARGO_HOME=/build/.cargo \
 		-e INSTAR_REQUIRE_LANDLOCK \
+		-e INSTAR_REQUIRE_SECCOMP \
 		-v "$(CURDIR):/workspace" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
