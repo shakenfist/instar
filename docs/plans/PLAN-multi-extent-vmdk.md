@@ -563,7 +563,7 @@ this table whether it is merged.
 | 1. Pin and measure qemu's output | [PLAN-multi-extent-vmdk-phase-01-pin.md](PLAN-multi-extent-vmdk-phase-01-pin.md) | Complete | 34832d47 |
 | 2. Fixtures and baselines | [PLAN-multi-extent-vmdk-phase-02-fixtures.md](PLAN-multi-extent-vmdk-phase-02-fixtures.md) | Complete | 2e8a3022 |
 | 3. Read side: lift the extent ceiling | [PLAN-multi-extent-vmdk-phase-03-read-ceiling.md](PLAN-multi-extent-vmdk-phase-03-read-ceiling.md) | Complete | 64e6fbc6 |
-| 4. Multi-extent descriptor emitter | [PLAN-multi-extent-vmdk-phase-04-descriptor.md](PLAN-multi-extent-vmdk-phase-04-descriptor.md) | In progress | |
+| 4. Multi-extent descriptor emitter | [PLAN-multi-extent-vmdk-phase-04-descriptor.md](PLAN-multi-extent-vmdk-phase-04-descriptor.md) | Complete | 3aa85cc5 |
 | 5. Host-only flat create | PLAN-multi-extent-vmdk-phase-05-flat-create.md | Not started | |
 | 6. ABI: output rotation | PLAN-multi-extent-vmdk-phase-06-abi.md | Not started | |
 | 7. Core: rotation in the guest | PLAN-multi-extent-vmdk-phase-07-core.md | Not started | |
