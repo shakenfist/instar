@@ -767,6 +767,7 @@ class InstarTestBase(testtools.TestCase):
         output_format: Optional[str] = None,
         unsafe_quirks: bool = False,
         chain: bool = False,
+        verbose: bool = False,
     ) -> tuple:
         """
         Run instar info on an image.
@@ -781,13 +782,19 @@ class InstarTestBase(testtools.TestCase):
                            a valid partition table. Required for testing images
                            marked with unsafe_quirks_required in the manifest.
             chain: Enable backing chain discovery (--chain)
+            verbose: Ask for the diagnostics instar keeps off stderr by
+                     default (--verbose, which is a global flag and so goes
+                     before the subcommand)
 
         Returns:
             tuple: (stdout, stderr, return_code)
         """
         instar = self.get_instar_binary()
 
-        cmd = [str(instar), 'info']
+        cmd = [str(instar)]
+        if verbose:
+            cmd.append('--verbose')
+        cmd.append('info')
         if chain:
             cmd.append('--chain')
         if qemu_version:

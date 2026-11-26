@@ -56,9 +56,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use fetch_protocol::{FetchClient, SeqPacketSocket};
@@ -588,6 +588,70 @@ impl RemoteSource {
     }
 }
 
+/// The name of `signal`, for the handful a fetcher could plausibly die on.
+///
+/// A table rather than `strsignal`, which would mean a pointer from the C
+/// library to read and a locale to render it in: the number is printed in
+/// every case, so an unnamed signal is still identified, and what the name
+/// buys is that the common ones are recognisable without a lookup.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return None,
+    })
+}
+
+/// What to tell the operator about a fetcher that has been reaped, or `None`
+/// where there is nothing to tell.
+///
+/// A fetcher that exited by itself, with any status, says nothing here: a
+/// clean exit is the normal end of a run, and a failure it reports through the
+/// protocol has already reached the user as a sentence this side wrote from a
+/// status. A fetcher killed by a signal is the case this exists for, because
+/// the protocol carries nothing at all in that case -- the socket simply stops
+/// answering -- and the signal is the only description of what happened that
+/// anybody has.
+///
+/// `SIGSYS` gets its own sentence because it has a single cause: the fetcher
+/// reached a system call its own policy does not allow. That is this program's
+/// mistake and not the user's, and saying so is the difference between a bug
+/// that gets reported and a user who concludes their image is broken.
+///
+/// Said whatever verbosity the caller asked for. A child killed by a signal is
+/// abnormal by definition, the operation it was serving has already failed by
+/// the time this is known, and a diagnosis that only appears if the user
+/// happens to run the command again with another flag is a diagnosis nobody
+/// gets. The runs that are required to be silent on stderr are the ones that
+/// succeed, and on those this returns `None`.
+fn reaped_fetcher_note(pid: u32, status: ExitStatus) -> Option<String> {
+    let signal = status.signal()?;
+    let named = match signal_name(signal) {
+        Some(name) => format!("signal {signal} ({name})"),
+        None => format!("signal {signal}"),
+    };
+    if signal == libc::SIGSYS {
+        return Some(format!(
+            "instar: the fetcher (pid {pid}) was killed by {named}, which means it made a system \
+             call its sandbox does not allow. That is a bug in instar rather than anything wrong \
+             with the input or the way it was invoked, and the input it was serving was not read \
+             to the end"
+        ));
+    }
+    Some(format!(
+        "instar: the fetcher (pid {pid}) was killed by {named} rather than exiting when its \
+         socket closed; the input it was serving was not read to the end"
+    ))
+}
+
 impl Drop for RemoteSource {
     fn drop(&mut self) {
         // Closing the socket is how the fetcher is asked to stop: its `recv`
@@ -599,7 +663,15 @@ impl Drop for RemoteSource {
         let started = Instant::now();
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(status)) => {
+                    // The status is the only account of a fetcher that was
+                    // killed, so it is read here rather than discarded: this
+                    // is the last moment it exists.
+                    if let Some(note) = reaped_fetcher_note(self.child.id(), status) {
+                        eprintln!("{note}");
+                    }
+                    return;
+                }
                 Ok(None) => {}
                 Err(err) => {
                     // Nothing useful is left to do: the child cannot be
@@ -1411,6 +1483,66 @@ mod tests {
             !syscalls_only[0].contains(LANDLOCK_APPLIED)
                 && syscalls_only[1].contains(SECCOMP_APPLIED),
             "a kernel with only the syscall layer is misreported: {syscalls_only:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_that_exited_by_itself_is_not_reported() {
+        for raw in [0, 1 << 8, 70 << 8] {
+            let status = ExitStatus::from_raw(raw);
+            assert_eq!(
+                None,
+                reaped_fetcher_note(4242, status),
+                "a fetcher that exited with {status:?} was reported as though it had been killed, \
+                 which would put a line on the stderr of a run that is required to be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fetcher_killed_for_a_call_its_policy_denies_is_told_as_this_programs_fault() {
+        // A wait status whose low seven bits are the signal is what the
+        // kernel reports for a process that died on one.
+        let note = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGSYS))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            note.contains("SIGSYS") && note.contains(&format!("signal {}", libc::SIGSYS)),
+            "the note does not name the signal: {note}"
+        );
+        assert!(
+            note.contains("system call") && note.contains("sandbox"),
+            "the note does not say what SIGSYS means for this process: {note}"
+        );
+        assert!(
+            note.contains("bug in instar"),
+            "the note leaves the user to conclude their input was at fault: {note}"
+        );
+        assert!(
+            note.contains("4242"),
+            "the note does not name the pid: {note}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_killed_by_any_other_signal_names_that_signal() {
+        let note = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGSEGV))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            note.contains("SIGSEGV") && note.contains(&format!("signal {}", libc::SIGSEGV)),
+            "the note does not name the signal: {note}"
+        );
+        assert!(
+            !note.contains("bug in instar"),
+            "a signal that is not SIGSYS was described as a policy violation: {note}"
+        );
+
+        // A signal with no name in the table is still identified, because the
+        // number is in every one of these sentences.
+        let unnamed = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGWINCH))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            unnamed.contains(&format!("signal {}", libc::SIGWINCH)),
+            "an unnamed signal is not identified at all: {unnamed}"
         );
     }
 

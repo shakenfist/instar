@@ -710,6 +710,26 @@ FILE_URL_FIXTURES = (
 # rather than that the feature is not built.
 REFUSED_SCHEMES = ('https', 'http', 's3', 'nbd', 'ftp')
 
+# What `--verbose` says of each confinement layer once its policy is in
+# force on the fetcher. Keyed by the layer's name, which is also what the
+# privileged side calls it on the fetcher's command line.
+CONFINEMENT_APPLIED = {
+    'landlock': 'has left itself no reachable path',
+    'seccomp': 'has left itself only the syscalls it serves with',
+}
+
+# What it says instead on a kernel that cannot provide the layer. Such a
+# run goes ahead with one layer fewer rather than failing, so a test here
+# has to accept either sentence -- but accepting the weaker one silently
+# would mean a machine whose kernel quietly provides nothing passes every
+# confinement test it has. Setting INSTAR_REQUIRE_LANDLOCK or
+# INSTAR_REQUIRE_SECCOMP turns that substitution into a failure, which is
+# the arrangement the fetcher's own unit tests and the strace oracle use.
+CONFINEMENT_UNAVAILABLE = {
+    'landlock': 'runs without a filesystem policy',
+    'seccomp': 'runs without a syscall policy',
+}
+
 
 class TestInfoFileUrl(InstarTestBase):
     """`instar info` over a `file://` URL rather than a path.
@@ -728,7 +748,7 @@ class TestInfoFileUrl(InstarTestBase):
             self.skipTest(f'Test image not found: {image.path}')
         return image
 
-    def _info(self, target, image=None, output_format=None, chain=False):
+    def _info(self, target, image=None, output_format=None, chain=False, verbose=False):
         """Run `info` on a path or URL, as the fixture requires it to be run."""
         return self.run_instar_info(
             target,
@@ -736,7 +756,34 @@ class TestInfoFileUrl(InstarTestBase):
             output_format=output_format,
             unsafe_quirks=bool(image is not None and image.requires_unsafe_quirks),
             chain=chain,
+            verbose=verbose,
         )
+
+    def _assert_every_layer_is_accounted_for(self, stderr, context):
+        """Assert the verbose stream says what became of every layer.
+
+        Searched as substrings of the whole stream rather than compared as
+        lines. The fetcher's stderr is instar's own, and the fetcher writes
+        a diagnostic in several pieces, so a piece of one of its lines can
+        arrive between these sentences or in the middle of one. What
+        interleaving cannot do is remove a sentence the privileged side
+        wrote, so presence is what is asserted and order is not.
+        """
+        for layer, applied in CONFINEMENT_APPLIED.items():
+            if applied in stderr:
+                continue
+            required = f'INSTAR_REQUIRE_{layer.upper()}'
+            if os.environ.get(required):
+                self.fail(
+                    f'{context}: {required} is set, so the fetcher applying {layer} is '
+                    f'required rather than hoped for, and --verbose does not say it did: '
+                    f'{stderr!r}'
+                )
+            self.assertIn(
+                CONFINEMENT_UNAVAILABLE[layer], stderr,
+                f'{context}: --verbose accounts for {layer} neither as applied nor as '
+                f'missing from this kernel: {stderr!r}'
+            )
 
     @staticmethod
     def _targets(path):
@@ -789,6 +836,12 @@ class TestInfoFileUrl(InstarTestBase):
         apart for this reason: a comparison of the two combined would
         hide it, and under `--verbose` the diagnostics are there by
         design.
+
+        The silence now carries a second meaning. A fetcher that dies on
+        a signal is reported whatever the caller asked for, because by
+        then the run has failed and a diagnosis nobody sees is no
+        diagnosis -- so an empty stderr here is also the assertion that
+        nothing killed the fetcher, a sandbox policy included.
         """
         for image_id in FILE_URL_FIXTURES:
             image = self._fixture(image_id)
@@ -802,6 +855,94 @@ class TestInfoFileUrl(InstarTestBase):
                         '', stderr,
                         f'{image_id}: info {target} wrote to stderr without --verbose'
                     )
+
+    def test_a_confined_fetcher_prints_what_the_path_prints(self):
+        """The sandbox is accounted for and the bytes are unchanged.
+
+        One test rather than two on purpose. A comparison of the bytes
+        on its own stays green if the fetcher quietly stops being
+        confined, which is the failure a sandbox is most likely to have
+        and the hardest to see; an assertion about the sandbox lines on
+        its own stays green if a confined fetcher starts serving
+        different bytes. Together they say that these bytes came out of
+        a fetcher with the policies on.
+
+        Three runs per fixture and format, because `--verbose` is what
+        makes the sandbox visible and it also appends this run's VMM
+        statistics -- its own timings, which no two runs of anything
+        share -- to stdout. So the oracle is the pair of default runs,
+        compared byte for byte, and the verbose run is held to printing
+        the image report those two agreed on before its statistics. The
+        exit status and the output's length are inside each comparison
+        rather than checked somewhere else: two failed runs print two
+        empty streams that compare equal.
+        """
+        for image_id in FILE_URL_FIXTURES:
+            image = self._fixture(image_id)
+            path = image.path.resolve()
+            target = f'file://{path}'
+            for output_format in (None, 'json'):
+                with self.subTest(image=image_id, output=output_format or 'human'):
+                    expected, path_stderr, path_rc = self._info(
+                        str(path), image, output_format
+                    )
+                    self.assertEqual(
+                        0, path_rc,
+                        f'{image_id}: info on the path exited {path_rc}; '
+                        f'stderr={path_stderr!r}'
+                    )
+                    self.assertNotEqual(
+                        '', expected,
+                        f'{image_id}: info on the path exited 0 and printed nothing'
+                    )
+
+                    stdout, stderr, rc = self._info(target, image, output_format)
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: info {target} exited {rc}; stderr={stderr!r}'
+                    )
+                    self.assertNotEqual(
+                        '', stdout,
+                        f'{image_id}: info {target} exited 0 and printed nothing'
+                    )
+                    self.assertEqual(
+                        expected, stdout,
+                        f'{image_id}: a fetcher printed something other than what the plain '
+                        f'path printed'
+                    )
+
+                    stdout, stderr, rc = self._info(
+                        target, image, output_format, verbose=True
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: info --verbose {target} exited {rc}; stderr={stderr!r}'
+                    )
+                    self.assertTrue(
+                        stdout.startswith(expected),
+                        f'{image_id}: info --verbose {target} printed an image report other '
+                        f'than the one the plain path printed: {stdout!r}'
+                    )
+                    self._assert_every_layer_is_accounted_for(stderr, f'{image_id} {target}')
+
+    def test_a_path_reports_no_sandbox_because_it_has_no_fetcher(self):
+        """A path says nothing about a layer, however verbose the run.
+
+        What ties the sandbox lines to the fetcher rather than to the
+        operation: the same image, the same flag, and a route that reads
+        the file in the privileged process has nothing to confine and
+        nothing to say about confining it.
+        """
+        image = self._fixture('cirros-qcow2')
+        stdout, stderr, rc = self._info(str(image.path.resolve()), image, verbose=True)
+        self.assertEqual(0, rc, f'info --verbose on the path exited {rc}; stderr={stderr!r}')
+        self.assertNotEqual('', stdout, 'info --verbose on the path printed nothing')
+        for layer in CONFINEMENT_APPLIED:
+            self.assertNotIn(
+                layer, stderr,
+                f'a plain path reported {layer}, so the sandbox lines are not the '
+                f'fetcher\'s: {stderr!r}'
+            )
 
     def test_a_scheme_instar_does_not_serve_is_refused_by_name(self):
         """Every unserved scheme exits non-zero and names itself."""

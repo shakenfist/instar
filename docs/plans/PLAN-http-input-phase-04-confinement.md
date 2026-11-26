@@ -307,7 +307,21 @@ step does not need to redo any of that.
     not a fetcher whose error handling should be trusted to continue.
     The diagnosis is cheap: phase 3's `Drop` already `wait`s for the
     child, so the status is available, and `WTERMSIG == SIGSYS` names
-    this exactly. The VMM reports it under `--verbose`.
+    this exactly.
+
+    This decision said until step 4d that the VMM reports it under
+    `--verbose`, and that was wrong. A child killed by a signal is
+    abnormal by definition, the operation it was serving has already
+    failed by the time the status is read, and a diagnosis that appears
+    only if the user runs the command again with another flag is a
+    diagnosis nobody gets. It is reported whatever verbosity was asked
+    for. What decision 3 and its test require is that a run which
+    *succeeds* says nothing on stderr, and a successful run reaches
+    this path with a status that is not a signal, so it still says
+    nothing. Step 4d checked the rest of the suite for a test that
+    requires silence on a *failing* run and found one, in
+    `tests/test_compare.py`, which compares two paths and so starts no
+    fetcher at all.
 
 12. **`PR_SET_DUMPABLE` 0 is declined; `RLIMIT_CORE` 0 is set
     instead.** What the master plan wanted from it is that a crash does
@@ -601,6 +615,110 @@ one instruction out allows or kills a call nobody thought to try. The
 five calls that must be absent are still proved by attempting them for
 real.
 
+**The runs step 4d's tests were checked against.** The whole host
+integration suite, with `INSTAR_REQUIRE_LANDLOCK=1
+INSTAR_REQUIRE_SECCOMP=1` so the new test asserts the policies applied
+rather than accepting a kernel's excuse: `Ran: 4595 tests`, 3920 passed,
+671 skipped, 4 expected failures, **0 failed**, classified by
+`tools/ci/check-stestr-run.sh <log> in-output` as "3924 of 4595 tests
+executed, 671 skipped, against 3126 discovered; no worker lost". The unit
+tests, with the same two variables set: **3158 passed, 0 failed** across
+83 test binaries. `make instar` builds and `pre-commit run --all-files`
+exits 0; its first run wanted one `assert!` in the new VMM tests broken
+over three lines, which is in the tree.
+
+Two notes on what step 4d did *not* add. The row asks for a default run
+still silent on stderr, and phase 3's
+`test_a_default_run_is_silent_on_stderr_either_way` is that test already
+-- it now runs against a confining build, and it has gained a second
+meaning rather than a duplicate: because a killed fetcher is reported
+whatever the verbosity, an empty stderr there is also the assertion that
+nothing killed the fetcher. And the suite's `run_instar_info` helper
+gained a `verbose` argument, because nothing in the suite had needed
+`--verbose` on an `info` run before; `--verbose` is a global flag, so it
+goes before the subcommand.
+
 ## Mutation results
 
-To be filled in by step 4d.
+Five mutations, one at a time, applied to a copy of the tree in the
+session scratchpad and never to the worktree, by
+`p04-step-4d/run-mutation.sh <a|b|c|d|e>`. The script restores the
+mutated file from a pristine copy taken before the first mutation rather
+than with `git checkout` -- a checkout would also discard the work under
+test -- refuses to run when the text it means to change is not in the
+file exactly once, so a mutation that silently did not apply cannot pass
+as a surviving one, and runs each command under `timeout`. All five were
+caught.
+
+| Mutation | Caught by | How it presented |
+|---|---|---|
+| (a) the filesystem policy is built and then not applied: `landlock_restrict_self` replaced by a success | `confine::tests::the_policy_keeps_an_inherited_descriptor_and_denies_its_path` | The probe's exit status became "the inherited descriptor read and the path opened" rather than "read and refused": `left: 20, right: 21` |
+| (b) the syscall filter is built and then not installed: the `PR_SET_SECCOMP` `prctl` replaced by a success | `confine::tests::the_syscall_policy_kills_every_call_that_reaches_past_what_it_was_handed` | `left: Exited(30), right: Killed(31)` -- the probe's `socket` call returned a descriptor instead of ending the process |
+| (c) `pread64` removed from the measured allowlist | `test_info_safe.TestInfoFileUrl.test_a_confined_fetcher_prints_what_the_path_prints`, and every other test in that class that reads an image through a fetcher | End to end, at the first read, on all twelve fixture-and-format cases: `instar: the fetcher (pid N) was killed by signal 31 (SIGSYS), which means it made a system call its sandbox does not allow. That is a bug in instar rather than anything wrong with the input or the way it was invoked, and the input it was serving was not read to the end` then `Error: "No info result received from guest"`, exit 1 |
+| (d) an unknown layer in `--confine=` ignored instead of refused | `confine::tests::an_unknown_layer_is_refused_by_name` and `tests::an_unknown_confinement_layer_is_refused_by_name` | `Confinement::parse("nonsense")` returned `Confinement { landlock: true, seccomp: false }` -- the mutation was applied to a list naming a real layer and a nonsense one, and the nonsense went through |
+| (e) a named layer that cannot be applied warns and carries on instead of failing | `confine::tests::asking_for_the_filesystem_policy_without_landlock_fails` | `restrict_filesystem(None)` returned `Ok(())`, with the warning the mutation prints on the test's own stderr |
+
+Commands. (a), (b), (d) and (e) are proved by the unit tests, run in the
+copy as `INSTAR_REQUIRE_LANDLOCK=1 INSTAR_REQUIRE_SECCOMP=1 make
+test-rust`; each exited non-zero naming the test above. (c) is the one
+that has to be proved end to end, so the script builds the mutated tree
+with `make instar` and runs the integration selection against *that*
+binary, with the suite's own unmutated test code:
+`INSTAR_BINARY_PATH=<copy>/src/target/release/instar
+INSTAR_REQUIRE_LANDLOCK=1 INSTAR_REQUIRE_SECCOMP=1 stestr run
+--concurrency 4 TestInfoFileUrl`, which exited 1. The unit tests catch
+(c) as well -- the serving-loop probe's `pread` step fails -- but the row
+asked how it presents to a user, and the answer is the sentence above,
+printed by the privileged side's reap.
+
+**A failing `subTest` loses its test's result in this suite, so a
+confinement regression is red as a truncated run rather than as a named
+test.** Found while proving (c), and pre-existing: every test in this
+class loops over fixtures inside `with self.subTest(...)`, which is the
+shape phase 3 established and the right one for six fixtures. The
+mutated run reported `Ran: 7, Passed: 3, Failed: 1` with three workers at
+`N/A` elapsed, and the same one test run alone under `--concurrency 1`
+reported "The test run didn't actually run any tests" -- in both cases
+the failing test's own result never arrived, although every subtest
+failure and its assertion message were printed in full.
+`tools/ci/check-stestr-run.sh` refuses both runs, which is what keeps
+this honest in CI: the guard is load-bearing for this class, not
+decoration. For a result attributable by name the same test was run
+outside stestr as well, with the venv's `python -m unittest -v
+test_info_safe.TestInfoFileUrl.test_a_confined_fetcher_prints_what_the_path_prints`
+against the mutated binary: `FAILED (failures=12)`, one failure per
+fixture and output format, each quoting the `SIGSYS` sentence.
+
+**The diagnosis of a killed fetcher is printed whatever the caller's
+verbosity, and decision 11 needs correcting at source.** It says the
+VMM reports a `SIGSYS` under `--verbose`. That is the wrong default: a
+child killed by a signal is abnormal by definition, the operation it was
+serving has already failed by the time the status is read, and a
+diagnosis that appears only if the user happens to run the command again
+with another flag is a diagnosis nobody gets. `RemoteSource::drop` now
+reads the status it used to throw away and prints one sentence for a
+child that died on a signal, naming the signal, with its own sentence for
+`SIGSYS` saying what it means and that it is instar's bug rather than the
+user's. The decision 3 silence is unaffected and the claim was checked
+rather than assumed: the assertions that a default run writes nothing to
+stderr are assertions about runs that *succeed*, and a fetcher that
+exited by itself -- with any status -- is reported as nothing, which
+`fetch::tests::a_fetcher_that_exited_by_itself_is_not_reported` pins. One
+test in the suite does assert silence on a failing run,
+`test_compare.py`'s content-mismatch case at exit 1, and it cannot be
+affected: it compares two paths, so no fetcher is spawned. The verbosity
+is not threaded into `RemoteSource` for this, because a report that is
+unconditional needs no field to decide with.
+
+**`--verbose` puts this run's VMM statistics on stdout, so a verbose
+parity comparison cannot be byte-identical.** Measured while writing the
+tests: `--verbose` appends a `=== VMM Statistics ===` block to stdout in
+both output formats, and it carries this run's own read rate and exit
+rate, which differ between two runs of the same command on the same path.
+The parity oracle is therefore still the pair of default runs, compared
+byte for byte, and what the verbose run is held to is that its stdout
+*starts with* the report those two agreed on -- which is exactly true,
+because the statistics are appended after it. The new integration test
+makes all three runs per fixture and format so that the confinement
+evidence and the parity are one assertion rather than two tests that can
+pass for the wrong reasons.
