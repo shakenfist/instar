@@ -726,3 +726,59 @@ baseline-matrix and round-trip cases for qcow2, vhd and raw.
 `make instar` needed `make clean-instar` first, failing with
 `GLIBC_2.32/2.33/2.34 not found` because the dev image's artefacts
 were in the shared target directory from the Rust test runs.
+
+**Step 5f, 2026-11-27.** Mutation check. The row said to leave the
+mutations in a runnable script; one already exists and is mature, so
+four cases were added to **`tools/mutate-differencing.sh`** rather than
+a second harness being written. That script has a PASS / FAIL / BROKEN
+vocabulary in which BROKEN means the case proved nothing and is never
+scored as a pass, restores from `.mutation-backups/` rather than with
+`git checkout`, refuses to start on a dirty `src/`, and applies every
+edit through `tools/replace-once.py`, which fails unless the search
+string occurs exactly once. Its own header records that an earlier
+hand-rolled harness reported success for code it never changed. A new
+script would have re-learned that badly.
+
+| Case | Mutation | Killed by |
+|---|---|---|
+| `vmdk-split-create-extent-ceiling-off-by-one` | bound at `MAX_EXTENTS + 1` | `one_byte_past_the_table_is_refused` |
+| `vmdk-split-create-zero-size-guard-removed` | `if false && extent_count == 0` | `a_zero_size_is_refused_with_its_own_message` |
+| `vmdk-split-create-existing-extent-not-refused` | `if false && symlink_metadata(..).is_ok()` | `a_derived_extent_that_exists_is_refused_by_name` |
+| `vmdk-create-cleanup-removes-every-opened-file` | record every opened file as created | `a_file_that_was_already_there_is_kept` |
+
+**4 PASS, 0 FAIL, 0 BROKEN**, harness exit 0, re-run by the management
+session rather than taken from the report, with `src/` confirmed
+restored afterwards -- a mutation left in the tree compiles and passes
+the gate, so nothing downstream would catch it. The ceiling case is
+bounded at one past the limit rather than deleted so that sixty-four
+extents stay accepted: the mutant is confined to the boundary its test
+is named for and cannot kill a different test instead. The first three
+fail as `unwrap_err` on an `Ok`, which is the refusal vanishing rather
+than a build error or an unrelated assertion firing first.
+
+`EXPECTED_CASES` is 183, was 179. `--list` reports 183 cases and
+`--check-patterns` reports 183 of 183 landing with none drifted, so
+every search string still matches exactly once.
+
+**The sub-agent left a documentation inconsistency, fixed by the
+management session.** `EXPECTED_CASES` is cross-checked against a
+headline count in `docs/testing.md`, which was bumped to 183 -- but
+that page also carries a per-group table it describes as the flat
+version so the sum can be checked in one pass, and the table still
+totalled 179 with no row for the new cases. The page says the group
+counts are the thing to re-derive when the two disagree, and nothing
+checks them mechanically. Added: a `split flat create` row of 4, the
+corrected total, "eighteen groups" for "seventeen", and the group's
+prose paragraph in the page's established style. The table now has
+eighteen rows summing to 183, matching the total row and the headline.
+
+That also explains an exit 2 the sub-agent reported and did not trace:
+the harness cross-checks the headline, `EXPECTED_CASES` and its own
+count, and on that invocation the doc still said 179. It was the guard
+working on a half-finished edit, not a mutation failure.
+
+Decision 5's cleanup fix now has mutation evidence from two
+independent directions: this mutant, and the contradicting test pair
+recorded under step 5c part two. The second is the stronger of the
+two, because it shows the defect was pinned as intended behaviour
+rather than merely left untested.
