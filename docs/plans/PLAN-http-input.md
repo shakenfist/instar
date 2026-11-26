@@ -498,7 +498,7 @@ there is a confined process to put it in.
 | 1. Guest I/O wait | [PLAN-http-input-phase-01-guest-wait.md](PLAN-http-input-phase-01-guest-wait.md) | Complete | a8387ffe |
 | 2. Fetch protocol and a file-backed fetcher | [PLAN-http-input-phase-02-protocol.md](PLAN-http-input-phase-02-protocol.md) | Complete | 49d6b9b9 |
 | 3. Remote backing store | [PLAN-http-input-phase-03-backing.md](PLAN-http-input-phase-03-backing.md) | Complete | c43b08f1 |
-| 4. Confinement | PLAN-http-input-phase-04-confinement.md | Not started | |
+| 4. Confinement | [PLAN-http-input-phase-04-confinement.md](PLAN-http-input-phase-04-confinement.md) | In progress | |
 | 5. HTTP backend | PLAN-http-input-phase-05-http.md | Not started | |
 | 6. Cache and prefetch | PLAN-http-input-phase-06-prefetch.md | Not started | |
 | 7. Operation scope and chain policy | PLAN-http-input-phase-07-scope.md | Not started | |
@@ -625,13 +625,63 @@ descriptors are staged clear of 3 and 4 before the fork, which only
 the end-to-end run through the real binary can catch. Its findings for
 phases 4, 5 and 7 are in Future work below.
 
-**4. Confinement.** Landlock, seccomp-bpf, user and mount
-namespaces, rlimits (`RLIMIT_FSIZE` 0 and `RLIMIT_NPROC` 0 are the
-cheap wins), `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE` 0, and
-descriptor hygiene, applied in the child before `exec`. What the
-running kernel refuses is reported, not silently skipped. Still no
-network, so the sandbox is tested against a fetcher that cannot be
-blamed for network behaviour.
+**4. Confinement.** Landlock, seccomp-bpf, rlimits and
+`PR_SET_NO_NEW_PRIVS` on the fetcher. What the running kernel refuses
+is reported, not silently skipped. Still no network, so the sandbox is
+tested against a fetcher that cannot be blamed for network behaviour.
+
+This section said, until the phase was planned, that every layer is
+"applied in the child before `exec`", that `RLIMIT_FSIZE` 0 and
+`RLIMIT_NPROC` 0 are the cheap wins, and that the list also includes
+`PR_SET_DUMPABLE` 0, user and mount namespaces, and descriptor
+hygiene. Planned 2026-11-26, and measured rather than argued:
+
+* **A deny-all Landlock ruleset cannot be applied before the `exec`.**
+  With the ruleset created, `PR_SET_NO_NEW_PRIVS` set and
+  `landlock_restrict_self` called, the following `execv` fails with
+  `EACCES`: the policy denies the loader the binary and the libraries.
+  Applied *after* startup it is exactly right -- a `pread` on an
+  inherited descriptor still works and an `open` of that same path
+  fails. So confinement is two-stage: the parent sets the rlimits and
+  `PR_SET_NO_NEW_PRIVS` in `pre_exec`, and the fetcher applies
+  Landlock and seccomp to itself after its setup and before it reads
+  the first peer byte. A seccomp allowlist installed pre-`exec` has
+  the same problem for the same reason.
+* **`RLIMIT_FSIZE` 0 is not a cheap win.** A child with it set, whose
+  stderr is a regular file, is killed by `SIGXFSZ` on its first
+  diagnostic write; with stderr a pipe the write succeeds. `instar
+  info --verbose file:///x 2>log` is the first case, so the limit
+  would kill the fetcher for printing the line it was asked for. It is
+  also redundant: once Landlock denies every path, the fetcher cannot
+  create a file to grow. `RLIMIT_NPROC` 0 *is* cheap, and survives the
+  `execv`, since the limit is enforced at `fork`.
+* **`PR_SET_DUMPABLE` 0 blinds instar's own diagnostics.** With it
+  set, the parent -- same uid, same session -- gets `EACCES` reading
+  `/proc/<pid>/fd` of its own child, which is the call phase 3's
+  descriptor-set test makes and the one phase 9's confinement test
+  was to make. `RLIMIT_CORE` 0 gets what the dump flag was wanted for
+  without that cost, and what is given up is protection from a
+  same-uid process, which can attach to the privileged half just as
+  easily and so is not a boundary.
+* **The namespaces are one decision, not two, and the phase declines
+  them.** `unshare(CLONE_NEWNS)` alone fails with `EPERM`
+  unprivileged; with `CLONE_NEWUSER` in the same call it succeeds. So
+  a mount namespace means entering a user namespace, which is a
+  privilege transition that buys what the Landlock ruleset and the
+  syscall allowlist already buy. See Future work.
+* **Descriptor hygiene shipped in phase 3**, which asserts the
+  fetcher's descriptor set as the whole of `{0, 1, 2, 3, 4}`.
+
+The phase's own survey also found that the unit tests run inside a
+`docker run` with no `--security-opt`, `--cap-add` or `--privileged`
+anywhere in the tree, so what the daemon's default seccomp profile and
+a missing `CAP_SYS_ADMIN` allow decides what can be *tested*, and that
+`InitReply` has a reserved `flags` field but every decoder rejects a
+non-zero `flags` as a typed error -- so reporting the sandbox over the
+wire would spend a checkable invariant, and the phase does not: the
+privileged side probes the kernel, names the layers it requires on the
+child's command line, and the child exits non-zero rather than
+silently skipping one.
 
 **5. HTTP backend.** Ranged GETs, sizing from `Content-Length`, the
 `206` probe, `ETag`/`Last-Modified` pinning so a source that changes
@@ -1206,6 +1256,19 @@ chosen to defer to here, so that we do not forget them.
   ordering is the one instar owns, since the flag is a default in a
   dependency that a bump could change, so phase 4's descriptor-hygiene
   test should keep asserting the whole set rather than lean on either.
+* **User and mount namespaces for the fetcher, declined in phase 4.**
+  Measured 2026-11-26: `unshare(CLONE_NEWNS)` alone is `EPERM`
+  unprivileged and succeeds only with `CLONE_NEWUSER` in the same
+  call, so the mount namespace costs a user namespace. Inside one the
+  fetcher holds a full capability set over its own namespace, a
+  strictly larger surface than it has now, and the layer is
+  unavailable in the container tier where the unit tests run, so it
+  could not be tested where it matters. What it would buy -- no
+  reachable path, no reachable network -- the deny-all Landlock
+  ruleset and the syscall allowlist already buy, and more precisely.
+  Worth revisiting if a later backend has to open something, which is
+  the case namespaces are actually for; a fetcher that opens nothing
+  is not it.
 * **`run_check` and `compare_images` call `std::process::exit`, which
   blocks phase 7.** The fetcher is reaped by a `Drop`, and a `Drop`
   does not run on `exit`. `info` returns its errors through `main`, so
