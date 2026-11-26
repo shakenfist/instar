@@ -17054,10 +17054,8 @@ impl VmdkExtentNaming {
 ///
 /// `prefix` and `postfix` are the decomposed stem, which is what
 /// `vmdk::build_split_descriptor` names its extents from; the split
-/// writer passes them straight through to it. The writer is a separate
-/// change, which is why they look unread here.
+/// writer passes them straight through to it.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct VmdkExtentPaths {
     /// The output's base name up to its last `.`, without the
     /// directory.
@@ -17196,7 +17194,6 @@ fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf,
 /// that party outside the untrusted-image threat model this project
 /// defends. A dangling symlink counts as present, because creating
 /// through one writes to a file the user never named.
-#[allow(dead_code)] // The split writer is its only caller, and is a separate change.
 fn vmdk_split_create_plan(
     output: &Path,
     virtual_size: u64,
@@ -17248,6 +17245,21 @@ fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
     let mut text = vec![0u8; needed];
     let written =
         vmdk::build_flat_descriptor(&mut text, 0, capacity_sectors, extent_name.as_bytes());
+    debug_assert_eq!(written, needed);
+    text
+}
+
+/// The split descriptor naming the extents derived from `prefix` and
+/// `postfix`, for create. As with the monolithicFlat descriptor, the
+/// builder reports the length it needs whatever the buffer, so it is
+/// measured first and the buffer sized to fit.
+///
+/// Both passes cost one iteration per extent, so the caller must have
+/// bounded `layout.extent_count` before it measures.
+fn vmdk_split_descriptor(layout: &vmdk::SplitLayout, prefix: &[u8], postfix: &[u8]) -> Vec<u8> {
+    let needed = vmdk::build_split_descriptor(&mut [], 0, layout, prefix, postfix);
+    let mut text = vec![0u8; needed];
+    let written = vmdk::build_split_descriptor(&mut text, 0, layout, prefix, postfix);
     debug_assert_eq!(written, needed);
     text
 }
@@ -22929,6 +22941,127 @@ fn write_vmdk_flat(
     Ok(text.len() as u64)
 }
 
+/// Host-side twoGbMaxExtentFlat VMDK creation: one sparse raw extent per
+/// extent the layout calls for, and the text descriptor that names them
+/// all.
+///
+/// Every extent is the length `SplitLayout` gives it -- a full 2 GiB for
+/// all but the last -- and nothing is written into any of them, so the
+/// image costs its descriptor and a set of holes, exactly as the
+/// single-extent subformat does for its one extent. qemu only truncates
+/// a flat extent under every preallocation mode, so `falloc` and `full`
+/// allocate nothing here either.
+///
+/// `vmdk_split_create_plan` does all the refusing, before a file is
+/// opened, so nothing is created for a command that will be refused.
+/// Once a file has been opened (and so truncated), any failure removes
+/// every file this call opened.
+#[allow(dead_code)] // Create's subformat routing is its only caller; wiring it removes this.
+fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let size_str = args
+        .size
+        .as_ref()
+        .ok_or("create: vmdk twoGbMaxExtentFlat requires SIZE")?;
+    let requested = parse_memory_size(size_str)?;
+
+    let descriptor_path = Path::new(&args.filename);
+    let (layout, paths) =
+        vmdk_split_create_plan(descriptor_path, requested, vmdk::SplitKind::Flat, "create")?;
+    // The size the image describes, which is the request rounded up to a
+    // whole sector as the single-extent path rounds it. The plan bounds
+    // the extent count, so this is at most 128 GiB and cannot overflow.
+    let virtual_size = layout.total_sectors * 512;
+
+    let mut opened = Vec::new();
+    let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);
+    let descriptor_len = match result {
+        Ok(n) => n,
+        Err(e) => {
+            for path in &opened {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    };
+
+    render_create_success(args, virtual_size, descriptor_len, descriptor_len, 0);
+    Ok(())
+}
+
+/// Write a twoGbMaxExtentFlat VMDK for `run_create_vmdk_split_flat`,
+/// returning the descriptor's length. Each file is pushed onto `opened`
+/// as soon as it has been opened, so the caller can remove exactly those
+/// on failure.
+///
+/// Every extent is written and `fsync`ed before the descriptor is
+/// created, which is the reverse of the single-extent order and is
+/// deliberate. The descriptor is the only part of a split image that
+/// says what the other parts are, so one that exists must never name a
+/// set of extents that is not on disk. Ordering it last leaves extent
+/// files with no descriptor as the only half-state a failure can
+/// produce, and nothing reads those.
+fn write_vmdk_split_flat(
+    descriptor_path: &Path,
+    layout: &vmdk::SplitLayout,
+    paths: &VmdkExtentPaths,
+    opened: &mut Vec<std::path::PathBuf>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(path)
+            .map_err(|e| format!("create: open '{}' failed: {}", terminal_safe_path(path), e))
+    };
+
+    for (index, (extent_path, _)) in paths.extents.iter().enumerate() {
+        let extent = open(extent_path)?;
+        opened.push(extent_path.clone());
+        // The extent is a hole of this length, not this many bytes
+        // written. The plan bounds the count at 64 extents of 2 GiB, so
+        // the multiplication cannot overflow.
+        let length = layout.sectors_of_extent(index as u64) * 512;
+        extent.set_len(length).map_err(|e| {
+            format!(
+                "create: ftruncate '{}' failed: {}",
+                terminal_safe_path(extent_path),
+                e
+            )
+        })?;
+        extent.sync_all().map_err(|e| {
+            format!(
+                "create: sync '{}' failed: {}",
+                terminal_safe_path(extent_path),
+                e
+            )
+        })?;
+    }
+
+    let text = vmdk_split_descriptor(layout, &paths.prefix, &paths.postfix);
+    let mut descriptor = open(descriptor_path)?;
+    opened.push(descriptor_path.to_path_buf());
+    descriptor.write_all(&text).map_err(|e| {
+        format!(
+            "create: write '{}' failed: {}",
+            terminal_safe_path(descriptor_path),
+            e
+        )
+    })?;
+    descriptor.sync_all().map_err(|e| {
+        format!(
+            "create: sync '{}' failed: {}",
+            terminal_safe_path(descriptor_path),
+            e
+        )
+    })?;
+    Ok(text.len() as u64)
+}
+
 /// Apply ftruncate + optional preallocation pass + fsync. Split out
 /// so `run_create_raw` can handle cleanup uniformly on any failure.
 ///
@@ -27219,5 +27352,133 @@ mod vmdk_split_extent_paths_tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("out.vmdk"), b"old").unwrap();
         plan(dir.path(), EXTENT_BYTES).expect("the named descriptor is the user's to lose");
+    }
+}
+
+#[cfg(test)]
+mod vmdk_split_flat_writer_tests {
+    //! Unit tests for the host-side twoGbMaxExtentFlat writer: the length
+    //! it gives each extent, the descriptor bytes it writes, and that no
+    //! descriptor exists until every extent does.
+    //!
+    //! The extents are holes, so every length here is an apparent length.
+    //! An allocated length or a disk-usage figure would be a property of
+    //! the filesystem the test happens to run on, not of the writer.
+    //! Comparison against qemu's own descriptors lives in the Python
+    //! suite, which has the pinned cases.
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Bytes in every extent but the last.
+    const EXTENT_BYTES: u64 = vmdk::SPLIT_EXTENT_SECTORS * 512;
+    /// The largest image the guest's extent table can describe: 128 GiB.
+    const MAX_BYTES: u64 = vmdk::MAX_EXTENTS as u64 * EXTENT_BYTES;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Plan a flat split create of `bytes` into `dir`, for a writer test
+    /// that is not about the refusals.
+    fn plan(dir: &Path, bytes: u64) -> (vmdk::SplitLayout, VmdkExtentPaths) {
+        vmdk_split_create_plan(
+            &dir.join("out.vmdk"),
+            bytes,
+            vmdk::SplitKind::Flat,
+            "create",
+        )
+        .expect("the plan accepts this size")
+    }
+
+    /// The length the file claims, which for a hole-bearing extent is
+    /// the only length that is the writer's business.
+    fn apparent_len(path: &Path) -> u64 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .len()
+    }
+
+    #[test]
+    fn each_extent_is_as_long_as_the_layout_says() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("out.vmdk");
+        let (layout, paths) = plan(dir.path(), 5 * GIB);
+        let mut opened = Vec::new();
+        write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
+
+        let lengths: Vec<u64> = paths.extents.iter().map(|(p, _)| apparent_len(p)).collect();
+        assert_eq!(lengths, [2 * GIB, 2 * GIB, GIB]);
+        for (index, length) in lengths.iter().enumerate() {
+            assert_eq!(*length, layout.sectors_of_extent(index as u64) * 512);
+        }
+    }
+
+    #[test]
+    fn the_descriptor_is_the_emitters_bytes() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("out.vmdk");
+        let (layout, paths) = plan(dir.path(), 5 * GIB);
+        let mut opened = Vec::new();
+        let reported = write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
+
+        let needed = vmdk::build_split_descriptor(&mut [], 0, &layout, b"out", b".vmdk");
+        let mut expected = vec![0u8; needed];
+        vmdk::build_split_descriptor(&mut expected, 0, &layout, b"out", b".vmdk");
+
+        let on_disk = std::fs::read(&descriptor).unwrap();
+        assert_eq!(on_disk, expected);
+        assert_eq!(reported, expected.len() as u64);
+        // Measuring first sized the buffer exactly: a buffer sized by
+        // guess would leave trailing zeros or a truncated last line.
+        assert!(
+            on_disk.ends_with(b"ddb.toolsVersion = \"2147483647\"\n"),
+            "{}",
+            String::from_utf8_lossy(&on_disk)
+        );
+    }
+
+    /// Sixty-four extents is the most the guest's extent table holds, and
+    /// all of them are holes: this writes no bytes at all.
+    #[test]
+    fn a_tables_worth_of_extents_is_all_written() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("out.vmdk");
+        let (layout, paths) = plan(dir.path(), MAX_BYTES);
+        let mut opened = Vec::new();
+        write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
+
+        assert_eq!(paths.extents.len(), vmdk::MAX_EXTENTS);
+        for (path, _) in &paths.extents {
+            assert_eq!(apparent_len(path), EXTENT_BYTES);
+        }
+        assert!(apparent_len(&descriptor) > 0);
+        // Every extent, then the descriptor: the order the files were
+        // opened in, which is the order they were created in.
+        assert_eq!(opened.len(), vmdk::MAX_EXTENTS + 1);
+        assert_eq!(opened[vmdk::MAX_EXTENTS], descriptor);
+    }
+
+    /// The descriptor is the only part of a split image that says what
+    /// the other parts are, so it must not exist until they do. A
+    /// directory in the way of the second extent fails the write
+    /// part-way through, which is the half-state the ordering is for.
+    #[test]
+    fn no_descriptor_is_created_until_every_extent_is() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("out.vmdk");
+        let (layout, paths) = plan(dir.path(), 3 * EXTENT_BYTES);
+        std::fs::create_dir(&paths.extents[1].0).unwrap();
+
+        let mut opened = Vec::new();
+        let err = write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("create: open "), "{err}");
+        assert!(err.contains("out-f002.vmdk"), "{err}");
+        assert!(
+            !descriptor.exists(),
+            "the descriptor outlived a write that never finished its extents"
+        );
+        assert!(!paths.extents[2].0.exists(), "a later extent was opened");
+        assert_eq!(opened, vec![PathBuf::from(&paths.extents[0].0)]);
+        assert_eq!(apparent_len(&paths.extents[0].0), EXTENT_BYTES);
     }
 }

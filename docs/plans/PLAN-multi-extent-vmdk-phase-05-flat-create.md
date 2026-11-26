@@ -452,3 +452,46 @@ extent file already existed. That is a measured witness of exactly the
 behaviour decision 1 diverges from, which is better evidence than the
 claim it replaced, and definition-of-done item 6 is now that
 divergence.
+
+**Step 5b, 2026-11-27.** The host-side writer, in `src/vmm/src/main.rs`
+alone (+265/-4): `run_create_vmdk_split_flat` as the entry point,
+`write_vmdk_split_flat` as the writer, and `vmdk_split_descriptor` as
+the measure-then-write pair beside `vmdk_flat_descriptor`.
+
+Each extent is opened, recorded, `set_len` to
+`sectors_of_extent(i) * 512` and `fsync`ed, in extent order; only then
+is the descriptor text built, the descriptor opened, written and
+`fsync`ed. That is the reverse of the single-extent path's order and is
+decision 6: a descriptor that does not exist cannot name a set of
+extents that is not on disk, so extent files with no descriptor are the
+only half-state a failure can leave, and nothing reads those.
+
+The entry point reports `layout.total_sectors * 512` as the virtual
+size rather than rounding the request itself. Verified rather than
+taken on trust: `split_layout` computes `total_sectors` with
+`div_ceil(512)`, so that is the request rounded up to a whole sector,
+which is the number the single-extent path reaches through
+`checked_next_multiple_of(512)`. It cannot overflow because the plan
+has already bounded the extent count.
+
+Two divergences from the single-extent path were kept deliberately.
+The new writer's error strings escape their paths with
+`terminal_safe_path` where the old one uses `Path::display`: the
+derived names are refused for `"`, CR, LF and non-UTF-8 but **not**
+for other control characters, so an ESC in a derived name would
+otherwise reach the terminal raw. And the `OpenOptions` closure is
+duplicated rather than shared, because step 5c reworks the failure
+cleanup across both paths and can unify the two call sites once
+instead of twice.
+
+Allow bookkeeping came out as planned: step 5a's two
+`#[allow(dead_code)]` attributes are gone, and one remains on
+`run_create_vmdk_split_flat`, which step 5d's CLI routing removes.
+Clippy runs with `-D warnings` here, so nothing else in the step is
+unreachable.
+
+Verified by the management session: `make test-rust` re-run on the
+reviewed tree, 3168 passed, 0 failed, 3 ignored over 83 binaries --
+the 3164 baseline plus this step's four -- with all four named in the
+run rather than inferred from the total, and `pre-commit run
+--all-files` twelve of twelve.
