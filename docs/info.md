@@ -189,3 +189,15 @@ nothing of the kind. Discovery now refuses such a reference, naming it,
 and the reading operations open nothing for it -- which is also what
 `qemu-img` does, for its own reason: it reads everything before the
 first colon as a protocol name and reports `Unknown protocol 'C'`.
+Both drive-letter spellings count, `C:\images\base.qcow2` and
+`C:/images/base.qcow2`, as does a `\\server\share` root.
+
+Plain `info` still describes such an image and exits zero, printing the
+reference as recorded with no "actual path": it reports what the header
+says and refuses nothing. `info --chain` on a qcow2 or VMDK overlay now
+exits non-zero instead, because a qcow2 chain is not fail-soft -- a
+listing that cannot be completed is an error rather than a short
+listing. A VHD or VHDX reporting walk still ends its listing at the
+child that records the reference, prints the reason on stderr, and
+exits zero, which is the fail-soft behaviour differencing parents have
+always had.

@@ -439,7 +439,7 @@ impl std::fmt::Display for ChainError {
             ChainError::WindowsAbsoluteReference { image, reference } => {
                 write!(
                     f,
-                    "{} records a backing reference in Windows convention ({}), which \
+                    "{} records a reference in Windows convention ({}), which \
                      names no file on this host; qemu-img refuses it as an unknown \
                      protocol and instar will not open a POSIX file of that literal \
                      name instead",
@@ -969,6 +969,15 @@ pub fn validate_backing_write_target(
 /// because that is what the image says and `info` prints what the
 /// image says.
 ///
+/// Either separator counts after the drive letter: Windows itself
+/// accepts `C:/images/parent.vhdx`, tools that pass a path through a
+/// URL or a JSON document often emit it that way, and qemu-img refuses
+/// both spellings for the same reason -- everything before the first
+/// colon is read as a protocol name. Taking only the backslash form
+/// would have left the forward-slash one classified relative and so
+/// joined onto the image's directory, which is the behaviour this
+/// classifier exists to stop.
+///
 /// This is a *classification*, never a conversion. No caller builds a
 /// host path from the value: a reporting walk uses the answer to stop,
 /// and [`validate_reference`] uses it to refuse. The VHDX
@@ -981,7 +990,10 @@ pub fn is_windows_absolute_reference(reference: &str) -> bool {
         return true;
     }
     let bytes = reference.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn validate_reference(

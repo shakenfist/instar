@@ -326,19 +326,33 @@ fn map_rebase_error(e: RebaseError) -> u32 {
 /// The driver name to record for the new backing in the
 /// overlay's `EXT_BACKING_FORMAT` extension, as qemu spells it.
 ///
-/// Only the formats `-F` accepts are named. The spelling is the
-/// *driver's*, not instar's enum name -- qemu writes `vpc` for
-/// VHD, where `ImageFormat::name()` says `vhd` -- so a format
-/// whose driver spelling this table has not settled returns an
-/// empty name and the planner leaves the record alone, rather
-/// than writing a name no reader would recognise. A host that
-/// states no format at all (`new_backing_format == 0`, the
+/// Every format a rebase can put under an overlay is named, not
+/// just the three `-F` spells: without `-F` the host states what
+/// chain discovery found for the new backing, and a VHD or VHDX
+/// backing is both discovered and readable by this build, so
+/// leaving those two unnamed left the overlay recording its old
+/// backing's format -- the exact symptom this record exists to
+/// avoid.
+///
+/// The spelling is the *driver's*, not instar's enum name -- qemu
+/// writes `vpc` for VHD, where `ImageFormat::name()` says `vhd` --
+/// so a format whose driver spelling this table has not settled
+/// returns an empty name and the planner leaves the record alone,
+/// rather than writing a name no reader would recognise. A host
+/// that states no format at all (`new_backing_format == 0`, the
 /// auto-detect code) lands here too.
+///
+/// All five names pad to the same single 8-byte record slot
+/// (`raw`, `vpc`, `vhdx`, `vmdk`, `qcow2`), so any of them can
+/// replace any other in place; see `push_backing_format_patch`,
+/// which refuses a width change rather than shifting the chain.
 fn backing_format_record_name(format_code: u32) -> &'static [u8] {
     match ImageFormat::from_u32(format_code) {
         ImageFormat::Raw => b"raw",
         ImageFormat::Qcow2 => b"qcow2",
         ImageFormat::Vmdk4 => b"vmdk",
+        ImageFormat::Vhd => b"vpc",
+        ImageFormat::Vhdx => b"vhdx",
         _ => b"",
     }
 }
@@ -1878,6 +1892,57 @@ unsafe fn read_input_byte_range(
 // Chain reader
 // ---------------------------------------------------------------------------
 
+/// Pre-flight a chain segment: every member must be a format this
+/// build's chain reader can serve.
+///
+/// `#[cfg(feature = ...)]` here would check this *crate's* own
+/// feature table, not qcow2's -- rebase-op declares no such
+/// features itself, so the qcow2 dependency features below are
+/// unconditional for this binary. Without a format's `-input`
+/// feature on that dependency the qcow2 crate falls through to
+/// `read_raw_sectors` for that format, which is wrong for any
+/// image whose data isn't laid out at the guest-virtual offset;
+/// this allowlist is what rebase-op's own Cargo.toml feature list
+/// (`vhd-input`, `vhdx-input`, alongside the qcow2/raw case that
+/// needed no feature at all) actually supports.
+///
+/// It runs once per segment before the comparison loop rather than
+/// per cluster inside the reader, which is what lets the refusal
+/// have a reason of its own. Inside the reader all it could do was
+/// return "the read failed", which the runner reported as
+/// `ERROR_PARSE_FAILED` -- "the overlay's header could not be
+/// parsed", about an overlay that parsed perfectly well (issue
+/// #632).
+///
+/// The guest has no number formatting, so which member it was goes
+/// no further than this: the error code carries the class of
+/// refusal and the host's message names the formats a rebase can
+/// read, which is what the user needs to act.
+fn chain_segment_is_readable(
+    chain_config: &ChainConfig,
+    chain_first: u32,
+    chain_count: u32,
+) -> bool {
+    for i in 0..chain_count {
+        // `chain_first + i` is bounded by the device-count gate the
+        // runner applies first, so this cannot wrap today; checking
+        // keeps that an assumption this function makes rather than
+        // one it inherits.
+        let idx = match chain_first.checked_add(i) {
+            Some(idx) => idx as usize,
+            None => return false,
+        };
+        if idx >= MAX_CHAIN_DEVICES {
+            return false;
+        }
+        match chain_config.devices[idx].detected_format() {
+            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Read whatever data the backing chain at
 /// `[chain_first, chain_first + chain_count)` provides at
 /// `guest_offset` into `out_buf`. Walks the chain top-to-base,
@@ -1905,50 +1970,6 @@ unsafe fn read_input_byte_range(
 /// initialised for every qcow2 member via
 /// [`qcow2::init_chain_states`]. `out_buf` must point to at
 /// least `cluster_size` writable bytes.
-/// Pre-flight a chain segment: every member must be a format this
-/// build's chain reader can serve.
-///
-/// `#[cfg(feature = ...)]` here would check this *crate's* own
-/// feature table, not qcow2's -- rebase-op declares no such
-/// features itself, so the qcow2 dependency features below are
-/// unconditional for this binary. Without a format's `-input`
-/// feature on that dependency the qcow2 crate falls through to
-/// `read_raw_sectors` for that format, which is wrong for any
-/// image whose data isn't laid out at the guest-virtual offset;
-/// this allowlist is what rebase-op's own Cargo.toml feature list
-/// (`vhd-input`, `vhdx-input`, alongside the qcow2/raw case that
-/// needed no feature at all) actually supports.
-///
-/// It runs once per segment before the comparison loop rather than
-/// per cluster inside the reader, which is what lets the refusal
-/// have a reason of its own. Inside the reader all it could do was
-/// return "the read failed", which the runner reported as
-/// `ERROR_PARSE_FAILED` -- "the overlay's header could not be
-/// parsed", about an overlay that parsed perfectly well (issue
-/// #632).
-///
-/// The guest has no number formatting, so which member it was goes
-/// no further than this: the error code carries the class of
-/// refusal and the host's message names the formats a rebase can
-/// read, which is what the user needs to act.
-unsafe fn chain_segment_is_readable(
-    chain_config: &ChainConfig,
-    chain_first: u32,
-    chain_count: u32,
-) -> bool {
-    for i in 0..chain_count {
-        let idx = (chain_first + i) as usize;
-        if idx >= MAX_CHAIN_DEVICES {
-            return false;
-        }
-        match chain_config.devices[idx].detected_format() {
-            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
 unsafe fn read_chain_cluster(
     call_table: &CallTable,
     chain_first: u32,

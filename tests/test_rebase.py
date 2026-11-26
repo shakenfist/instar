@@ -1738,6 +1738,62 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
                 json.loads(r.stdout).get('backing-filename-format'), 'raw',
                 'without -F the overlay must record what discovery found')
 
+    def test_rebase_onto_a_vhd_family_backing_records_its_driver_name(self):
+        """A VHD or VHDX backing is recorded as `vpc` or `vhdx`.
+
+        The name written is the *driver's*, which is not instar's enum
+        name for VHD, and a format the record table does not name is
+        left alone -- so an unnamed format means the overlay goes on
+        recording its old backing's format, which is #972 again. VHD
+        and VHDX are reachable without `-F` (which only spells qcow2,
+        vmdk and raw): chain discovery identifies both, and rebase's
+        chain reader can serve both, so this is a rebase that succeeds
+        and used to leave the record saying `qcow2`.
+        """
+        self._require_qemu_tools()
+        for create_format, recorded in (('vpc', 'vpc'), ('vhdx', 'vhdx')):
+            with self.subTest(format=create_format):
+                with tempfile.TemporaryDirectory() as td:
+                    td = Path(td)
+                    r = subprocess.run(
+                        ['qemu-img', 'create', '-f', 'qcow2', 'base.qcow2', '4M'],
+                        capture_output=True, text=True, timeout=30, cwd=str(td))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    backing = f'nb.{create_format}'
+                    r = subprocess.run(
+                        ['qemu-img', 'create', '-f', create_format, backing, '4M'],
+                        capture_output=True, text=True, timeout=30, cwd=str(td))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    overlay = td / 'ovl.qcow2'
+                    r = subprocess.run(
+                        ['qemu-img', 'create', '-f', 'qcow2', '-b', 'base.qcow2',
+                         '-F', 'qcow2', 'ovl.qcow2', '4M'],
+                        capture_output=True, text=True, timeout=30, cwd=str(td))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+                    _, stderr, rc = self.run_instar_rebase(overlay, '-b', backing)
+                    self.assertEqual(rc, 0, f'rebase failed: stderr={stderr!r}')
+
+                    r = subprocess.run(
+                        ['qemu-img', 'info', '--output=json', str(overlay)],
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(
+                        r.returncode, 0,
+                        f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+                    info = json.loads(r.stdout)
+                    self.assertEqual(info.get('backing-filename'), backing)
+                    self.assertEqual(
+                        info.get('backing-filename-format'), recorded,
+                        'the overlay still records its old backing\'s format')
+
+                    # The whole overlay opens, backing and all: a record
+                    # naming a format qemu cannot match to the file it
+                    # points at fails here rather than above.
+                    r = subprocess.run(['qemu-img', 'check', str(overlay)],
+                                       capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.returncode, 0,
+                                     f'qemu-img check: {r.stdout!r} {r.stderr!r}')
+
 
 # ----------------------------------------------------------------------
 # Chains holding a member the info gate could not identify.

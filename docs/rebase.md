@@ -151,7 +151,18 @@ A qcow2 overlay also records its backing's *format*, in a header
 extension, and a reader trusts that field over probing the file. So
 a rebase that changes format rewrites it: without `-F`, to the
 format chain discovery found for the new backing; with `-F`, to
-what `-F` says. An overlay that recorded no format keeps recording
+what `-F` says. `-u` is no exception -- the new backing is still
+opened to discover its format, so `rebase -u -b new.raw` records
+`raw` with no `-F` given.
+
+The name written is the driver's, as `qemu-img` spells it: `raw`,
+`qcow2`, `vmdk`, `vpc` for VHD and `vhdx`. The first three are what
+`-F` accepts; the last two are reachable without `-F`, since
+discovery identifies a VHD or VHDX backing and the chain reader can
+serve one. A format outside that set leaves the record as it was,
+rather than writing a name no reader would recognise.
+
+An overlay that recorded no format keeps recording
 none -- a reader then probes the backing file, as it did before --
 because adding a record means relaying the extension chain out, and
 that is the same deferred work as long-path relocation. A detach
@@ -195,6 +206,15 @@ not be composed
  master-plan TODO; for now the picker in the differential
  fuzzer matches the backing-name length to the overlay's
  existing slot.
+- **`-u` still requires the new backing to exist.** `qemu-img
+ rebase -u -F raw -b not-yet-there.raw overlay.qcow2` succeeds,
+ writing the reference for a file that is not there yet; instar
+ refuses it with `Path resolution error: ... No such file or
+ directory`, because chain discovery runs on the new backing
+ whatever mode it is in -- which is also how `-u` comes to record
+ the discovered format. The error message says to pass `-u` to
+ skip the existence check, which only applies to the check at
+ argument-parsing time. Tracked as issue #979.
 - **Safe-mode rebase for vmdk is not yet supported.** instar
  rejects with `ERROR_UNSUPPORTED_FORMAT`. qemu-img also
  rejects vmdk rebase entirely (there is no upstream vmdk

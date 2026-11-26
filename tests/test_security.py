@@ -1072,6 +1072,11 @@ class TestWindowsConventionBackingReference(InstarTestBase):
         """An overlay recording REFERENCE, beside a file of that name."""
         directory = Path(directory)
         planted = directory / self.REFERENCE
+        # The forward-slash spelling joins into a nested path rather
+        # than one file name, which is the shape the hazard takes for
+        # that spelling: the directories have to exist for the plant
+        # to be the file a regression would open.
+        planted.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2', str(planted), '1M'],
             capture_output=True, check=True)
@@ -1129,3 +1134,20 @@ class TestWindowsConventionBackingReference(InstarTestBase):
                           f'refusal does not name the reason: {stderr!r}')
             self.assertNotIn(str(planted), stdout,
                              'the planted file was listed as a chain member')
+
+
+class TestWindowsConventionForwardSlashReference(TestWindowsConventionBackingReference):
+    """The same hazard, spelled with forward slashes.
+
+    `C:/images/base.qcow2` is the spelling a path acquires on its way
+    through a URL or a JSON document, and Windows accepts it as readily
+    as the backslash form. qemu-img refuses both for the same reason --
+    everything before the first colon is a protocol name -- but instar's
+    classifier originally required a literal backslash, so this spelling
+    was classified relative and joined onto the image's directory, and a
+    planted `C:/images/base.qcow2` was opened as the backing file.
+
+    Every assertion is inherited; only the reference changes.
+    """
+
+    REFERENCE = 'C:/images/base.qcow2'

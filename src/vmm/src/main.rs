@@ -2181,6 +2181,14 @@ mod differencing_parent_classification_tests {
         assert!(is_windows_absolute_reference(r"\\server\share\p.vhdx"));
         // Boundary: the shortest possible drive-letter root.
         assert!(is_windows_absolute_reference(r"C:\"));
+        // Either separator after the drive letter. This spelling used
+        // to be classified relative, and so was joined onto the
+        // image's directory -- the #899 hazard, reached by the form
+        // qemu-img refuses for exactly the same reason it refuses the
+        // backslash one.
+        assert!(is_windows_absolute_reference("C:/images/base.qcow2"));
+        assert!(is_windows_absolute_reference("z:/p.vhdx"));
+        assert!(is_windows_absolute_reference("C:/"));
     }
 
     #[test]
@@ -2190,7 +2198,10 @@ mod differencing_parent_classification_tests {
         assert!(!is_windows_absolute_reference("/abs/parent.vhdx"));
         assert!(!is_windows_absolute_reference(""));
         assert!(!is_windows_absolute_reference("C:"));
-        assert!(!is_windows_absolute_reference("C:/unix/style"));
+        // A colon alone is not enough: the third byte has to be a
+        // separator. `C:x` is a legal POSIX name and names a file
+        // relative to the image, which is what instar resolves it as.
+        assert!(!is_windows_absolute_reference("C:relative"));
         // Shorter than three bytes: nothing at index 2 to check.
         assert!(!is_windows_absolute_reference("C"));
         assert!(!is_windows_absolute_reference("ab"));
@@ -2212,9 +2223,14 @@ mod differencing_parent_classification_tests {
         assert!(backing_reference_is_absolute("/abs/parent.vhdx"));
         assert!(backing_reference_is_absolute(r"C:\images\parent.vhdx"));
         assert!(backing_reference_is_absolute(r"\\attacker\share\probe"));
+        // Either separator after the drive letter: the forward-slash
+        // spelling was classified relative here too, so `info` printed
+        // a joined "actual path" for it while the reading operations
+        // opened the file at that path.
+        assert!(backing_reference_is_absolute("C:/unix/style"));
         assert!(!backing_reference_is_absolute("parent.vhdx"));
         assert!(!backing_reference_is_absolute("../sub/parent.vhdx"));
-        assert!(!backing_reference_is_absolute("C:/unix/style"));
+        assert!(!backing_reference_is_absolute("C:relative"));
     }
 
     // --- resolve_reported_parent: Windows-absolute classification ------
@@ -4317,11 +4333,11 @@ fn backing_reference_is_absolute(reference: &str) -> bool {
 /// terminal-safe at every call site.
 fn differencing_listing_stops(
     chain_use: ChainUse,
-    differencing_child: &Option<(std::path::PathBuf, ImageFormat)>,
+    differencing_child: Option<&Path>,
     parent: &Path,
     what: &str,
 ) -> Option<String> {
-    let (child, _child_format) = differencing_child.as_ref()?;
+    let child = differencing_child?;
     if chain_use != ChainUse::Report {
         return None;
     }
@@ -4512,7 +4528,9 @@ fn discover_backing_chain(
             Err(e) => {
                 if let Some(reason) = differencing_listing_stops(
                     chain_use,
-                    &differencing_child,
+                    differencing_child
+                        .as_ref()
+                        .map(|(child, _)| child.as_path()),
                     &current,
                     &format!("could not be described by the info operation: {e}"),
                 ) {
@@ -4551,7 +4569,9 @@ fn discover_backing_chain(
         {
             if let Some(reason) = differencing_listing_stops(
                 chain_use,
-                &differencing_child,
+                differencing_child
+                    .as_ref()
+                    .map(|(child, _)| child.as_path()),
                 &current,
                 &format!(
                     "is {}, a format detected but not supported for reading",
@@ -4650,7 +4670,7 @@ fn discover_backing_chain(
             if image_format != *child_format {
                 if let Some(reason) = differencing_listing_stops(
                     chain_use,
-                    &differencing_child,
+                    Some(child.as_path()),
                     &current,
                     &format!(
                         "is {image_format}, and a differencing {child_format} \

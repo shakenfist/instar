@@ -231,7 +231,7 @@ ADVERSARIAL_LOCATOR_REASONS = {
 COMPOSING_LOCATOR_REASONS = {
     'vhd-diff-locator-etc-passwd': "Backing file '/etc/passwd' is outside allowed paths",
     'vhd-diff-locator-dotdot': 'is outside allowed paths',
-    'vhd-diff-locator-unc': 'records a backing reference in Windows convention',
+    'vhd-diff-locator-unc': 'records a reference in Windows convention',
     'vhd-diff-locator-url': 'Backing file not found',
     'vhd-diff-locator-overlong': 'is outside allowed paths',
     'vhd-diff-locator-conflicting': 'Backing file not found',

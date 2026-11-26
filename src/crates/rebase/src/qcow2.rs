@@ -327,7 +327,13 @@ fn plan_qcow2_safe<'a>(
 
     // Last, so the recorded format is only ever updated for a
     // header whose pointer rewrite was already planned.
-    push_backing_format_patch(opts, parsed, &mut plan, ext_buf)?;
+    push_backing_format_patch(
+        opts,
+        parsed,
+        &mut plan,
+        ext_buf,
+        (new_backing_file_size > 0).then_some((new_backing_file_offset, new_backing_file_size)),
+    )?;
 
     let context = RebaseQcow2SafeContext {
         overlay_cluster_size: cluster_size as u32,
@@ -376,11 +382,17 @@ fn fixed_header_end(parsed: &QcowHeader) -> u64 {
 /// fits; a record whose width would have to change is refused
 /// rather than written at the wrong width, because a shifted
 /// chain is a corrupt header.
+///
+/// `path_write` is the path-bytes write the caller has already
+/// planned, if it planned one, so that a header pointing its
+/// backing name into the extension area is refused rather than
+/// having its path bytes overwritten by this patch.
 fn push_backing_format_patch<'a>(
     opts: &Qcow2RebaseOpts<'_>,
     parsed: &QcowHeader,
     plan: &mut RebasePlan<'a>,
     ext_buf: &'a mut [u8],
+    path_write: Option<(u64, u32)>,
 ) -> Result<(), RebaseError> {
     // A detached overlay has no backing to describe, and no
     // reader consults the field once the reference is gone.
@@ -428,6 +440,26 @@ fn push_backing_format_patch<'a>(
     let slot_limit = parsed.cluster_size.min(opts.overlay_file_size);
     if len_offset < fixed_header_end(parsed) || record_end > slot_limit {
         return Err(RebaseError::HeaderMismatch);
+    }
+
+    // Both this record and the backing path are bounded to the same
+    // window -- after the fixed header, inside the first cluster --
+    // and `compute_path_target` deliberately does not walk the
+    // extensions to narrow its end of it. In a header qemu wrote the
+    // two never meet, because the name is laid down after the
+    // extension chain. In a hand-made or corrupt one they can, and
+    // then the plan holds two writes over the same bytes: this patch
+    // is pushed last, so it would silently overwrite the path the
+    // plan had just written. Refuse instead, which is what
+    // `BackingFormatSlotTooSmall` already does for the other way
+    // this record can be unwritable.
+    if let Some((path_offset, path_len)) = path_write {
+        let path_end = path_offset
+            .checked_add(u64::from(path_len))
+            .ok_or(RebaseError::Overflow)?;
+        if len_offset < path_end && path_offset < record_end {
+            return Err(RebaseError::HeaderMismatch);
+        }
     }
 
     ext_buf[0..4].copy_from_slice(&(name.len() as u32).to_be_bytes());
@@ -493,7 +525,13 @@ fn plan_qcow2_unsafe<'a>(
 
     // Last, so the recorded format is only ever updated for a
     // header whose pointer rewrite was already planned.
-    push_backing_format_patch(opts, parsed, &mut plan, ext_buf)?;
+    push_backing_format_patch(
+        opts,
+        parsed,
+        &mut plan,
+        ext_buf,
+        (new_backing_file_size > 0).then_some((new_backing_file_offset, new_backing_file_size)),
+    )?;
 
     Ok(Qcow2RebaseOutput::Unsafe { plan })
 }

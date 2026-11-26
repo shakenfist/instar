@@ -278,6 +278,51 @@ fn a_name_that_would_move_the_extensions_is_refused() {
 }
 
 #[test]
+fn a_backing_name_overlapping_the_format_record_is_refused() {
+    // `compute_path_target` bounds the path bytes to "after the
+    // fixed header, inside the first cluster" and deliberately does
+    // not walk the extensions, so a header that aims its backing
+    // name at the format record passes that bound. Both writes are
+    // then planned over the same bytes, and the record patch is
+    // pushed last: without a disjointness check it would silently
+    // overwrite the path the plan had just written. No header qemu
+    // or instar writes looks like this -- the name goes down after
+    // the extension chain -- so refusing costs nothing a real image
+    // needs.
+    let mut bytes = build_overlay(b"old.qcow2");
+    let header = QcowHeader::parse(&bytes).expect("parse");
+    let exts = parse_header_extensions(&bytes, &header);
+    assert!(
+        exts.backing_format_offset != 0,
+        "the fixture must record a backing format"
+    );
+    // The record's length word, which is where the patch starts.
+    let aimed = exts.backing_format_offset as u64 - 4;
+    bytes[8..16].copy_from_slice(&aimed.to_be_bytes());
+    bytes[16..20].copy_from_slice(&9u32.to_be_bytes());
+
+    let header_bytes = bytes[..4096].to_vec();
+    let opts = Qcow2RebaseOpts {
+        mode: RebaseMode::Unsafe,
+        overlay_header: &header_bytes,
+        overlay_file_size: bytes.len() as u64,
+        refcount_table: &[],
+        refblock_host_offsets: &[],
+        refcount_blocks: &[],
+        refblock_count: 0,
+        new_backing_virtual_size: VIRTUAL_SIZE,
+        new_backing_path: b"new.qcow2",
+        detach: false,
+        new_backing_format_name: b"raw",
+    };
+    let mut scratch = vec![0xccu8; 64 * 1024];
+    assert_eq!(
+        plan_rebase_qcow2(&opts, &mut scratch).err(),
+        Some(RebaseError::HeaderMismatch)
+    );
+}
+
+#[test]
 fn a_detach_does_not_touch_the_recorded_format() {
     // There is no backing left to describe, and qemu-img leaves
     // the record alone too.

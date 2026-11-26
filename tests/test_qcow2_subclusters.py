@@ -443,6 +443,15 @@ for _label, _table in (('EXPECTED_FAILURES', EXPECTED_FAILURES), ('FAILS_CLOSED'
     _unknown = {key for key in _table if key[1] not in qcow2_subclusters.BUILDERS}
     if _unknown:
         raise RuntimeError(f'{_label} names fixtures that do not exist: {sorted(_unknown)}')
+for _label, _table in (('EXPECTED_FAILURES', EXPECTED_FAILURES), ('FAILS_CLOSED', FAILS_CLOSED)):
+    # The fixture half of each key is checked above. The operation half
+    # is checked here, because an entry keyed on an operation that is
+    # not run is never consulted: a divergence silently stops being
+    # expected, or a fails-closed refusal silently stops being pinned,
+    # and the run stays green either way.
+    _unknown = {key[0] for key in _table if key[0] not in OPERATIONS}
+    if _unknown:
+        raise RuntimeError(f'{_label} names operations that are not run: {sorted(_unknown)}')
 _both = set(EXPECTED_FAILURES) & set(FAILS_CLOSED)
 if _both:
     raise RuntimeError(f'EXPECTED_FAILURES and FAILS_CLOSED both name: {sorted(_both)}')
