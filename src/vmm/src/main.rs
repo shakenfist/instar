@@ -9900,7 +9900,8 @@ struct CreateArgs {
     /// --format.
     #[arg(long, default_value = "",
           value_parser = ["", "monolithicSparse", "streamOptimized",
-                          "monolithicFlat", "dynamic", "fixed"])]
+                          "monolithicFlat", "twoGbMaxExtentFlat", "dynamic",
+                          "fixed"])]
     subformat: String,
 
     /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
@@ -18854,10 +18855,18 @@ fn parse_create_o_options(
                     "monolithicSparse" => out.vmdk_subformat = Some(0),
                     "streamOptimized" => out.vmdk_subformat = Some(1),
                     "monolithicFlat" => out.vmdk_subformat = Some(2),
+                    "twoGbMaxExtentFlat" => out.vmdk_subformat = Some(4),
+                    "twoGbMaxExtentSparse" => {
+                        return Err("create: vmdk subformat 'twoGbMaxExtentSparse' is not \
+                             supported for create (supported: monolithicSparse, \
+                             streamOptimized, monolithicFlat, twoGbMaxExtentFlat)"
+                            .into())
+                    }
                     _ => {
                         return Err(format!(
                             "create: bad value '{}' for -o key 'subformat' \
-                             (expected monolithicSparse / streamOptimized / monolithicFlat)",
+                             (expected monolithicSparse / streamOptimized / monolithicFlat / \
+                             twoGbMaxExtentFlat)",
                             value
                         )
                         .into())
@@ -21769,6 +21778,11 @@ fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error
         return run_create_vmdk_flat(&args);
     }
 
+    // A twoGbMaxExtentFlat VMDK is the same, with one extent per 2 GiB.
+    if is_vmdk_split_flat_create(&args) {
+        return run_create_vmdk_split_flat(&args);
+    }
+
     run_create_nonraw(&args, _verbose)
 }
 
@@ -21784,6 +21798,11 @@ fn resolve_create_args(mut args: CreateArgs) -> Result<CreateArgs, Box<dyn std::
 /// Whether `args` (with `-o` applied) asks for a monolithicFlat VMDK.
 fn is_vmdk_flat_create(args: &CreateArgs) -> bool {
     args.target_format == "vmdk" && args.subformat == "monolithicFlat"
+}
+
+/// Whether `args` (with `-o` applied) asks for a twoGbMaxExtentFlat VMDK.
+fn is_vmdk_split_flat_create(args: &CreateArgs) -> bool {
+    args.target_format == "vmdk" && args.subformat == "twoGbMaxExtentFlat"
 }
 
 /// Apply parsed `-o` overrides on top of the individual `--flag`
@@ -21812,7 +21831,10 @@ fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverride
             0 => "monolithicSparse",
             1 => "streamOptimized",
             2 => "monolithicFlat",
-            _ => "monolithicSparse",
+            4 => "twoGbMaxExtentFlat",
+            // The parser only produces the numbers above; a new one must
+            // be added here rather than become some other subformat.
+            other => unreachable!("create: unmapped vmdk subformat number {other}"),
         }
         .to_string();
     }
@@ -23027,7 +23049,6 @@ fn write_vmdk_flat(
 /// there -- see `VmdkCreatedFiles`. The plan has already refused a
 /// pre-existing extent, so the descriptor is the only file a split
 /// create can find in place.
-#[allow(dead_code)] // Create's subformat routing is its only caller; wiring it removes this.
 fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let size_str = args
         .size
@@ -23383,7 +23404,7 @@ fn render_create_success_json(
     println!("}}");
 }
 
-/// The options a monolithicFlat VMDK cannot take.
+/// The options a flat VMDK, single extent or split, cannot take.
 ///
 /// qemu refuses a backing file ("Flat image can't have backing file") and
 /// `zeroed_grain=on` ("Flat image can't enable zeroed grain"), at
@@ -23392,18 +23413,19 @@ fn render_create_success_json(
 /// file the size must be given. `preallocation=metadata` is refused by the
 /// common preallocation check.
 fn validate_vmdk_flat_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let name = args.subformat.as_str();
     if args.backing.is_some() {
-        return Err("create: vmdk monolithicFlat cannot have a backing file".into());
+        return Err(format!("create: vmdk {name} cannot have a backing file").into());
     }
     if args.size.is_none() {
-        return Err("create: vmdk monolithicFlat requires SIZE".into());
+        return Err(format!("create: vmdk {name} requires SIZE").into());
     }
     if args.zeroed_grain {
-        return Err("create: vmdk monolithicFlat cannot enable zeroed_grain".into());
+        return Err(format!("create: vmdk {name} cannot enable zeroed_grain").into());
     }
     if args.grain_size != 0 {
         return Err(format!(
-            "create: vmdk monolithicFlat has no grains, so it takes no grain size (got {})",
+            "create: vmdk {name} has no grains, so it takes no grain size (got {})",
             args.grain_size
         )
         .into());
@@ -23445,7 +23467,7 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     }
     // Before the size check, because a flat image cannot take its size
     // from a backing file.
-    if is_vmdk_flat_create(args) {
+    if is_vmdk_flat_create(args) || is_vmdk_split_flat_create(args) {
         validate_vmdk_flat_create_args(args)?;
     }
     // Before the size check too, so that `-b` without a size is told
@@ -23515,11 +23537,14 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         "vmdk" => {
             if !matches!(
                 args.subformat.as_str(),
-                "" | "monolithicSparse" | "streamOptimized" | "monolithicFlat"
+                "" | "monolithicSparse"
+                    | "streamOptimized"
+                    | "monolithicFlat"
+                    | "twoGbMaxExtentFlat"
             ) {
                 return Err(format!(
-                    "create: --subformat '{}' is not valid for vmdk \
-                     (expected monolithicSparse, streamOptimized, or monolithicFlat)",
+                    "create: --subformat '{}' is not valid for vmdk (expected monolithicSparse, \
+                     streamOptimized, monolithicFlat, or twoGbMaxExtentFlat)",
                     args.subformat
                 )
                 .into());
@@ -24284,6 +24309,162 @@ mod create_option_tests {
         resolve(&["-f", "vmdk", "-o", "zeroed_grain=on", "f.vmdk", "1M"]).unwrap();
     }
 
+    /// Run `instar create ARGV...` through resolution and routing, as
+    /// `main` does.
+    fn run_create_cli(argv: &[&str]) -> Result<(), String> {
+        let args = resolve_create_args(parse_create_cli(argv)).map_err(|e| e.to_string())?;
+        run_create(args, false).map_err(|e| e.to_string())
+    }
+
+    /// Both spellings reach the split writer: three extents for 5 GiB,
+    /// at the lengths the layout gives them, and a descriptor of the
+    /// split type. The `-o` spelling goes through a number and back, so
+    /// this also catches it being mapped to some other subformat.
+    #[test]
+    fn split_flat_subformat_is_created_by_both_spellings() {
+        for (name, spelling) in [
+            ("o", &["-o", "subformat=twoGbMaxExtentFlat"][..]),
+            ("flag", &["--subformat", "twoGbMaxExtentFlat"][..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join(format!("{name}.vmdk"));
+            let mut argv = vec!["-q", "-f", "vmdk"];
+            argv.extend_from_slice(spelling);
+            argv.extend_from_slice(&[out.to_str().unwrap(), "5G"]);
+            run_create_cli(&argv).unwrap();
+
+            let text = std::fs::read_to_string(&out).unwrap();
+            assert!(
+                text.contains("createType=\"twoGbMaxExtentFlat\""),
+                "{name}: {text}"
+            );
+            let gib = 1024u64 * 1024 * 1024;
+            for (i, want) in [(1, 2 * gib), (2, 2 * gib), (3, gib)] {
+                let extent = dir.path().join(format!("{name}-f{i:03}.vmdk"));
+                let len = std::fs::metadata(&extent)
+                    .unwrap_or_else(|e| panic!("{name}: extent {i}: {e}"))
+                    .len();
+                assert_eq!(len, want, "{name}: extent {i}");
+            }
+            assert!(!dir.path().join(format!("{name}-f004.vmdk")).exists());
+            assert!(!dir.path().join(format!("{name}-flat.vmdk")).exists());
+        }
+    }
+
+    #[test]
+    fn split_flat_resolves_to_the_split_route_only() {
+        for argv in [
+            &[
+                "-f",
+                "vmdk",
+                "-o",
+                "subformat=twoGbMaxExtentFlat",
+                "s.vmdk",
+                "5G",
+            ][..],
+            &[
+                "-f",
+                "vmdk",
+                "--subformat",
+                "twoGbMaxExtentFlat",
+                "s.vmdk",
+                "5G",
+            ][..],
+        ] {
+            let args = resolve(argv).unwrap();
+            assert!(is_vmdk_split_flat_create(&args), "{:?}", argv);
+            assert!(!is_vmdk_flat_create(&args), "{:?}", argv);
+        }
+        let single = resolve(&["-f", "vmdk", "-o", FLAT_O, "f.vmdk", "1M"]).unwrap();
+        assert!(!is_vmdk_split_flat_create(&single));
+        let sparse = resolve(&["-f", "vmdk", "f.vmdk", "1M"]).unwrap();
+        assert!(!is_vmdk_split_flat_create(&sparse));
+        assert_eq!(sparse.subformat, "");
+    }
+
+    /// The `-o` route names the subformat and what is supported; clap
+    /// refuses the `--subformat` route, and its help does not list it.
+    #[test]
+    fn split_sparse_is_refused_and_the_supported_subformats_named() {
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=twoGbMaxExtentSparse",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk subformat 'twoGbMaxExtentSparse' is not supported for create \
+             (supported: monolithicSparse, streamOptimized, monolithicFlat, twoGbMaxExtentFlat)"
+        );
+        use clap::Parser;
+        let refused = Cli::try_parse_from([
+            "instar",
+            "create",
+            "-f",
+            "vmdk",
+            "--subformat",
+            "twoGbMaxExtentSparse",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("twoGbMaxExtentSparse"), "{refused}");
+        assert!(refused.contains("twoGbMaxExtentFlat"), "{refused}");
+    }
+
+    #[test]
+    fn existing_vmdk_subformats_still_resolve_to_themselves() {
+        for sub in ["monolithicSparse", "streamOptimized", "monolithicFlat"] {
+            let o = format!("subformat={sub}");
+            let args = resolve(&["-f", "vmdk", "-o", &o, "f.vmdk", "1M"]).unwrap();
+            assert_eq!(args.subformat, sub);
+        }
+        let err = resolve(&["-f", "vmdk", "-o", "subformat=bogus", "f.vmdk", "1M"]).unwrap_err();
+        assert!(err.starts_with("create: bad value 'bogus'"), "{err}");
+    }
+
+    /// A split flat image takes the options a monolithicFlat one cannot,
+    /// refused under its own name.
+    #[test]
+    fn split_flat_refuses_what_flat_refuses() {
+        let sub = "subformat=twoGbMaxExtentFlat";
+        let err = resolve(&["-f", "vmdk", "-o", sub, "-b", "p.vmdk", "s.vmdk"]).unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk twoGbMaxExtentFlat cannot have a backing file"
+        );
+        let err = resolve(&["-f", "vmdk", "-o", sub, "s.vmdk"]).unwrap_err();
+        assert_eq!(err, "create: vmdk twoGbMaxExtentFlat requires SIZE");
+        let o = format!("{sub},zeroed_grain=on");
+        let err = resolve(&["-f", "vmdk", "-o", &o, "s.vmdk", "5G"]).unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk twoGbMaxExtentFlat cannot enable zeroed_grain"
+        );
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            sub,
+            "--grain-size",
+            "4096",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err();
+        assert!(
+            err.starts_with("create: vmdk twoGbMaxExtentFlat has no grains"),
+            "{err}"
+        );
+        let o = format!("{sub},preallocation=metadata");
+        assert!(resolve(&["-f", "vmdk", "-o", &o, "s.vmdk", "5G"]).is_err());
+    }
+
     #[test]
     fn flat_refuses_a_grain_size() {
         let want =
@@ -24422,8 +24603,7 @@ mod create_option_tests {
     }
 
     /// Run the split flat writer for `name` in `dir` with SIZE `size`.
-    /// Create's subformat routing does not reach it yet, so the
-    /// arguments are the ones clap parses rather than resolved ones;
+    /// The arguments are the ones clap parses rather than resolved ones;
     /// the writer reads only the filename and the size.
     fn create_split_flat(dir: &Path, name: &str, size: &str) -> Result<(), String> {
         let out = dir.join(name);

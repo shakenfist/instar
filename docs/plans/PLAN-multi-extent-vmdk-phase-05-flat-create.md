@@ -273,7 +273,7 @@ in parallel.
 | 5a. The path set and the three refusals | high | opus | worktree | Generalise `vmdk_flat_extent_path` (`src/vmm/src/main.rs:17011`) into a function that takes the output path and a `SplitLayout` and returns the decomposed stem (`prefix`, `postfix`) that `vmdk::build_split_descriptor` takes plus the N derived extent paths, keeping its existing UTF-8 / no-`"`-CR-LF refusal verbatim and leaving `monolithicFlat`'s `-flat` call site working. Add the three refusals of decisions 1, 2 and 3, all of them before any file is opened: more than `vmdk::MAX_EXTENTS` extents, a zero size, and a derived extent that already exists. Match the wording shape of the read-side refusal at `:4934`. Read phase 4's emitter doc at `src/crates/vmdk/src/lib.rs:470-495` first -- it specifies these bounds as the caller's. Unit tests for each refusal and for the name derivation at 1, 2, 64 and 65 extents. Commit subject: "Derive a split VMDK's extent paths." |
 | 5b. The writer | high | opus | worktree | Add the host-only writer beside `write_vmdk_flat` (`src/vmm/src/main.rs:22683`): for each extent, open and `ftruncate` to `layout.sectors_of_extent(i) * 512`; then write the descriptor from `vmdk::build_split_descriptor` using 5a's stem; `fsync` every extent before the descriptor, then the descriptor (decision 6). Follow the existing function's idioms exactly -- `mode(0o644)`, the measure-then-write two-call pattern at `:17049`, and the `Result` error strings prefixed `create:`. Do **not** change the convert path. Commit subject: "Write a split flat VMDK on the host." |
 | 5c. Cleanup that removes only what it created | high | opus | worktree | Decision 5. Change the `opened` list in `run_create_vmdk_flat` / `write_vmdk_flat` (`:22659-22673`) to record whether this run created each file, and remove on failure only those. Both the single-extent and split paths use it. Add a test that a failure after a pre-existing descriptor was truncated leaves that file present. Keep this in its own commit, touching nothing else, so it can be reverted alone. Commit subject: "Delete only the files create itself made." |
-| 5d. CLI wiring | medium | sonnet | worktree | Extend `is_vmdk_flat_create` (`src/vmm/src/main.rs`, two lines) and `create`'s subformat validation to accept `twoGbMaxExtentFlat` and route it to 5b. Refuse `twoGbMaxExtentSparse` per decision 7. Find every create-side subformat validation site -- there is more than one, and `:18312` and `:18644` map subformat strings to `vmdk_subformat` numbers for other subcommands, which must not change. Leave the convert validator at `:16804` untouched. Commit subject: "Accept twoGbMaxExtentFlat in create." |
+| 5d. CLI wiring | medium | sonnet | worktree | Extend `is_vmdk_flat_create` (`src/vmm/src/main.rs`, two lines) and `create`'s subformat validation to accept `twoGbMaxExtentFlat` and route it to 5b. Refuse `twoGbMaxExtentSparse` per decision 7. Find every create-side subformat validation site -- there is more than one, and the owners are not what this row first claimed. `create`'s own `-o subformat=` mapper (the arm whose error reads `create: bad value`) **must** change, or `-o subformat=twoGbMaxExtentFlat` is refused as a bad value; only `measure`'s identical-looking mapper and its string-to-number match are the ones to leave alone, along with `convert`'s `--subformat` value list and its validator. Note the trap in `apply_create_overrides`: a `-o` subformat round-trips through a number and back to a string with `_ => "monolithicSparse"` as its fallback, so a new string added to the forward mapper and not the reverse one silently creates a monolithicSparse image instead of being refused. Commit subject: "Accept twoGbMaxExtentFlat in create." |
 | 5e. Tests against the real oracle | high | opus | worktree | Integration tests under `tests/`. The descriptor oracle is already committed: phase 1's pinned cases in `tests/golden/qemu-create-pins.json`, reachable through `tests/helpers/qemu_pins.py`, and the static per-version `qemu-img` builds in `instar-testdata`. There are **seven** pinned flat cases, and their names carry their units: `vmdk-multi-flat-1M` (1 extent), `-2G` (1), `-2049M` (2), `-4G` (2), `-5G` (3), `-21G` (11), and `-5G-existing-extent` (3). **Every one of them is within the 64-extent ceiling, so all are comparable** -- the largest is 11 extents. Compare all six plain cases byte for byte; there is no pinned case past the ceiling, so decision 2's refusal is proven by instar's own arithmetic at unit level and not against a pin. The seventh case is the one to read carefully: `vmdk-multi-flat-5G-existing-extent` pins `rc: 0` and an unchanged descriptor for a create whose extent already existed, which is the measurement that makes decision 1 a divergence rather than a preference. Assert against it that instar refuses where qemu succeeded, and cite the pin. Assert instar's end-to-end `create` descriptor is byte-identical to qemu's for the five comparable sizes with `$CID` substituted, and that every extent file exists with the length the pin implies. Extend `scripts/create-vmdk-flat-testdata.sh`'s split-flat case rather than writing a new generator. Remember that `tests/` is copied to `/tmp` for the packaged run, so no test may resolve a path outside it -- `tools/ci/check-tests-relocatable.sh` enforces this and runs in CI. Classify the suite run with `tools/ci/check-stestr-run.sh`, never stestr's totals block. Commit subject: "Test split flat create against qemu's pins." |
 | 5f. Mutation-check the three refusals | medium | sonnet | worktree | The master plan requires it for any test meant to prove a refusal. Break each of 5a's three refusals and decision 5's cleanup fix in turn, on a copy, and confirm a named test fails and names the right thing. Restore from the copy, never with `git checkout <dir>`. Run each mutant under `timeout` and count a timeout as killed. Leave the mutations in a runnable script and record its path and the kill count in the execution notes. Commit subject: "Mutation-check split create's refusals." |
 | 5g. Documentation | medium | sonnet | worktree | `docs/create.md` has three places to change, all found already: the per-format table whose vmdk row lists the three subformats, the `-o` option list that repeats them, and the opening paragraph that says the monolithicFlat path does not require KVM -- which is now true of a second subformat. Add the new subformat, the 128 GiB limit with the reason it is instar's and not qemu's, and the pre-existing-extent refusal stated as the trade-off decision 1 describes, including its cost to the user. `docs/output-formats.md` already names the `twoGbMaxExtent*` subformats on the read side, where it describes the `/extents.N` children; say there that one of them can now be written. `docs/vmdk/vmdk-extents.md` (phase 4's page): the path derivation rule and the refusals, next to the naming rule already there. State the qemu divergences as divergences. Nothing under `docs/` outside `docs/plans/` may carry a `file.rs:123` line reference: the `docs-line-references` pre-commit hook rejects them and excludes only plan files, so name the function rather than the line. Commit subject: "Document split flat create." |
@@ -563,3 +563,71 @@ reviewed tree, 3173 passed, 0 failed, 3 ignored over 83 binaries --
 3168 plus six new, minus the removed defect test -- with all six named
 in the run and the removed one confirmed absent from it, and
 `pre-commit run --all-files` twelve of twelve.
+
+**Step 5d, 2026-11-27.** The CLI wiring, in `src/vmm/src/main.rs`
+(+210/-16): `twoGbMaxExtentFlat` added to `CreateArgs`' `--subformat`
+value list, mapped to and from `4` in create's `-o subformat=` parser,
+accepted by `validate_create_args`, and routed by a new
+`is_vmdk_split_flat_create` beside the `monolithicFlat` route. Step
+5b's `#[allow(dead_code)]` is gone, so nothing in the phase is
+unreachable any more.
+
+**Step 5d's row in the table above was wrong and is corrected there.**
+It said two `-o subformat=` mappers belong to other subcommands and
+must not change. Only one does -- `measure`'s, whose error reads
+`measure: bad value`. The other is create's own, and leaving it alone
+would have refused `-o subformat=twoGbMaxExtentFlat` as a bad value,
+which is the exact command definition-of-done item 1 runs. The row now
+identifies each site by the subcommand in its error string rather than
+by a line number.
+
+The row also now names a trap the plan had missed: a `-o` subformat
+round-trips through a number and back to a string in
+`apply_create_overrides`, whose fallback arm was
+`_ => "monolithicSparse"`. Adding the new subformat to the forward
+mapper alone would have silently created a monolithicSparse image
+instead of refusing anything -- a wrong answer no existing test could
+catch, since every monolithicSparse assertion would still have held.
+The fallback is now `unreachable!` naming the number. That is a
+deliberate choice: the forward parser is the only writer of the field
+and produces only 0, 1, 2 and 4, so the arm is an invariant rather
+than a reachable path, and a crash is strictly better than a wrong
+image. A returned error would need `apply_create_overrides` to change
+signature and every caller to handle it, which is outside this step.
+**The structural fix -- one source of truth for the number-to-name
+mapping -- is worth a follow-up.**
+
+A correction to the management session's own brief, found by the
+sub-agent: the `--subformat` value list documented "when `-O` vmdk"
+belongs to `MeasureArgs`, not to convert. `measure` takes `-O` as
+well. Convert has no clap value list for subformat at all; its only
+gate is the validator this phase must not widen, which is confirmed
+untouched -- the diff's hunks run from 9903 straight to 18856, and
+that validator sits at 16802.
+
+`twoGbMaxExtentSparse` is deliberately **not** in create's clap value
+list, so `--help`'s possible values stay truthful rather than
+advertising something always refused. The two routes therefore print
+different messages, both correct: `-o subformat=twoGbMaxExtentSparse`
+gives decision 7's refusal, naming the subformat and listing the four
+that are supported, with no phase number, file name or date; and
+`--subformat twoGbMaxExtentSparse` is refused by clap, which names the
+valid values.
+
+**One qemu claim in this step is unmeasured, and is deferred to 5e
+rather than accepted.** All four of `monolithicFlat`'s option refusals
+-- backing file, SIZE, `zeroed_grain` and grain size -- were applied
+to the split subformat on the reasoning that qemu treats both as flat.
+No pinned case covers grain size with any flat subformat, so that is
+an assertion. Instar's behaviour is at least consistent with what it
+already does for `monolithicFlat`, so nothing is broken either way,
+but whether it diverges from qemu is unknown. Step 5e measures it
+against a static build, and 5g documents it if it diverges.
+
+Verified by the management session: `make test-rust` re-run on the
+reviewed tree, 3178 passed, 0 failed, 3 ignored over 83 binaries,
+3173 plus this step's five, all five named in the run. The re-run was
+necessary rather than routine: the sub-agent's own last test run
+predated a by-hand reformat it made after a denied `rustfmt` container
+call. `pre-commit run --all-files` twelve of twelve. The real binary
+is still unexercised by hand; step 5e's suite runs it.
