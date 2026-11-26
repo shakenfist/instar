@@ -16991,24 +16991,114 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     execute_convert(exec, verbose)
 }
 
-/// Name the extent file of a monolithicFlat VMDK the way qemu does.
+/// How a VMDK names the extent files that sit beside its descriptor,
+/// and how many of them there are.
 ///
-/// Returns the extent's path and the name the descriptor records for it.
+/// Every flat subformat puts its extents in the output's own directory
+/// and derives each name from the output's own stem, so one derivation
+/// serves them all and only the suffix and the count differ. A second
+/// derivation would be a second name-safety predicate to keep in step
+/// with this one, which is how the two descriptor builders came to
+/// disagree about their `ddb.*` lines.
+#[derive(Debug, Clone, Copy)]
+enum VmdkExtentNaming {
+    /// `monolithicFlat`: one extent, named `<prefix>-flat<postfix>`.
+    MonolithicFlat,
+    /// A split subformat: one extent per `layout.extent_count`, named
+    /// `<prefix>-f<NNN><postfix>` for a flat layout and
+    /// `<prefix>-s<NNN><postfix>` for a sparse one, where `NNN` is the
+    /// one-based extent number zero-padded to at least three digits.
+    /// `vmdk::build_split_descriptor` writes those same names from the
+    /// same stem, which is why the stem is returned alongside them.
+    Split(vmdk::SplitLayout),
+}
+
+impl VmdkExtentNaming {
+    /// The subformat's name, for a refusal that has to say which
+    /// create path refused.
+    fn subformat(&self) -> &'static str {
+        match self {
+            Self::MonolithicFlat => "monolithicFlat",
+            Self::Split(layout) => match layout.kind {
+                vmdk::SplitKind::Flat => "twoGbMaxExtentFlat",
+                vmdk::SplitKind::Sparse => "twoGbMaxExtentSparse",
+            },
+        }
+    }
+
+    /// How many extent files this naming yields.
+    fn extent_count(&self) -> u64 {
+        match self {
+            Self::MonolithicFlat => 1,
+            Self::Split(layout) => layout.extent_count,
+        }
+    }
+
+    /// What goes between the stem's prefix and its extension for
+    /// extent `index`, counted from zero.
+    fn suffix(&self, index: u64) -> Vec<u8> {
+        match self {
+            Self::MonolithicFlat => b"-flat".to_vec(),
+            Self::Split(layout) => {
+                let tag = match layout.kind {
+                    vmdk::SplitKind::Flat => 'f',
+                    vmdk::SplitKind::Sparse => 's',
+                };
+                format!("-{tag}{:03}", index.saturating_add(1)).into_bytes()
+            }
+        }
+    }
+}
+
+/// The extent file names a VMDK create derives from its output path.
+///
+/// `prefix` and `postfix` are the decomposed stem, which is what
+/// `vmdk::build_split_descriptor` names its extents from; the split
+/// writer passes them straight through to it. The writer is a separate
+/// change, which is why they look unread here.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct VmdkExtentPaths {
+    /// The output's base name up to its last `.`, without the
+    /// directory.
+    prefix: Vec<u8>,
+    /// The output's extension including its dot, or empty when the
+    /// base name holds no dot.
+    postfix: Vec<u8>,
+    /// One entry per extent in extent order: the path to write, and
+    /// the name the descriptor records for it.
+    extents: Vec<(std::path::PathBuf, String)>,
+}
+
+/// Name the extent files of a flat VMDK the way qemu does.
+///
 /// qemu (`filename_decompose`, `block/vmdk.c:2279-2316`, and the `"%s-flat%s"`
 /// format in `vmdk_co_do_create`, `:2599`, qemu 7.0.0) takes the basename
 /// after the last `/`, splits it at its last `.`, and writes
-/// `<prefix>-flat<postfix>` in the output's directory. The output's own
-/// extension is kept, a name with no dot gets a bare `-flat` suffix, and a
-/// leading dot is the split point (`.hid` gives `-flat.hid`). qemu also
-/// looks for `\` and then `:` when there is no `/`; neither is a path
-/// separator on the hosts instar runs on, so they are not split on.
+/// `<prefix><suffix><postfix>` in the output's directory. The output's own
+/// extension is kept, a name with no dot gets a bare suffix, and a
+/// leading dot is the split point (`.hid` with monolithicFlat's `-flat`
+/// gives `-flat.hid`). qemu also looks for `\` and then `:` when there is
+/// no `/`; neither is a path separator on the hosts instar runs on, so
+/// they are not split on. The split subformats number their extents from
+/// the same decomposition, so the same split point serves every
+/// subformat.
 ///
-/// The descriptor records the name as a quoted string on a line of UTF-8
+/// The descriptor records each name as a quoted string on a line of UTF-8
 /// text, so a name that is not UTF-8, or that holds a `"`, CR or LF, is
 /// refused rather than written: it would name a file other than the
 /// extent, or end the quoted string and add descriptor lines of its own.
-/// qemu writes such names verbatim. `op` prefixes the refusal.
-fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf, String), String> {
+/// qemu writes such names verbatim. `op` prefixes the refusal, which
+/// names the subformat that refused.
+///
+/// Nothing here bounds the extent count, and the work is one allocation
+/// per extent: a caller deriving the count from a virtual size must
+/// bound the size before it asks.
+fn vmdk_extent_paths(
+    output: &Path,
+    naming: VmdkExtentNaming,
+    op: &str,
+) -> Result<VmdkExtentPaths, String> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     let bytes = output.as_os_str().as_bytes();
@@ -17018,28 +17108,136 @@ fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf,
         Some(i) => base.split_at(i),
         None => (base, &base[base.len()..]),
     };
-    let mut name = Vec::with_capacity(base.len() + 5);
-    name.extend_from_slice(prefix);
-    name.extend_from_slice(b"-flat");
-    name.extend_from_slice(postfix);
-    let recordable = std::str::from_utf8(&name)
-        .ok()
-        .filter(|n| !n.contains(['"', '\r', '\n']));
-    let Some(recorded) = recordable else {
-        return Err(format!(
-            "{}: vmdk monolithicFlat cannot record the extent name {:?} in its descriptor \
-             (it must be UTF-8 without '\"', CR or LF)",
-            op,
-            String::from_utf8_lossy(&name)
+
+    let count = naming.extent_count();
+    // The capacity hint is clamped so that an unbounded count cannot
+    // ask for an unbounded allocation up front; the loop still derives
+    // every name it was asked for.
+    let hint = count.min(vmdk::MAX_EXTENTS as u64) as usize;
+    let mut extents = Vec::with_capacity(hint);
+    for index in 0..count {
+        let suffix = naming.suffix(index);
+        let mut name = Vec::with_capacity(base.len() + suffix.len());
+        name.extend_from_slice(prefix);
+        name.extend_from_slice(&suffix);
+        name.extend_from_slice(postfix);
+        let recordable = std::str::from_utf8(&name)
+            .ok()
+            .filter(|n| !n.contains(['"', '\r', '\n']));
+        let Some(recorded) = recordable else {
+            return Err(format!(
+                "{}: vmdk {} cannot record the extent name {:?} in its descriptor \
+                 (it must be UTF-8 without '\"', CR or LF)",
+                op,
+                naming.subformat(),
+                String::from_utf8_lossy(&name)
+            ));
+        };
+        let recorded = recorded.to_string();
+        let mut path = dir.to_vec();
+        path.extend_from_slice(&name);
+        extents.push((
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
+            recorded,
         ));
-    };
-    let recorded = recorded.to_string();
-    let mut path = dir.to_vec();
-    path.extend_from_slice(&name);
-    Ok((
-        std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
-        recorded,
-    ))
+    }
+
+    Ok(VmdkExtentPaths {
+        prefix: prefix.to_vec(),
+        postfix: postfix.to_vec(),
+        extents,
+    })
+}
+
+/// Name the one extent file of a monolithicFlat VMDK, for create and
+/// convert, which both have exactly one.
+///
+/// Returns the extent's path and the name the descriptor records for
+/// it. `vmdk_extent_paths` does the deriving and the refusing.
+fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf, String), String> {
+    let derived = vmdk_extent_paths(output, VmdkExtentNaming::MonolithicFlat, op)?;
+    derived
+        .extents
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("internal error: {op}: monolithicFlat derived no extent name"))
+}
+
+/// Refuse what a split VMDK create cannot write, and derive what it
+/// will write, before anything is opened.
+///
+/// Returns the extent layout the descriptor and the extent lengths come
+/// from, and the derived names. Three things are refused here rather
+/// than part-way through a write that has already made files:
+///
+/// A size needing more extents than the guest's extent table holds.
+/// That table is a fixed array of `vmdk::MAX_EXTENTS` entries, so an
+/// image with more extents is one instar's own reader declines; writing
+/// it would produce output no part of instar can read back, and would
+/// leave the differential fuzzer blind above the cap. The limit is
+/// instar's own: qemu-img has none, and writes a split image of any
+/// size it can express.
+///
+/// A zero virtual size, which lays out zero extents and would emit a
+/// descriptor with no extent lines at all. The reader refuses that too.
+///
+/// A derived extent path that already exists. The descriptor is the
+/// path the user named and create has always overwritten it, but
+/// `<stem>-f001<ext>` and its siblings are instar's invention, and
+/// truncating a file nobody named is not something to do on instar's
+/// word alone. qemu-img truncates them in place, so this is a
+/// deliberate divergence, and the cost is that re-running a failed
+/// create means removing the extents by hand.
+///
+/// The existence test is advisory against anyone else who can write to
+/// the output's directory, as the cleanup helpers' test is: between the
+/// stat and the create they could put a file at the path. The output
+/// path and its directory are the invoking user's choice, which puts
+/// that party outside the untrusted-image threat model this project
+/// defends. A dangling symlink counts as present, because creating
+/// through one writes to a file the user never named.
+#[allow(dead_code)] // The split writer is its only caller, and is a separate change.
+fn vmdk_split_create_plan(
+    output: &Path,
+    virtual_size: u64,
+    kind: vmdk::SplitKind,
+    op: &str,
+) -> Result<(vmdk::SplitLayout, VmdkExtentPaths), String> {
+    let layout = vmdk::split_layout(virtual_size, kind);
+    let naming = VmdkExtentNaming::Split(layout);
+    let subformat = naming.subformat();
+
+    if layout.extent_count == 0 {
+        return Err(format!(
+            "{op}: a vmdk {subformat} image of {virtual_size} bytes has no extents, and a \
+             descriptor with no extent lines is one instar cannot read; refusing to write \
+             an image with nothing in it"
+        ));
+    }
+    if layout.extent_count > vmdk::MAX_EXTENTS as u64 {
+        return Err(format!(
+            "{op}: a vmdk {subformat} image of {virtual_size} bytes needs {} extents, more \
+             than the {} the guest's extent table holds; the table is a fixed array, so \
+             instar could not read such an image back and refuses to write one (the limit \
+             is instar's own, not qemu's)",
+            layout.extent_count,
+            vmdk::MAX_EXTENTS
+        ));
+    }
+
+    let paths = vmdk_extent_paths(output, naming, op)?;
+    for (path, _) in &paths.extents {
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err(format!(
+                "{op}: the vmdk {subformat} extent '{}' already exists; instar derived that \
+                 path rather than being given it and will not overwrite it, so nothing has \
+                 been written",
+                terminal_safe_path(path)
+            ));
+        }
+    }
+
+    Ok((layout, paths))
 }
 
 /// The monolithicFlat descriptor naming `extent_name`, for create and
@@ -26807,5 +27005,219 @@ mod vmdk_flat_extent_path_tests {
         let (path, name) = vmdk_flat_extent_path(out, "op").unwrap();
         assert_eq!(path.as_os_str().as_bytes(), b"\xff\"/out-flat.vmdk");
         assert_eq!(name, "out-flat.vmdk");
+    }
+}
+
+#[cfg(test)]
+mod vmdk_split_extent_paths_tests {
+    //! Unit tests for the split half of `vmdk_extent_paths`, and for the
+    //! three things `vmdk_split_create_plan` refuses before a file can be
+    //! opened. End-to-end coverage against qemu's pinned descriptors
+    //! lives in the Python suite.
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Bytes in every extent but the last.
+    const EXTENT_BYTES: u64 = vmdk::SPLIT_EXTENT_SECTORS * 512;
+    /// The largest image the guest's extent table can describe: 128 GiB.
+    const MAX_BYTES: u64 = vmdk::MAX_EXTENTS as u64 * EXTENT_BYTES;
+
+    /// Derive the flat split names for `output` at `bytes`. No bound is
+    /// applied: the deriver has none, which is why the plan has them.
+    fn derived(output: &str, bytes: u64) -> VmdkExtentPaths {
+        let layout = vmdk::split_layout(bytes, vmdk::SplitKind::Flat);
+        vmdk_extent_paths(Path::new(output), VmdkExtentNaming::Split(layout), "test").unwrap()
+    }
+
+    /// The names the descriptor would record, in extent order.
+    fn names(paths: &VmdkExtentPaths) -> Vec<&str> {
+        paths.extents.iter().map(|(_, n)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn the_stem_is_the_decomposition_the_emitter_takes() {
+        let paths = derived("dir/out.vmdk", EXTENT_BYTES);
+        assert_eq!(paths.prefix, b"out");
+        assert_eq!(paths.postfix, b".vmdk");
+
+        let bare = derived("dir/out", EXTENT_BYTES);
+        assert_eq!(bare.prefix, b"out");
+        assert_eq!(bare.postfix, b"");
+    }
+
+    #[test]
+    fn one_extent_is_numbered_from_one() {
+        let paths = derived("dir/out.vmdk", EXTENT_BYTES);
+        assert_eq!(names(&paths), ["out-f001.vmdk"]);
+        assert_eq!(paths.extents[0].0, PathBuf::from("dir/out-f001.vmdk"));
+    }
+
+    #[test]
+    fn two_extents_are_numbered_in_order() {
+        let paths = derived("out.vmdk", EXTENT_BYTES + 1);
+        assert_eq!(names(&paths), ["out-f001.vmdk", "out-f002.vmdk"]);
+    }
+
+    #[test]
+    fn the_tables_worth_of_extents_derives_every_name() {
+        let paths = derived("out.vmdk", MAX_BYTES);
+        assert_eq!(paths.extents.len(), 64);
+        assert_eq!(names(&paths)[0], "out-f001.vmdk");
+        assert_eq!(names(&paths)[63], "out-f064.vmdk");
+    }
+
+    /// The deriver does not enforce the extent ceiling, so that there is
+    /// one place that does and one message to read.
+    #[test]
+    fn one_extent_past_the_table_still_derives() {
+        let paths = derived("out.vmdk", MAX_BYTES + 1);
+        assert_eq!(paths.extents.len(), 65);
+        assert_eq!(names(&paths)[64], "out-f065.vmdk");
+    }
+
+    #[test]
+    fn a_sparse_layout_is_tagged_s() {
+        let layout = vmdk::split_layout(EXTENT_BYTES, vmdk::SplitKind::Sparse);
+        let paths = vmdk_extent_paths(
+            Path::new("out.vmdk"),
+            VmdkExtentNaming::Split(layout),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(names(&paths), ["out-s001.vmdk"]);
+    }
+
+    #[test]
+    fn extents_stay_in_the_outputs_directory() {
+        let paths = derived("/abs/d.ir/out", EXTENT_BYTES + 1);
+        assert_eq!(paths.extents[0].0, PathBuf::from("/abs/d.ir/out-f001"));
+        assert_eq!(paths.extents[1].0, PathBuf::from("/abs/d.ir/out-f002"));
+        assert_eq!(names(&paths), ["out-f001", "out-f002"]);
+    }
+
+    /// The same predicate monolithicFlat uses, naming the subformat that
+    /// refused rather than monolithicFlat's name.
+    #[test]
+    fn a_name_the_descriptor_cannot_quote_is_refused() {
+        let layout = vmdk::split_layout(EXTENT_BYTES, vmdk::SplitKind::Flat);
+        let outputs: [&[u8]; 4] = [b"a\"b.vmdk", b"a\nb.vmdk", b"a\rb.vmdk", b"\xff\xfe.img"];
+        for output in outputs {
+            let err = vmdk_extent_paths(
+                Path::new(OsStr::from_bytes(output)),
+                VmdkExtentNaming::Split(layout),
+                "op",
+            )
+            .unwrap_err();
+            assert!(err.starts_with("op: vmdk twoGbMaxExtentFlat "), "{err}");
+            assert!(err.contains("UTF-8 without"), "{err}");
+        }
+    }
+
+    /// Plan a flat split create of `bytes` into `dir`.
+    fn plan(dir: &Path, bytes: u64) -> Result<(vmdk::SplitLayout, VmdkExtentPaths), String> {
+        vmdk_split_create_plan(
+            &dir.join("out.vmdk"),
+            bytes,
+            vmdk::SplitKind::Flat,
+            "create",
+        )
+    }
+
+    #[test]
+    fn exactly_the_table_s_worth_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let (layout, paths) = plan(dir.path(), MAX_BYTES).expect("128 GiB is 64 extents");
+        assert_eq!(layout.extent_count, 64);
+        assert_eq!(paths.extents.len(), 64);
+    }
+
+    #[test]
+    fn one_byte_past_the_table_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let err = plan(dir.path(), MAX_BYTES + 1).unwrap_err();
+        assert!(err.starts_with("create: "), "{err}");
+        assert!(err.contains("needs 65 extents"), "{err}");
+        assert!(
+            err.contains("the 64 the guest's extent table holds"),
+            "{err}"
+        );
+        assert!(err.contains(&format!("{} bytes", MAX_BYTES + 1)), "{err}");
+        assert!(err.contains("fixed array"), "{err}");
+        assert!(err.contains("not qemu's"), "{err}");
+        assert!(
+            !dir.path().join("out.vmdk").exists(),
+            "the refusal opened the descriptor"
+        );
+        assert!(
+            !dir.path().join("out-f001.vmdk").exists(),
+            "the refusal opened an extent"
+        );
+    }
+
+    #[test]
+    fn a_zero_size_is_refused_with_its_own_message() {
+        let dir = TempDir::new().unwrap();
+        let err = plan(dir.path(), 0).unwrap_err();
+        assert!(err.starts_with("create: "), "{err}");
+        assert!(err.contains("has no extents"), "{err}");
+        assert!(err.contains("no extent lines"), "{err}");
+        assert!(!err.contains("extent table holds"), "{err}");
+        assert!(
+            !dir.path().join("out.vmdk").exists(),
+            "the refusal created the descriptor"
+        );
+    }
+
+    #[test]
+    fn a_derived_extent_that_exists_is_refused_by_name() {
+        let dir = TempDir::new().unwrap();
+        let clash = dir.path().join("out-f002.vmdk");
+        std::fs::write(&clash, b"mine").unwrap();
+        let later = dir.path().join("out-f003.vmdk");
+        std::fs::write(&later, b"also mine").unwrap();
+
+        let err = plan(dir.path(), 5 * EXTENT_BYTES).unwrap_err();
+        assert!(err.starts_with("create: "), "{err}");
+        assert!(err.contains("out-f002.vmdk"), "{err}");
+        assert!(
+            !err.contains("out-f003.vmdk"),
+            "only the first is named: {err}"
+        );
+        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("nothing has been written"), "{err}");
+
+        assert_eq!(std::fs::read(&clash).unwrap(), b"mine");
+        assert!(
+            !dir.path().join("out.vmdk").exists(),
+            "the refusal created the descriptor"
+        );
+        assert!(
+            !dir.path().join("out-f001.vmdk").exists(),
+            "the refusal created an extent"
+        );
+    }
+
+    /// Creating through a dangling symlink would write a file the user
+    /// never named, so a link counts as the path being taken.
+    #[test]
+    fn a_dangling_symlink_at_a_derived_path_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("out-f001.vmdk");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &link).unwrap();
+        let err = plan(dir.path(), EXTENT_BYTES).unwrap_err();
+        assert!(err.contains("out-f001.vmdk"), "{err}");
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    /// The asymmetry is deliberate: the descriptor is the path the user
+    /// typed, and create's help text has always promised to overwrite it.
+    #[test]
+    fn a_pre_existing_descriptor_is_not_refused() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("out.vmdk"), b"old").unwrap();
+        plan(dir.path(), EXTENT_BYTES).expect("the named descriptor is the user's to lose");
     }
 }

@@ -366,3 +366,64 @@ Answer these before any step runs.
    map.
 4. **Whether this session may push and open the pull request** when
    the phase is done.
+
+## Execution notes
+
+Implementation began 2026-11-27 (AEDT), from commit `8e7ce7df` on
+`multi-extent-vmdk-phase-05-flat-create`.
+
+**Back brief, answered 2026-11-27 (AEDT).** All four as the plan
+recommended.
+
+1. Decision 5's cleanup fix stays in scope, in its own revertable
+   commit with its own test, rather than being filed as an issue.
+2. Decision 1's divergence from qemu-img is confirmed, now the cost to
+   a user re-running a failed create is written down.
+3. The extent-ceiling refusal **names the mechanism** -- that the
+   guest's extent table is a fixed array, so instar could not read the
+   image back -- and not only the limit. Step 5a's message does.
+4. This session may push the branch and open the pull request when the
+   phase is done.
+
+Steps run in the order the table gives them, sequentially, because
+every one of them writes to the same worktree and 5b onward consume
+the previous step's interface.
+
+The step table's `Isolation` column is read as the phase worktree
+itself rather than a throwaway copy per sub-agent. A discarded
+worktree would break that chain, and one cut from the shared clone
+would be on `develop`, carrying neither this branch nor this plan.
+
+**Step 5a, 2026-11-27.** The extent path set and the three refusals,
+in `src/vmm/src/main.rs` alone (+442/-30).
+
+The row asked for a function taking the output path and a
+`SplitLayout`. That cannot also serve `monolithicFlat`, which has no
+layout, so the sub-agent introduced a `VmdkExtentNaming` enum carrying
+the layout in its `Split` variant. Kept: it is what decision 4 asks
+for -- one derivation and one name-safety predicate -- rather than a
+departure from it. `vmdk_flat_extent_path` survives as a two-line
+adapter with its old signature, so convert's and create's
+single-extent call sites are untouched.
+
+The refusals live in `vmdk_split_create_plan`, applied zero size
+first, then the extent count, then existence, so the ceiling refuses
+before a size near `u64::MAX` could derive 2^33 names. The existence
+test uses `symlink_metadata`, so a dangling symlink counts as the path
+being taken: creating through one writes to a file the user never
+named. That reading is beyond the row and is kept.
+
+`vmdk_split_create_plan`, and `VmdkExtentPaths`'s two stem fields,
+carry `#[allow(dead_code)]` until step 5b's writer calls them. **5b
+removes both.**
+
+Verified by the management session rather than from the report:
+`build_split_descriptor`'s stem contract was re-read from
+`src/crates/vmdk/src/lib.rs` (`prefix` is the base name without its
+extension, `postfix` the extension including its dot) and matched
+against the derivation; the convert subformat validator and
+`CreateArgs::filename`'s help text were confirmed outside every diff
+hunk; and `make test-rust` was re-run on the reviewed tree -- 3164
+passed, 0 failed, 3 ignored over 83 test binaries -- with the four
+refusal tests confirmed present in that run rather than inferred from
+the total.
