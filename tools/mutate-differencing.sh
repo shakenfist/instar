@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=183
+EXPECTED_CASES=184
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -3151,6 +3151,16 @@ rust_case 'vmdk-create-cleanup-removes-every-opened-file' "${VMM_MAIN_LIB}" \
     '        self.opened.push((path.to_path_buf(), !existed));' \
     '        self.opened.push((path.to_path_buf(), true)); // MUTATED' \
     instar 'a_file_that_was_already_there_is_kept'
+
+# The search spans lines because the two flat create paths call
+# `remove_created()` on identically indented lines, so no single line
+# identifies this one. The case exists because the tests that used to
+# cover this call survived its removal: they planted their failure at a
+# path the plan refuses, so the writer never ran.
+rust_case 'vmdk-split-create-failure-keeps-its-extents' "${VMM_MAIN_LIB}" \
+    $'    let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);\n    let descriptor_len = match result {\n        Ok(n) => n,\n        Err(e) => {\n            opened.remove_created();\n' \
+    $'    let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);\n    let descriptor_len = match result {\n        Ok(n) => n,\n        Err(e) => {\n            // MUTATED: no cleanup\n' \
+    instar 'split_failure_removes_the_extents_it_created'
 
 # ---------------------------------------------------------------------
 # Totals

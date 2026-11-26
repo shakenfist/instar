@@ -933,6 +933,25 @@ Filled in as the plan runs. Already known:
   where the operator kept the contract for now and asked for this
   issue.
 
+* [#985](https://github.com/shakenfist/instar/issues/985),
+  `create -f raw` unlinking its output on a late failure whether or not
+  that run created it -- the same defect class phase 5 fixed for the
+  flat VMDK writers, left in raw. Reproducible in one command on ext4
+  (`ftruncate` past the 16 TiB file-size maximum), so it is not a race
+  or a corner of a full filesystem. Found by phase 5's review and filed
+  rather than folded in, because raw is outside this plan's scope and
+  the fix wants its own tests: this is the class that was pinned as
+  intended behaviour by two green tests before phase 5 inverted them.
+
+* [#986](https://github.com/shakenfist/instar/issues/986), two
+  follow-ups on `VmdkCreatedFiles` raised in phase 5's review and
+  deferred there: opening derived extents with `O_EXCL` so the
+  "this run created it" flag is true by construction rather than by a
+  preceding stat, and moving the single-extent writer to
+  `terminal_safe_path` so the `render` closure that exists only to keep
+  the two writers' quoting apart can go. Neither is a defect; the
+  closure should not outlive the deferral that created it.
+
 * Extending phase 4's pin-literal guard,
   `tools/ci/check-vmdk-split-pins.py`, to the VHDX literals in
   `src/crates/create/tests/round_trip.rs`. Those are copied from the

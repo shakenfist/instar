@@ -394,3 +394,42 @@ class TestCreateVmdkSplitFlat(_SplitFlatBase):
                 self.assertEqual(virtual_size, sum(lengths))
                 self.assertEqual(virtual_size,
                                  sum(one['sectors'] for one in self.declared_extents(descriptor)) * SECTOR)
+
+
+class TestSplitFlatIsCreateOnly(_SplitFlatBase):
+    """Only `create` knows this subformat; the sibling subcommands still refuse it.
+
+    `create`'s `--subformat` value list gained twoGbMaxExtentFlat, and convert
+    and measure keep their own lists and their own `-o` parsers. Nothing shares
+    a list between them, which is exactly why a later widening could leak into
+    one of them unnoticed: a subformat convert accepted but could not emit
+    would write a descriptor naming extents it never made.
+    """
+
+    def run_instar(self, *args, timeout=300):
+        cmd = [str(self.get_instar_binary()), *[str(one) for one in args]]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.stdout, result.stderr, result.returncode
+
+    def test_convert_and_measure_refuse_the_split_flat_subformat(self):
+        """Each refuses it by name, before writing anything, and says what it does take."""
+        cases = (
+            ('convert --subformat', ('convert', '-O', 'vmdk', '--subformat', 'twoGbMaxExtentFlat'), 1),
+            ('measure -o subformat', ('measure', '-O', 'vmdk', '-o', 'subformat=twoGbMaxExtentFlat'), 1),
+            # Refused by the argument parser rather than by instar's own
+            # validation, which is why the exit code differs.
+            ('measure --subformat', ('measure', '-O', 'vmdk', '--subformat', 'twoGbMaxExtentFlat'), 2),
+        )
+        with tempfile.TemporaryDirectory() as workdir:
+            source = Path(workdir) / 'in.raw'
+            self.run_instar('create', '-q', '-f', 'raw', source, '1M')
+            for name, args, expected_rc in cases:
+                with self.subTest(case=name):
+                    out = Path(workdir) / 'out.vmdk'
+                    extra = (out,) if args[0] == 'convert' else ()
+                    _, stderr, rc = self.run_instar(*args, source, *extra)
+                    self.assertEqual(expected_rc, rc, stderr)
+                    self.assertIn('twoGbMaxExtentFlat', stderr)
+                    self.assertIn('monolithicFlat', stderr)
+                    self.assertFalse(out.exists(), f'{name} wrote an output it had refused')
+            self.assertEqual(['in.raw'], self.files_in(workdir))

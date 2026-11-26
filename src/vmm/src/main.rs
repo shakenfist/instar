@@ -23086,10 +23086,18 @@ fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::erro
 /// Every extent is written and `fsync`ed before the descriptor is
 /// created, which is the reverse of the single-extent order and is
 /// deliberate. The descriptor is the only part of a split image that
-/// says what the other parts are, so one that exists must never name a
-/// set of extents that is not on disk. Ordering it last leaves extent
+/// says what the other parts are, so one that exists should never name
+/// a set of extents that is not on disk. Ordering it last leaves extent
 /// files with no descriptor as the only half-state a failure can
 /// produce, and nothing reads those.
+///
+/// That holds for a create that fails, which is what the ordering is
+/// for. It does not extend to a host crash: the containing directory is
+/// never `fsync`ed, so the descriptor's directory entry and the
+/// extents' can reach stable storage in either order, and a power loss
+/// can leave a descriptor naming extents whose names are not there yet.
+/// The single-extent writer has the same gap, and qemu-img promises no
+/// more.
 fn write_vmdk_split_flat(
     descriptor_path: &Path,
     layout: &vmdk::SplitLayout,
@@ -24619,39 +24627,55 @@ mod create_option_tests {
         run_create_vmdk_split_flat(&args).map_err(|e| e.to_string())
     }
 
-    /// Half one of the guarantee for the split subformat. A directory
-    /// in the way of the second extent fails the write after the first
-    /// extent has been made. The descriptor is the only file a split
-    /// create can find in place -- a pre-existing extent is refused
-    /// before anything is opened -- and it survives.
-    ///
-    /// This writer opens the descriptor after every extent, so a
-    /// failure part-way cannot have truncated it; that it is also not
-    /// deleted once truncated is tested where the bookkeeping is.
+    /// A directory counts as a derived extent's path being taken, so
+    /// the plan refuses before anything is opened. The descriptor the
+    /// user named keeps its bytes, because the open that would have
+    /// truncated it never runs.
     #[test]
-    fn split_failure_keeps_the_descriptor_it_did_not_create() {
+    fn split_create_refuses_a_directory_at_an_extent_path() {
         let dir = tempfile::tempdir().unwrap();
         let descriptor = dir.path().join("s.vmdk");
         std::fs::write(&descriptor, b"old").unwrap();
         std::fs::create_dir(dir.path().join("s-f002.vmdk")).unwrap();
         let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
         assert!(err.contains("s-f002.vmdk"), "{}", err);
+        assert!(err.contains("instar derived that path"), "{}", err);
         assert_eq!(std::fs::read(&descriptor).unwrap(), b"old");
+        assert!(
+            !dir.path().join("s-f001.vmdk").exists(),
+            "a refused create opened an extent"
+        );
     }
 
-    /// Half two for the split subformat: the extent the run did make is
-    /// removed, and no descriptor is left behind.
+    /// The cleanup guarantee at the split entry point: the extents this
+    /// run made are removed when the write fails. The failure is a
+    /// directory at the descriptor's own path, which is the only one a
+    /// split create can be made to take -- the plan refuses every other
+    /// file it could find in place -- and because the descriptor is
+    /// opened last, it fires with both extents already on disk. The
+    /// assertion on where the error comes from is what keeps that true:
+    /// a failure moved into the plan would leave nothing to clean up.
+    ///
+    /// The other half of the guarantee, that a file this run did not
+    /// create is kept once truncated, cannot be reached from here at
+    /// all: after the first file is opened, nothing this writer opens
+    /// can be a file the user already had. It is tested in
+    /// `vmdk_created_files_tests`, where the bookkeeping is.
     #[test]
     fn split_failure_removes_the_extents_it_created() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("s-f002.vmdk")).unwrap();
+        std::fs::create_dir(dir.path().join("s.vmdk")).unwrap();
         let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
-        assert!(err.contains("s-f002.vmdk"), "{}", err);
-        assert!(
-            !dir.path().join("s-f001.vmdk").exists(),
-            "a failed create left the extent it had made"
-        );
-        assert!(!dir.path().join("s.vmdk").exists());
+        assert!(err.starts_with("create: open "), "{}", err);
+        assert!(err.contains("s.vmdk"), "{}", err);
+        for extent in ["s-f001.vmdk", "s-f002.vmdk"] {
+            assert!(
+                !dir.path().join(extent).exists(),
+                "a failed create left {} behind",
+                extent
+            );
+        }
+        assert!(dir.path().join("s.vmdk").is_dir());
     }
 
     #[test]

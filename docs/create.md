@@ -211,13 +211,20 @@ almost nothing, and a split flat image costs its descriptor plus holes.
 Extents are named from `FILENAME` the way qemu-img names them: the basename
 is split at its last `.` and the extents are `<prefix>-f001<postfix>`
 through `-f064<postfix>`, in the same directory (`out.vmdk` gives
-`out-f001.vmdk`, `out-f002.vmdk` and so on). The descriptor is byte for byte the one
-qemu-img writes, including its disk database lines, apart from the `CID`:
-qemu-img writes a random value there and instar writes a constant one, so
-its output is reproducible. Every extent is synced before the descriptor is written, so a failure
-part-way never leaves a descriptor naming a set of extents that does not
-match it. On a failure, `create` removes the files it made and leaves any
-that were already there.
+`out-f001.vmdk`, `out-f002.vmdk` and so on). The descriptor is byte for byte
+the one qemu-img 6.2.0 and later writes, including its disk database lines,
+apart from the `CID`: qemu-img writes a random value there and instar writes
+a constant one, so its output is reproducible. Builds from 6.0.0 to 6.1.1
+differ by a single line — they write no `ddb.toolsVersion` and instar does;
+see [quirks.md](quirks.md).
+
+Every extent is synced before the descriptor is created, so a `create` that
+fails part-way leaves extent files with no descriptor, never a descriptor
+naming extents that are not there. That ordering is for a failed create
+rather than for a host crash: the containing directory is not synced, so
+after a power loss the descriptor's directory entry can be on disk when an
+extent's is not. On a failure, `create` removes the files it made and leaves
+any that were already there.
 
 Refused, before any file is opened:
 
@@ -229,15 +236,25 @@ Refused, before any file is opened:
 | `-b` or `-o backing_file`, no `SIZE`, `-o zeroed_grain=on`, `--grain-size` or `-o grain_size`, `preallocation=metadata` | As for monolithicFlat, with the message naming twoGbMaxExtentFlat. |
 | an extent name holding `"`, CR or LF | As for monolithicFlat. |
 
-A pre-existing derived extent is refused, and nothing is written, but the
-descriptor you named is still overwritten. This is a deliberate divergence
-from qemu-img, which truncates a pre-existing extent in place and succeeds.
-It is not unambiguously better, and it has a cost: a user re-running a
-failed create in the same directory has to remove the extent files
-themselves, where qemu-img would have overwritten them. The reason for the
-asymmetry is that `out.vmdk` is the path you typed and `create` has always
-promised to overwrite it, while `out-f001.vmdk` and its siblings are paths
-instar derived, and truncating files nobody named is not done silently.
+A pre-existing derived extent is refused and nothing at all is written, not
+even the descriptor: the refusal happens before any file is opened. A
+pre-existing descriptor is the other half of the asymmetry — a create that
+proceeds overwrites it, as `create` has always promised for the path you
+typed, while `out-f001.vmdk` and its siblings are paths instar derived, and
+truncating files nobody named is not done silently.
+
+The refusal is a deliberate divergence from qemu-img, which truncates a
+pre-existing extent in place and succeeds. It is not unambiguously better,
+and it has a cost: a user re-running a failed create in the same directory
+has to remove the extent files themselves, where qemu-img would have
+overwritten them.
+
+On success, `--output json` reports the descriptor as `filename`, its length
+as both `metadata_bytes_written` and `file_size_after`, and
+`resolved_unit_size` 0, as monolithicFlat does. The extents are not counted
+in `file_size_after`: a 128 GiB image spread over 65 files reports the few
+kilobytes of its descriptor, which is the only file `create` wrote bytes
+into.
 
 `twoGbMaxExtentSparse` is not supported for `create`; the supported
 subformats are monolithicSparse, streamOptimized, monolithicFlat and

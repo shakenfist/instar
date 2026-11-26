@@ -875,3 +875,61 @@ and all three failed the same way: the survey recorded what it expected
 to find rather than enumerating it. A survey claim of the form "there
 are N of these" should be produced by a command whose output is kept,
 not by reading until the expected number appears.
+
+## Review round 1 (#984)
+
+2026-11-27, +11:00. The automated reviewer raised 2 `fix`, 3
+`document`, 4 `consider` and 2 informational items on head `12b5197c`.
+
+Both `fix` items were real, and the first is the one worth carrying
+forward. The two split-create cleanup tests in `create_option_tests`
+planted a directory at the *second extent's* path, which the plan's
+existence check refuses before any file is opened -- so both tests ran
+through the refusal path and asserted nothing at all about cleanup.
+Proved by mutation rather than by reading: with `remove_created`'s body
+disabled, `split_failure_keeps_the_descriptor_it_did_not_create` and
+`split_failure_removes_the_extents_it_created` both still passed, while
+`flat_failure_removes_the_descriptor_it_created` and
+`a_file_this_run_created_is_removed` failed. **A test whose failure
+injection is refused earlier than it intends passes for the wrong
+reason, and reads as coverage.** The replacement plants the directory
+at the descriptor's own path -- the only failure a split create can be
+made to take, because the plan refuses every other file it could find
+in place -- and asserts the error starts at `create: open `, so a
+refusal moved earlier would fail the test rather than satisfy it.
+
+The other half of that guarantee, a file the run did not create being
+kept once truncated, is unreachable from the split entry point at all:
+once the first file is opened, nothing this writer opens can be a file
+the user already had. It is tested in `vmdk_created_files_tests`, where
+the bookkeeping is, and the test that used to claim it is now the
+refusal test it had always been.
+
+Three claims this phase wrote were stronger than the code, and are
+corrected at their source. `docs/create.md` said a refused
+pre-existing extent still overwrote the descriptor, in the one case
+where nothing is opened at all. The "byte for byte the one qemu-img
+writes" claim holds for 6.2.0 and later only: the four 6.0.0-6.1.1
+builds in the pin write no `ddb.toolsVersion` and instar does. And the
+extents-before-descriptor ordering protects a create that fails, not a
+host crash -- the containing directory is never `fsync`ed, so the
+descriptor's directory entry and an extent's can reach stable storage
+in either order.
+
+`docs/quirks.md` was the page the phase missed, and it is the one
+`ARCHITECTURE.md` sends a reader to for writer divergences. Its DDB
+entry became false as a general statement the moment this phase shipped
+a subformat whose descriptor carries the whole `ddb.*` block, and both
+new divergences -- the pre-existing-extent refusal and the 64-extent
+ceiling -- belonged there and were absent. All three are fixed.
+
+Declined, with the reasoning posted on the pull request: the
+`unreachable!` arm stays, because a crash beats a silently wrong image
+and the structural fix is a typed subformat rather than a `u8` round
+trip, which is the follow-up the notes above already name. The `O_EXCL`
+and path-quoting follow-ups are
+[#986](https://github.com/shakenfist/instar/issues/986), and
+`run_create_raw`'s cleanup defect -- surfaced in the notes above, and
+reproducible in one command -- is
+[#985](https://github.com/shakenfist/instar/issues/985). Both are named
+in the master plan's Future work.

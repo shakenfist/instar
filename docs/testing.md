@@ -2789,7 +2789,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **183 cases**, in eighteen groups. The prose below
+There are **184 cases**, in eighteen groups. The prose below
 describes each group, with sub-totals nested inside the larger ones; this
 table is the flat version, so the sum can be checked in one pass. The
 headline, `EXPECTED_CASES` and the case count the script itself reports
@@ -2810,13 +2810,13 @@ here are not, so they are the thing to re-derive if the two disagree.
 | data device | 12 |
 | descriptor attachment | 7 |
 | split descriptor | 7 |
-| split flat create | 4 |
+| split flat create | 5 |
 | data-file entry | 8 |
 | host-offset refusal | 2 |
 | VHDX metadata | 6 |
 | VHD footer copy | 4 |
 | partial last block | 4 |
-| **total** | **183** |
+| **total** | **184** |
 
 Forty-seven cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
