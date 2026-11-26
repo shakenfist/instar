@@ -274,7 +274,7 @@ in parallel.
 | 5b. The writer | high | opus | worktree | Add the host-only writer beside `write_vmdk_flat` (`src/vmm/src/main.rs:22683`): for each extent, open and `ftruncate` to `layout.sectors_of_extent(i) * 512`; then write the descriptor from `vmdk::build_split_descriptor` using 5a's stem; `fsync` every extent before the descriptor, then the descriptor (decision 6). Follow the existing function's idioms exactly -- `mode(0o644)`, the measure-then-write two-call pattern at `:17049`, and the `Result` error strings prefixed `create:`. Do **not** change the convert path. Commit subject: "Write a split flat VMDK on the host." |
 | 5c. Cleanup that removes only what it created | high | opus | worktree | Decision 5. Change the `opened` list in `run_create_vmdk_flat` / `write_vmdk_flat` (`:22659-22673`) to record whether this run created each file, and remove on failure only those. Both the single-extent and split paths use it. Add a test that a failure after a pre-existing descriptor was truncated leaves that file present. Keep this in its own commit, touching nothing else, so it can be reverted alone. Commit subject: "Delete only the files create itself made." |
 | 5d. CLI wiring | medium | sonnet | worktree | Extend `is_vmdk_flat_create` (`src/vmm/src/main.rs`, two lines) and `create`'s subformat validation to accept `twoGbMaxExtentFlat` and route it to 5b. Refuse `twoGbMaxExtentSparse` per decision 7. Find every create-side subformat validation site -- there is more than one, and `:18312` and `:18644` map subformat strings to `vmdk_subformat` numbers for other subcommands, which must not change. Leave the convert validator at `:16804` untouched. Commit subject: "Accept twoGbMaxExtentFlat in create." |
-| 5e. Tests against the real oracle | high | opus | worktree | Integration tests under `tests/`. The descriptor oracle is already committed: phase 1's pinned cases in `tests/golden/qemu-create-pins.json`, reachable through `tests/helpers/qemu_pins.py`, and the static per-version `qemu-img` builds in `instar-testdata`. The pinned flat cases are `vmdk-multi-flat-{1,2,4,5,21,2049}`, named in GiB. **Five of the six are comparable and the sixth is not:** 2049 GiB needs 1025 extents, so decision 2 refuses it. Do not iterate the case list blindly -- compare 1, 2, 4, 5 and 21, and use 2049 as the refusal test instead, which makes it a pinned witness that qemu writes a size instar declines. Assert instar's end-to-end `create` descriptor is byte-identical to qemu's for the five comparable sizes with `$CID` substituted, and that every extent file exists with the length the pin implies. Extend `scripts/create-vmdk-flat-testdata.sh`'s split-flat case rather than writing a new generator. Remember that `tests/` is copied to `/tmp` for the packaged run, so no test may resolve a path outside it -- `tools/ci/check-tests-relocatable.sh` enforces this and runs in CI. Classify the suite run with `tools/ci/check-stestr-run.sh`, never stestr's totals block. Commit subject: "Test split flat create against qemu's pins." |
+| 5e. Tests against the real oracle | high | opus | worktree | Integration tests under `tests/`. The descriptor oracle is already committed: phase 1's pinned cases in `tests/golden/qemu-create-pins.json`, reachable through `tests/helpers/qemu_pins.py`, and the static per-version `qemu-img` builds in `instar-testdata`. There are **seven** pinned flat cases, and their names carry their units: `vmdk-multi-flat-1M` (1 extent), `-2G` (1), `-2049M` (2), `-4G` (2), `-5G` (3), `-21G` (11), and `-5G-existing-extent` (3). **Every one of them is within the 64-extent ceiling, so all are comparable** -- the largest is 11 extents. Compare all six plain cases byte for byte; there is no pinned case past the ceiling, so decision 2's refusal is proven by instar's own arithmetic at unit level and not against a pin. The seventh case is the one to read carefully: `vmdk-multi-flat-5G-existing-extent` pins `rc: 0` and an unchanged descriptor for a create whose extent already existed, which is the measurement that makes decision 1 a divergence rather than a preference. Assert against it that instar refuses where qemu succeeded, and cite the pin. Assert instar's end-to-end `create` descriptor is byte-identical to qemu's for the five comparable sizes with `$CID` substituted, and that every extent file exists with the length the pin implies. Extend `scripts/create-vmdk-flat-testdata.sh`'s split-flat case rather than writing a new generator. Remember that `tests/` is copied to `/tmp` for the packaged run, so no test may resolve a path outside it -- `tools/ci/check-tests-relocatable.sh` enforces this and runs in CI. Classify the suite run with `tools/ci/check-stestr-run.sh`, never stestr's totals block. Commit subject: "Test split flat create against qemu's pins." |
 | 5f. Mutation-check the three refusals | medium | sonnet | worktree | The master plan requires it for any test meant to prove a refusal. Break each of 5a's three refusals and decision 5's cleanup fix in turn, on a copy, and confirm a named test fails and names the right thing. Restore from the copy, never with `git checkout <dir>`. Run each mutant under `timeout` and count a timeout as killed. Leave the mutations in a runnable script and record its path and the kill count in the execution notes. Commit subject: "Mutation-check split create's refusals." |
 | 5g. Documentation | medium | sonnet | worktree | `docs/create.md` has three places to change, all found already: the per-format table whose vmdk row lists the three subformats, the `-o` option list that repeats them, and the opening paragraph that says the monolithicFlat path does not require KVM -- which is now true of a second subformat. Add the new subformat, the 128 GiB limit with the reason it is instar's and not qemu's, and the pre-existing-extent refusal stated as the trade-off decision 1 describes, including its cost to the user. `docs/output-formats.md` already names the `twoGbMaxExtent*` subformats on the read side, where it describes the `/extents.N` children; say there that one of them can now be written. `docs/vmdk/vmdk-extents.md` (phase 4's page): the path derivation rule and the refusals, next to the naming rule already there. State the qemu divergences as divergences. Nothing under `docs/` outside `docs/plans/` may carry a `file.rs:123` line reference: the `docs-line-references` pre-commit hook rejects them and excludes only plan files, so name the function rather than the line. Commit subject: "Document split flat create." |
 
@@ -308,10 +308,11 @@ Falsifiable; each is checkable by someone who did not do the work.
    message names the 64-extent limit and the size, and **no file
    exists afterwards** -- neither descriptor nor extent.
 5. 128 GiB exactly is accepted and writes 64 extents.
-6. The pinned `vmdk-multi-flat-2049` case -- a size qemu-img writes as
-   1025 extents -- is refused by decision 2, and the test cites the
-   pin so the divergence is recorded against a measurement rather
-   than an assertion.
+6. The pinned `vmdk-multi-flat-5G-existing-extent` case -- which
+   records `rc: 0` and a complete descriptor for a qemu-img create
+   whose extent file already existed -- is refused by instar, and the
+   test cites that pin, so decision 1's divergence is recorded against
+   a measurement rather than an assertion.
 7. A zero size is refused with its own message, and no file is
    created.
 8. A pre-existing `out-f002.vmdk` is refused by name, nothing is
@@ -427,3 +428,27 @@ hunk; and `make test-rust` was re-run on the reviewed tree -- 3164
 passed, 0 failed, 3 ignored over 83 test binaries -- with the four
 refusal tests confirmed present in that run rather than inferred from
 the total.
+
+**Correction, 2026-11-27 (AEDT): step 5e's brief and definition-of-done
+item 6 were wrong about the pinned cases, and are fixed above.** Found
+by the management session checking the brief's premises before sending
+it, which is what the risks table's last row asks for.
+
+The brief said there are six pinned flat cases "named in GiB", and that
+`vmdk-multi-flat-2049` is 2049 GiB needing 1025 extents, so decision 2
+refuses it and it serves as a pinned witness of the ceiling. Read from
+`tests/golden/qemu-create-pins.json`, the names carry their units and
+there are seven cases: `1M` (1 extent), `2G` (1), `2049M` (2), `4G`
+(2), `5G` (3), `21G` (11) and `5G-existing-extent` (3). `2049M` is
+2049 **MiB**, two extents, not 2049 GiB. The largest pin is eleven
+extents, so **nothing in the pin set is past the 64-extent ceiling**
+and there is no pinned witness of it: decision 2's refusal rests on
+instar's own arithmetic, unit-tested in step 5a, and the plan no longer
+claims otherwise.
+
+The seventh case repays the error. `vmdk-multi-flat-5G-existing-extent`
+pins `rc: 0` and a complete descriptor for a qemu-img create whose
+extent file already existed. That is a measured witness of exactly the
+behaviour decision 1 diverges from, which is better evidence than the
+claim it replaced, and definition-of-done item 6 is now that
+divergence.
