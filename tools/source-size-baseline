@@ -1,0 +1,52 @@
+# Source files over the 1,500-line threshold, one "<lines> <path>"
+# per line, sorted by path. Written by tools/source-size-ratchet.py, which fails
+# when a file over the threshold is missing from this list or is longer
+# than its entry here.
+#
+# Shrinking a file needs no edit by hand: `tools/source-size-ratchet.py --update`
+# lowers entries and drops files that fell under the threshold, and never
+# raises one. Raising an entry or adding a file is a deliberate hand edit:
+# make it in the pull request that grows the file, and say in the
+# pull request description why the file should grow rather than split.
+# Comments here are not preserved when the tool rewrites this file.
+
+2006 scripts/create-vhd-testdata.sh
+6057 scripts/differential-fuzz.py
+3049 src/crates/create/src/lib.rs
+3301 src/crates/create/tests/round_trip.rs
+3564 src/crates/measure/src/lib.rs
+1937 src/crates/qcow2-write-exec/src/lib.rs
+4426 src/crates/qcow2-write/src/lib.rs
+1711 src/crates/qcow2-write/tests/ordering.rs
+21160 src/crates/qcow2/src/lib.rs
+2297 src/crates/resize/src/qcow2.rs
+3280 src/crates/snapshot/src/qcow2.rs
+5424 src/crates/vhd/src/lib.rs
+9404 src/crates/vhdx/src/lib.rs
+4504 src/crates/vmdk/src/lib.rs
+1629 src/operations/bench/src/main.rs
+2012 src/operations/bitmap/src/main.rs
+4546 src/operations/check/src/main.rs
+1988 src/operations/commit/src/main.rs
+5459 src/operations/convert/src/main.rs
+2700 src/operations/info/src/main.rs
+2029 src/operations/rebase/src/main.rs
+2212 src/operations/snapshot/src/main.rs
+8711 src/shared/src/lib.rs
+2802 src/vmm/src/chain.rs
+26811 src/vmm/src/main.rs
+1594 tests/base.py
+1520 tests/test_adversarial.py
+2253 tests/test_bench.py
+1553 tests/test_bitmap.py
+2583 tests/test_check_formats.py
+1822 tests/test_commit.py
+1831 tests/test_compare.py
+7537 tests/test_convert.py
+3245 tests/test_create.py
+2047 tests/test_dd.py
+5175 tests/test_differencing.py
+1623 tests/test_measure.py
+1573 tests/test_rebase.py
+1842 tests/test_resize.py
+3155 tools/mutate-differencing.sh

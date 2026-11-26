@@ -1,0 +1,8 @@
+# Reference material rather than shipped code: AGENTS.md says
+# prototypes/ holds the throwaway spikes that settled a design
+# question, kept for the record and not maintained, so nobody reviews
+# a prototype the way the shipped tree is reviewed. This is the same
+# exclusion tools/audit/source-size.sh makes, for the same reason, so
+# that the ratchet and the push auditor's by-hand count agree about
+# what is source here.
+prototypes/

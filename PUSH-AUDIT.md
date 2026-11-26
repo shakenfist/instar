@@ -350,43 +350,54 @@ copy lives in shakenfist/development at
     repeated-review cost does not apply here; the length thresholds
     still do.
 
-    instar has not adopted the `source-size-ratchet` tooling, so
-    nothing checks the ratchet on commit and there is no baseline
-    file. The push auditor applies the block's rule by hand, and
-    `tools/audit/source-size.sh` does the counting:
+    instar has adopted the ratchet. `tools/source-size-ratchet.py` is
+    the template's script, copied verbatim; `tools/source-size-baseline`
+    is the list of files over 1,500 lines with their lengths, and
+    `tools/source-size-exclude` holds the one tree left out,
+    `prototypes/`, which AGENTS.md calls reference material rather than
+    shipped code. The `source-size-ratchet` pre-commit hook runs it on
+    every commit, and the `Check paths` job runs it on every pull
+    request and merge group -- this repository does not run
+    `pre-commit run --all-files` in CI, so the hook alone would gate
+    nothing a contributor had not installed. "Baselined" below means
+    "listed in that file".
 
-    - `tools/audit/source-size.sh --baseline` prints the **baseline**:
-      every tracked source file over 1,500 lines. In this repository
-      that output *is* the baseline -- "baselined" below means "listed
-      there" -- and it is context, not a finding list. Pass `800` to
-      see the whole candidate-to-split set.
-    - The **findings** are in wave 2's mechanical pass, which runs the
-      same script over the audit scope: every source file the scope
-      grows that is over 800 lines now, with its net growth. Because
-      it uses the audit scope, `--commits-file` covers merged phases
-      as it does for every other check, and a scope that cannot be
-      resolved, or a diff or count that fails, is reported as such
-      rather than as "(none)". A pure rename is not growth and does
-      not appear.
+    So the ratchet, not the auditor, is what catches a baselined file
+    growing or a new file crossing 1,500: by the time a branch reaches
+    the push audit it has already had to raise the entry. What wave 2
+    adds is the judgement a one-line baseline diff asks for -- whether
+    the file should have grown rather than split -- and the two bands
+    the ratchet does not cover:
 
-    A finding over 1,500 lines is the block's ratchet breach unless the
-    pull request description names the file and says why it had to
-    grow: with no baseline file to raise, the description is where the
-    reviewed decision is recorded. A finding between 800 and 1,500
-    opens a question. Neither command can see the block's last bullet
-    -- a baselined file that shrank by losing its rationale comments --
-    so read the diff of any baselined file the scope shrinks.
+    - **800 to 1,500 lines.** The ratchet's threshold is 1,500, so a
+      file growing through the candidate-to-split band is invisible to
+      it. `tools/audit/source-size.sh` over the audit scope is wave 2's
+      mechanical pass: every source file the scope grows that is over
+      800 lines now, with its net growth. Because it uses the audit
+      scope, `--commits-file` covers merged phases as it does for every
+      other check, and a scope that cannot be resolved, or a diff or
+      count that fails, is reported as such rather than as "(none)". A
+      pure rename is not growth and does not appear. Pass `--baseline
+      800` for the whole candidate set.
+    - **Workflow YAML.** The ratchet counts a fixed list of source
+      extensions, set fleet-wide in the template so that one review of
+      the script is a review of every copy, and YAML is not on it.
+      `.github/workflows/functional-tests.yml` is past 1,500 lines, and
+      two more workflows are past 800. `tools/audit/source-size.sh`
+      does count them -- its scope is every tracked file except the
+      formats that are not source -- so for workflow YAML the block's
+      rule is still applied by hand, with the auditor's own judgement
+      standing in for a baseline entry, and the pull request
+      description is where that decision is recorded.
 
-    The script's header says what counts as source and why; in short,
-    every tracked file except formats that are not source, with
-    `prototypes/` excluded because AGENTS.md calls it reference
-    material rather than shipped code. Workflow YAML is counted.
+    Neither tool can see the block's last bullet -- a baselined file
+    that shrank by losing its rationale comments -- so read the diff of
+    any baselined file the scope shrinks.
 
     The Python integration suite is in scope and is where the rule
-    bites hardest: several of its modules are well past 1,500 lines,
-    and `--baseline` is the current list. A per-operation test module
-    is a real seam, so length alone is not a defect, but they are
-    baselined like any other file, and the block's rule applies to
+    bites hardest: half the baseline is `tests/`. A per-operation test
+    module is a real seam, so length alone is not a defect, but they
+    are baselined like any other file, and the block's rule applies to
     them unchanged.
 
 <!-- shared-block: plan-references-in-code v1 -->

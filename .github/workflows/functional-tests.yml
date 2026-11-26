@@ -117,6 +117,29 @@ jobs:
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         run: tools/ci/check-no-changelog.sh
 
+      # The source size ratchet, here for the same reason as the
+      # changelog guard above: its verdict depends on the whole tree
+      # and on tools/source-size-baseline, and the filter below counts
+      # neither docs/ nor any markdown as code, so a pull request
+      # adding a 2,000-line docs/*.sh would skip ci-tooling entirely.
+      # The pre-commit hook alone is too easy to skip -- it needs
+      # `pre-commit install` to have been run -- and this repository
+      # does not run `pre-commit run --all-files` in CI, so without
+      # this step nothing in the gate enforces the baseline. Stdlib
+      # Python and git ls-files; well under a second. -I keeps tools/
+      # off sys.path, so a module planted there cannot shadow the
+      # standard library.
+      - name: Ensure Python is available
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: |
+          command -v python3 && exit 0
+          tools/ci/apt-get.sh update
+          tools/ci/apt-get.sh install -y python3
+
+      - name: Check the source size ratchet
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: python3 -I tools/source-size-ratchet.py
+
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'

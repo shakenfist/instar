@@ -137,6 +137,36 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # The source size ratchet, copied verbatim from
+      # shakenfist/development's templates/source-size-ratchet/ along
+      # with this stanza. PUSH-AUDIT.md's source-file-size block says a
+      # file over 1,500 lines may stay that long but may not grow, and
+      # that no file may cross 1,500, without a reviewed edit to
+      # tools/source-size-baseline. A review scoped to one diff cannot
+      # see growth that only shows up across fifty, so this asks the
+      # question as a one-line baseline diff instead. Do not edit the
+      # script: change it in the template and re-sync, so that one
+      # review of the template is a review of every copy.
+      - id: source-size-ratchet
+        name: source size ratchet
+        # python3 rather than relying on the copy's executable bit,
+        # which a copy made by hand or through a web editor can lose.
+        # -I (isolated mode) keeps tools/ off sys.path, so a module a
+        # pull request plants there, such as tools/fnmatch.py, cannot
+        # shadow the standard library and run inside the hook.
+        entry: python3 -I tools/source-size-ratchet.py
+        # The script is stdlib only, so it needs no managed environment.
+        language: system
+        # It measures the whole tree against the baseline, not the
+        # files in the commit: a file's verdict depends on its entry in
+        # tools/source-size-baseline, and that file is not source.
+        pass_filenames: false
+        # Any source file, the baseline or the exclude file can change
+        # the verdict, including on a commit that touches only one of
+        # the latter two, so there is no `files:` pattern that is not
+        # narrower than what the check reads.
+        always_run: true
+
   # Lints the agent context (AGENTS.md, CLAUDE.md, .claude/ and
   # anything else an agent is handed) for malformed structure,
   # smuggled instructions and the like. Renovate's pre-commit manager

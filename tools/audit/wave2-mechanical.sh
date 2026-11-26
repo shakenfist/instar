@@ -101,11 +101,15 @@ if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
 fi
 echo
 
-# PUSH-AUDIT.md's source-file-size block, applied by hand because
-# instar has not adopted the source-size ratchet. source-size.sh owns
-# what counts as source and how growth is measured. Called whatever the
-# scope, unlike the sections around it: it states a skip itself, and the
-# runbook promises a skip here is said out loud rather than left blank.
+# PUSH-AUDIT.md's source-file-size block, over the two bands the
+# source-size ratchet does not cover: files between 800 and 1,500
+# lines, which are under its threshold, and workflow YAML, which is not
+# on its extension list. Past 1,500 the ratchet has already stopped the
+# growth at commit time, so what is left here is the judgement.
+# source-size.sh owns what counts as source and how growth is measured.
+# Called whatever the scope, unlike the sections around it: it states a
+# skip itself, and the runbook promises a skip here is said out loud
+# rather than left blank.
 bold "=== wave 2a: source files over ${SOURCE_SIZE_SPLIT} lines that this work grows ==="
 source_size_growth
 echo

@@ -75,8 +75,14 @@ expect_fail() {
 }
 
 start 'a clean tree passes'
+# The plan path here is a fixture, not a pointer: the guard has to see
+# a file whose name contains the word without being a changelog, and a
+# plan asking for an entry is the realistic case, since that is what
+# the old plans this guard exists to override actually say. No such
+# plan is in docs/plans/, and none should be, so the line carries the
+# consistency audit's marker rather than being made to resolve.
 T="$(tree README.md docs/development.md docs/changelog-policy.md \
-    docs/plans/PLAN-add-a-CHANGELOG-entry.md CHANGELOG.txt)"
+    docs/plans/PLAN-add-a-CHANGELOG-entry.md CHANGELOG.txt)"  # audit-ok: plan-reference
 expect_pass 'names that only contain the word' "${T}"
 if grep -q 'carries no changelog file' "${WORK}/out"; then
     ok 'the summary states the tree is clean'

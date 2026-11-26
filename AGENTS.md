@@ -169,6 +169,14 @@ Per-format feature detail is in
   and linted by `clippy`, both enforced by the pre-commit hooks;
   `./scripts/check-rust.sh fix` auto-fixes formatting.
 
+- **A source file over 1,500 lines may not get longer** unless the same
+  change raises its entry in `tools/source-size-baseline` by hand, and
+  says in the pull request description why the file should grow rather
+  than split; a new file crossing 1,500 adds its line the same way. The
+  `source-size-ratchet` pre-commit hook refuses the commit otherwise.
+  Never buy the lines back by deleting comments or docstrings. See
+  "Source file size" in [docs/development.md](docs/development.md).
+
 - **Diagrams of structure or flow are `mermaid` fences, not ASCII art**,
   and they fail at render time rather than at commit time, so run
   `tools/mermaid-lint.sh` before pushing. Character art whose meaning is
