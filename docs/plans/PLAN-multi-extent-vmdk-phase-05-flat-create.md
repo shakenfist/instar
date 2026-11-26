@@ -665,3 +665,64 @@ that the guarantee is "not deleted" rather than "contents preserved".
 Reverting decision 5 now means reverting this commit with `c3598d58`;
 the pair is the revertable unit, not the single commit the plan asked
 for.
+
+**Step 5e, 2026-11-27.** Integration tests against the pinned oracle:
+`tests/test_create_vmdk_split_flat.py`, thirteen tests, plus comments
+on `scripts/create-vmdk-flat-testdata.sh`'s split-flat case recording
+why its extents are deleted and why a real split-flat image is made at
+test time rather than committed. No new fixture was needed, so
+`instar-testdata` is untouched.
+
+The approach is better than the row asked for. `qemu_pins.run_case`
+takes any binary and reduces a create to rc, stderr, the descriptor
+with its CID and extent names masked, the extent names, and each
+extent's apparent length -- so running it with the instar binary
+produces the same shape as the pinned qemu result, and the comparison
+is structural rather than a second implementation of it. Six plain
+pins are asserted identical that way.
+
+Two facts the sub-agent established that the plan did not have. Each
+pinned case has **two** groups, 6.0.0-6.1.1 and 6.2.0-10.2.0,
+differing only in `ddb.toolsVersion`, so a comparison must name a
+version; instar writes the modern form and the tests compare against
+the newest pinned build, checked to discriminate by diffing against
+the older group and against a different size. And **qemu-img has no
+grain-size option for vmdk at all** -- the management session
+re-measured this on the 10.2.0 static build: `-o help` lists nine
+options with no `grain_size` among them, and
+`-o subformat=twoGbMaxExtentFlat,grain_size=65536` gives `Invalid
+parameter 'grain_size'`, rc 1. So step 5d's refusal matches qemu's
+outcome at every subformat, and 5d's stated reason for it -- that
+qemu treats both subformats as flat -- was wrong. Documentation must
+say qemu takes no grain size for vmdk, not that instar diverges.
+Accepting `grain_size` for the sparse subformats is instar's own
+extension.
+
+The existing-extent divergence is asserted against the measurement
+rather than described: one test reads `rc: 0`, extent lengths
+`[2Gi, 2Gi, 1Gi]` and `existing_kept_lengths [2147483648]` out of the
+pin for all 80 builds, with the docstring explaining that a kept link
+holding an extent's length means qemu truncated in place where 1 MiB
+would have meant unlink-and-recreate; a second test runs instar on the
+same case and asserts it refuses, names `image-f002.vmdk`, writes
+nothing, and leaves the kept link at 1 MiB.
+
+Verified by the management session, and the verification mattered
+twice. The first run died in **discovery** -- `testscenarios` is
+missing from the shared tools venv -- so nothing executed, with
+`STESTR_EXIT=100` while the task notification reported exit code 0,
+which is the trailing command's code. Re-run through the project's own
+`make test-venv`, then classified with
+`tools/ci/check-stestr-run.sh` against a listed selection rather than
+from stestr's totals: **292 of 304 executed, 12 skipped, against 304
+discovered; no worker lost**, 0 failed. All thirteen of this step's
+tests are recorded `success` with **none skipped**, checked per test
+rather than inferred -- a pin-gated test that skipped would have made
+the run prove nothing. The twelve skips are pre-existing
+baseline-matrix and round-trip cases for qcow2, vhd and raw.
+`pre-commit run --all-files` twelve of twelve with the new file
+`git add -N`'d, including the relocatable-tests check.
+
+`make instar` needed `make clean-instar` first, failing with
+`GLIBC_2.32/2.33/2.34 not found` because the dev image's artefacts
+were in the shared target directory from the Rust test runs.

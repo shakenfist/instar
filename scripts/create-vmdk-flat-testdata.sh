@@ -9,8 +9,19 @@
 # Creates a trio of qemu-img-generated monolithicFlat pairs
 # (descriptor + flat extent) at small sizes, plus a
 # parentFileNameHint variant that should be rejected by the
-# VMM, and a twoGbMaxExtentFlat multi-extent variant that
-# should also be rejected.
+# VMM, and two twoGbMaxExtentFlat variants: a descriptor whose
+# extent files are deliberately absent, and a hand-built one
+# whose three small extents are all present.
+#
+# What this script does NOT make is a real split-flat image of
+# the sizes qemu writes. Its extents are full-length sparse
+# files, 2 GiB each, and git-LFS stores a hole as bytes, so a
+# 5 GiB fixture would be a 5 GiB LFS object. Tests that need
+# one make it when they run: from a pinned qemu-img build
+# through tests/helpers/vmdk_split.py, or from instar itself in
+# tests/test_create_vmdk_split_flat.py, which compares what
+# instar writes against the committed record of what qemu-img
+# writes in tests/golden/qemu-create-pins.json.
 
 set -euo pipefail
 
@@ -98,9 +109,18 @@ with open(sys.argv[1] + '/vmdk-flat-with-parent-flat.vmdk', 'wb') as f:
 " "$OUTDIR"
 
 # --- twoGbMaxExtentFlat multi-extent (descriptor-only reference) ---
-# A 3 GiB input forces qemu-img to split into two extents.
-# We keep only the descriptor file for reference (the real
-# multi-extent test uses the hand-built small fixture below).
+# A 3 GiB input forces qemu-img to split into two extents, and
+# both extents are then removed. The missing files are the
+# point of this fixture, not an economy: it is what instar is
+# handed when a split-flat descriptor has lost its extents, and
+# convert must refuse it by name rather than reading a short
+# image. qemu-img will not open it either, which is why the
+# manifest marks it skip_qemu_img.
+#
+# The 2 GiB extents themselves are not committable (see the
+# header), so an image whose extents are present comes either
+# from the hand-built small fixture below or from a create at
+# test time.
 rm -f "$OUTDIR/vmdk-twogb-flat.vmdk" \
       "$OUTDIR/vmdk-twogb-flat-f001.vmdk" \
       "$OUTDIR/vmdk-twogb-flat-f002.vmdk"
