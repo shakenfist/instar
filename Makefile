@@ -558,12 +558,20 @@ test-venv:
 test: test-rust test-integration
 
 # Run Rust unit tests (all workspace crates except no_main guest binaries)
+#
+# INSTAR_REQUIRE_LANDLOCK is passed through without a value, so it is set
+# inside the container only when the caller set it. A kernel without
+# Landlock makes the fetcher's filesystem-policy test assert the refusal
+# the fetcher owes that kernel instead of the policy biting, which is a
+# weaker assertion than the one worth having; setting the variable turns
+# that substitution into a failure.
 test-rust: instar-devcontainer
 	@echo "Running Rust unit tests..."
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
 		-e HOME=/build \
 		-e CARGO_HOME=/build/.cargo \
+		-e INSTAR_REQUIRE_LANDLOCK \
 		-v "$(CURDIR):/workspace" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \

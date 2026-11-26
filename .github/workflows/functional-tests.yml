@@ -585,11 +585,18 @@ jobs:
           make instar-devcontainer
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)
+          #
+          # INSTAR_REQUIRE_LANDLOCK makes the fetcher's filesystem-policy
+          # test demand the strong assertion. Without it, a runner whose
+          # kernel had no Landlock would assert the refusal that kernel is
+          # owed instead, and the policy would go untested in a green run.
+          # If this job fails on it, the runner is that kernel.
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e HOME=/build \
             -e CARGO_HOME=/build/.cargo \
             -e CARGO_BUILD_JOBS=2 \
+            -e INSTAR_REQUIRE_LANDLOCK=1 \
             -v "$(pwd):/workspace" \
             -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
             -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \

@@ -59,18 +59,28 @@ use fetch_protocol::{
     SeqPacketSocket, Status,
 };
 
+mod confine;
+
+use confine::{Confinement, CONFINE_FLAG};
+
 /// What to print when the arguments do not make sense.
 const USAGE: &str = "\
-usage: instar-fetch <socket-fd> <file-fd>
+usage: instar-fetch [--confine=<layers>] <socket-fd> <file-fd>
 
   socket-fd  an inherited AF_UNIX/SOCK_SEQPACKET socket connected to instar
   file-fd    an inherited, open, readable regular file to serve
+  --confine  what this process applies to itself once it is running and
+             before it reads anything from the socket: a comma-separated
+             list of \"landlock\", \"seccomp\", or \"none\" for a kernel
+             that can provide neither
 
-Both arguments are descriptor numbers that the parent process has already
-opened. instar-fetch takes no paths and opens nothing.";
+Both descriptor arguments are numbers that the parent process has already
+opened. instar-fetch takes no paths and opens nothing.
 
-/// The flag the privileged side names the confinement layers with.
-const CONFINE_FLAG: &str = "--confine=";
+instar probes the running kernel and names the layers it can provide, which
+is why the list is given rather than chosen here. A layer named on the list
+and not applied ends the run; a layer left off it is not applied, so a
+missing list means no confinement rather than a quiet default.";
 
 /// Buffer for one incoming datagram.
 ///
@@ -101,13 +111,16 @@ impl Source for File {
     }
 }
 
-/// The two descriptors this process was given.
+/// The two descriptors this process was given, and what it was told to do to
+/// itself before it uses them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Args {
     /// The SEQPACKET socket connected to the privileged side.
     socket_fd: RawFd,
     /// The file whose bytes are served.
     file_fd: RawFd,
+    /// The confinement the privileged side asked for.
+    confinement: Confinement,
 }
 
 /// What the command line asked for.
@@ -140,10 +153,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse the command line: exactly two descriptor numbers, or a request for
+/// Parse the command line: exactly two descriptor numbers, optionally
+/// preceded by the confinement the privileged side asks for, or a request for
 /// the usage.
 fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, String> {
     let mut positional = Vec::new();
+    let mut confinement: Option<Confinement> = None;
     for arg in args.into_iter().skip(1) {
         let text = arg
             .to_str()
@@ -155,11 +170,15 @@ fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, S
             return Ok(Invocation::Help);
         }
         // `--confine=<list>` is the privileged side naming the confinement
-        // layers it expects this process to apply to itself. Reading the list
-        // belongs with the policy that applies it, which is not this loop;
-        // what this loop needs is for the flag not to be counted as one of
-        // the descriptor numbers.
-        if text.starts_with(CONFINE_FLAG) {
+        // layers it expects this process to apply to itself. Two of them
+        // would be two answers to one question, and guessing which was meant
+        // is the kind of guess that ends with a process confined by less
+        // than its caller believes.
+        if let Some(list) = text.strip_prefix(CONFINE_FLAG) {
+            if confinement.is_some() {
+                return Err(format!("{CONFINE_FLAG} was given more than once"));
+            }
+            confinement = Some(Confinement::parse(list)?);
             continue;
         }
         positional.push(text);
@@ -177,7 +196,14 @@ fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, S
             "the socket and the file are both descriptor {socket_fd}, which cannot be both"
         ));
     }
-    Ok(Invocation::Serve(Args { socket_fd, file_fd }))
+    Ok(Invocation::Serve(Args {
+        socket_fd,
+        file_fd,
+        // No flag asks for nothing. instar always sends one, and sends an
+        // explicit "none" where the kernel has nothing to offer, so this is
+        // the shape of a fetcher someone ran by hand.
+        confinement: confinement.unwrap_or(Confinement::NOTHING),
+    }))
 }
 
 /// Parse one descriptor number, refusing the three standard descriptors.
@@ -269,6 +295,16 @@ fn serve(args: Args) -> io::Result<()> {
         eprintln!("instar-fetch: could not enlarge the socket buffers: {err}");
     }
     let max_datagram = socket.max_datagram()?;
+
+    // Confined here, and here is the only place it can be. Everything the
+    // setup needed is behind it -- the descriptors are adopted, the image's
+    // size is read, the socket's buffers are settled -- and the init request
+    // below is the first thing this process parses that the peer chose, so a
+    // policy applied any later would be a policy applied after the only
+    // surface it covers was already exposed. A layer that was asked for and
+    // cannot be applied ends the run, which is what keeps the privileged
+    // side's report of what it asked for true of what happened.
+    args.confinement.apply()?;
 
     let mut datagram = [0u8; REQUEST_BUFFER];
     let block_size = match initialise(&socket, &mut datagram, max_datagram, capacity)? {
@@ -552,8 +588,39 @@ mod tests {
             Invocation::Serve(Args {
                 socket_fd: 3,
                 file_fd: 4,
+                confinement: Confinement::NOTHING,
             })
         );
+    }
+
+    /// The flag instar really passes, parsed into the policy it names, and
+    /// not counted as one of the descriptor numbers.
+    #[test]
+    fn the_confinement_list_is_read_and_is_not_a_descriptor_number() {
+        assert_eq!(
+            parse_args(argv(&["--confine=landlock,seccomp", "3", "4"])).expect("parses"),
+            Invocation::Serve(Args {
+                socket_fd: 3,
+                file_fd: 4,
+                confinement: Confinement::parse("landlock,seccomp").expect("the layers parse"),
+            })
+        );
+    }
+
+    /// A list this build cannot obey is a usage error before any descriptor
+    /// is touched, and it names the token, because what it means is that the
+    /// two sides of the partition disagree about the vocabulary.
+    #[test]
+    fn an_unknown_confinement_layer_is_refused_by_name() {
+        let err = parse_args(argv(&["--confine=nonsense", "3", "4"])).expect_err("refused");
+        assert!(err.contains("nonsense"), "{err}");
+    }
+
+    #[test]
+    fn the_confinement_flag_cannot_be_given_twice() {
+        let err = parse_args(argv(&["--confine=landlock", "--confine=none", "3", "4"]))
+            .expect_err("refused");
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]

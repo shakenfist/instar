@@ -512,6 +512,26 @@ policy is in force. The management session reworded them for that
 reason; the applied form, which is what definition-of-done item 2
 requires, arrives with the code that applies it.
 
+**Step 4b added a way to demand the strong assertion, and CI now
+demands it.** A kernel without Landlock makes the filesystem-policy test
+assert the refusal that kernel is owed instead of the policy biting,
+which is a real assertion but not the one worth having.
+`INSTAR_REQUIRE_LANDLOCK` turns that substitution into a failure, in the
+shape finding 14 found already in the tree. The step added the
+passthrough to `make test-rust`; the management session found that no
+workflow runs that target -- CI mirrors it with a `docker run` of its
+own -- so the variable would have been unreachable from CI, which is the
+same trap as the libvhdi oracle that could go missing in a green run.
+The workflow's own invocation now sets it. Measured: the suite passes
+with it set, so the strong branch is the branch CI runs.
+
+**A fetcher run by hand with no list applies nothing.** Decision 14's
+"either the host did not ask" covers it, and the privileged side always
+sends an explicit list, including `none`. It is recorded because the
+alternative -- a fetcher that refuses to run unconfined -- would also
+have been defensible, and the choice is one a reviewer should see rather
+than infer.
+
 ## Mutation results
 
 To be filled in by step 4d.

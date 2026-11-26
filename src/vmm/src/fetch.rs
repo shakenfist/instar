@@ -228,6 +228,16 @@ const LAYER_SECCOMP: &str = "seccomp";
 /// What the list says when this kernel can provide no layer at all.
 const LAYER_NONE: &str = "none";
 
+/// What the report says of the filesystem policy once it is in force.
+///
+/// A constant of its own because it is the one clause in the report that
+/// claims a policy is applied rather than merely asked for, and the claim is
+/// only true where it is printed: the lines are written after the init
+/// exchange, and a fetcher that could not apply a layer it was named exits
+/// non-zero before it replies to the init. Naming the clause is what lets a
+/// test assert that it appears nowhere else.
+const LANDLOCK_APPLIED: &str = "has left itself no reachable path";
+
 /// `landlock_create_ruleset`'s version query flag.
 ///
 /// With a null attribute pointer and a zero size it is a question rather
@@ -318,10 +328,14 @@ impl KernelConfinement {
 
     /// One line per layer, for a caller that asked for verbosity.
     ///
-    /// The lines say what this kernel offers and what the fetcher was
-    /// therefore asked for, which is what this side knows: the asking and
-    /// the applying are two different moments, and a line claiming a policy
-    /// is in force belongs with the code that puts it there.
+    /// The filesystem line says the fetcher is confined rather than that it
+    /// was asked to be, and it can: the fetcher applies the layers this list
+    /// names before it answers anything, and exits non-zero without
+    /// answering if it cannot apply one of them, so a fetcher that completed
+    /// its init exchange is a fetcher that applied what it was named. These
+    /// lines are printed after that exchange for exactly that reason. The
+    /// syscall line still says what was asked for, because the asking is all
+    /// that happens to it yet.
     ///
     /// Said on this side because this side is where the answer is known, and
     /// said only under `--verbose` because a default run of an operation
@@ -333,8 +347,8 @@ impl KernelConfinement {
         let mut lines = Vec::new();
         lines.push(match self.landlock_abi {
             Some(abi) => format!(
-                "instar: this kernel provides {LAYER_LANDLOCK} (ABI {abi}), so the fetcher is \
-                 asked to leave itself no reachable path"
+                "instar: this kernel provides {LAYER_LANDLOCK} (ABI {abi}), and the fetcher \
+                 {LANDLOCK_APPLIED}"
             ),
             None => format!(
                 "instar: this kernel has no {LAYER_LANDLOCK}, so the fetcher runs without a \
@@ -1323,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_names_each_layer_whether_or_not_it_was_applied() {
+    fn the_report_claims_a_policy_only_where_the_kernel_can_provide_it() {
         let both = KernelConfinement {
             landlock_abi: Some(6),
             seccomp_kill: true,
@@ -1333,6 +1347,12 @@ mod tests {
         assert!(
             applied[0].contains(LAYER_LANDLOCK) && applied[0].contains("ABI 6"),
             "the landlock line does not say what was applied: {:?}",
+            applied[0]
+        );
+        assert!(
+            applied[0].contains(LANDLOCK_APPLIED),
+            "the landlock line does not say the fetcher is confined by it, which is what a \
+             completed init exchange proves: {:?}",
             applied[0]
         );
         assert!(
@@ -1351,6 +1371,11 @@ mod tests {
             assert!(
                 line.contains(layer) && line.contains("without"),
                 "a layer this kernel cannot provide is not reported as missing: {line:?}"
+            );
+            assert!(
+                !line.contains(LANDLOCK_APPLIED),
+                "a kernel that cannot provide the layer is reported as though the fetcher had \
+                 been confined by it anyway: {line:?}"
             );
         }
     }
