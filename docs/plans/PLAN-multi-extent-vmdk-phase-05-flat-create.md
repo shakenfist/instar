@@ -313,8 +313,14 @@ Falsifiable; each is checkable by someone who did not do the work.
    whose extent file already existed -- is refused by instar, and the
    test cites that pin, so decision 1's divergence is recorded against
    a measurement rather than an assertion.
-7. A zero size is refused with its own message, and no file is
-   created.
+7. A zero size is refused and no file is created. The refusal comes
+   from `create`'s own size check, not from the split plan's
+   zero-extent guard: `create` rejects a zero SIZE before any
+   subformat routing happens, so the guard decision 3 adds is
+   defence in depth for a caller inside the VMM rather than a
+   message a user can reach. The integration test asserts the
+   message a user actually gets; 5a's unit test covers the inner
+   guard.
 8. A pre-existing `out-f002.vmdk` is refused by name, nothing is
    written, and the pre-existing file is unchanged byte for byte.
 9. A pre-existing `out.vmdk` is still overwritten, matching the
@@ -631,3 +637,31 @@ necessary rather than routine: the sub-agent's own last test run
 predated a by-hand reformat it made after a denied `rustfmt` container
 call. `pre-commit run --all-files` twelve of twelve. The real binary
 is still unexercised by hand; step 5e's suite runs it.
+
+**Step 5c, part two, 2026-11-27.** The defect was pinned **twice**, and
+step 5c fixed only one of them. Besides the Rust unit test, the Python
+integration suite had
+`test_create.TestCreateVmdkFlat.test_failure_opening_the_extent_removes_the_descriptor`,
+asserting that a failed `monolithicFlat` create leaves only the
+directory behind -- that is, that the pre-existing descriptor is gone.
+It was introduced with the subformat and had passed ever since, so from
+commit `c3598d58` until this one the branch carried a failing test.
+
+The management session's review of 5c did not catch it: `make
+test-rust` and `pre-commit run --all-files` both pass on that tree, and
+neither runs the Python suite. Step 5e caught it because it was the
+first step to run the real binary. That is the review gap worth
+remembering -- **a change to host behaviour needs the integration
+suite run, not only the Rust tests and the gate.**
+
+The class was swept rather than the instance fixed: that file has three
+failure-cleanup tests, and only this one plants a file before running
+create, so only this one encoded the defect. The other two create
+everything they assert about, so their expectations still hold
+unchanged. The test is renamed for what it now proves, asserts the
+descriptor is present **and** zero length, and says in its docstring
+that the guarantee is "not deleted" rather than "contents preserved".
+
+Reverting decision 5 now means reverting this commit with `c3598d58`;
+the pair is the revertable unit, not the single commit the plan asked
+for.
