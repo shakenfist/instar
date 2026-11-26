@@ -69,6 +69,9 @@ usage: instar-fetch <socket-fd> <file-fd>
 Both arguments are descriptor numbers that the parent process has already
 opened. instar-fetch takes no paths and opens nothing.";
 
+/// The flag the privileged side names the confinement layers with.
+const CONFINE_FLAG: &str = "--confine=";
+
 /// Buffer for one incoming datagram.
 ///
 /// Every message the privileged side sends is at most a 32-byte header, so
@@ -150,6 +153,14 @@ fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, S
             .to_string();
         if text == "-h" || text == "--help" {
             return Ok(Invocation::Help);
+        }
+        // `--confine=<list>` is the privileged side naming the confinement
+        // layers it expects this process to apply to itself. Reading the list
+        // belongs with the policy that applies it, which is not this loop;
+        // what this loop needs is for the flag not to be counted as one of
+        // the descriptor numbers.
+        if text.starts_with(CONFINE_FLAG) {
+            continue;
         }
         positional.push(text);
     }

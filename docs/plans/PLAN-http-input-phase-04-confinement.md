@@ -1,6 +1,6 @@
 # HTTP input phase 4: confining the fetcher
 
-## Status: Not started
+## Status: In progress
 
 Master plan: `PLAN-http-input.md`.
 
@@ -254,7 +254,7 @@ step does not need to redo any of that.
 
 7. **`pre_exec` stays async-signal-safe.** Phase 3 established that
    the closure allocates nothing, takes no lock and formats no string.
-   Four `setrlimit` calls and one `prctl` keep that property. Nothing
+   Three `setrlimit` calls and one `prctl` keep that property. Nothing
    that builds a policy object may move into the closure; the seccomp
    program is not built there and not passed through it.
 
@@ -462,7 +462,55 @@ Three gates for the operator before any step runs.
 
 ## Execution notes
 
-To be filled in as the phase runs.
+**The back brief, answered 2026-11-26 (AEDT).** All three gates were
+confirmed as the plan proposed them. A kernel that cannot provide a
+layer does not stop the run and is reported only under `--verbose`
+(decision 16). User and mount namespaces stay declined (decision 13).
+A syscall outside the policy kills the process (decision 11).
+
+**The container tier, measured 2026-11-26.** Step 4a's first task, run
+as a throwaway test inside `make test-rust`'s container and then
+deleted; the management session reproduced all of it with a throwaway
+test of its own, because the numbers decide what the later steps can
+test rather than merely describing the host:
+
+* `landlock_create_ruleset(NULL, 0, 1)` returns **6**. The container
+  shares the host's kernel, so the ABI is the host's.
+* `prctl(PR_SET_NO_NEW_PRIVS, 1)` followed by a one-instruction
+  `SECCOMP_MODE_FILTER` install, in a forked child, **succeeds**.
+* `unshare(CLONE_NEWUSER)`, in a forked child, fails with **`EPERM`**.
+
+So both layers this phase installs can be tested against the real
+policy in the container tier, and no Landlock or seccomp test has to
+settle for asserting a report instead -- which is what the plan's third
+risk was written against. Namespaces could not have been tested there,
+which is the measurement behind decision 13's last clause.
+
+One further number, not asked for and worth keeping: `PR_GET_SECCOMP`
+reads **2** inside the container, because the container runtime has
+already installed a filter of its own. The privileged side would have
+read that as "already confined" and asked for nothing. Finding 16
+rejected that probe on the argument that it answers a different
+question; this is the measurement that would have caught it.
+
+**Decision 7's count was wrong, and is corrected at source.** It said
+four `setrlimit` calls; the step table, the scope and definition-of-done
+item 3 all name three, and the fourth was `RLIMIT_FSIZE`, which finding
+7 declined. The decision now reads three.
+
+**Step 4a touched the fetcher, which its row did not ask for.** The
+fetcher's `parse_args` refuses a third argument, so threading
+`--confine=` into the child's command line without tolerating it there
+would have made every spawn fail. Step 4a therefore accepts and ignores
+the flag, and step 4b replaces that with the parsing decision 14
+describes.
+
+That leaves one claim this step must not make. Until 4b and 4c, the
+child does nothing with the list, so the `--verbose` lines say what
+this kernel offers and what the fetcher was asked for -- not that a
+policy is in force. The management session reworded them for that
+reason; the applied form, which is what definition-of-done item 2
+requires, arrives with the code that applies it.
 
 ## Mutation results
 

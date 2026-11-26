@@ -39,6 +39,14 @@
 //! * **It holds five descriptors and no more:** the three standard ones, its
 //!   socket, and the file. Everything it is handed is something a future
 //!   sandbox would otherwise have to take back off it.
+//! * **It is confined before its first instruction, and again once it is
+//!   running.** What only a parent can set -- the resource limits, and the
+//!   promise that no `exec` of its can gain privilege -- is set between the
+//!   `fork` and the `exec`. The policies that have to come later, because a
+//!   filesystem denial applied before `exec` would stop the `exec` itself,
+//!   are applied by the fetcher to itself; this side decides which of those
+//!   the running kernel can provide and names them on the command line, so
+//!   the child applies what it was told or fails, and never quietly nothing.
 //! * **It is reaped by a `Drop`,** not by a call at the end of an operation,
 //!   because the paths that most need reaping are the ones nobody writes
 //!   down. `std::process::exit` is the one path a `Drop` cannot cover, so an
@@ -198,6 +206,45 @@ const CHILD_FILE_FD: RawFd = 4;
 /// [`stage_clear_of_child_fds`].
 const FIRST_STAGING_FD: RawFd = CHILD_FILE_FD + 1;
 
+/// The flag that names the confinement the fetcher must apply to itself.
+const CONFINE_FLAG: &str = "--confine=";
+
+/// The layer that denies the fetcher every path, named as the fetcher's
+/// command line spells it.
+///
+/// The spellings are repeated in the fetcher rather than shared through a
+/// crate on purpose: the fetcher's dependencies are the protocol and `libc`
+/// and nothing else, because every crate it links is code running beside
+/// bytes an attacker controls, and two string constants are a cheaper price
+/// than a crate in that position. What keeps the two copies honest is that
+/// every test here spawns the real binary with the real argument, so a
+/// disagreement is a failed spawn rather than a silently unconfined child.
+const LAYER_LANDLOCK: &str = "landlock";
+
+/// The layer that denies the fetcher every syscall its serving loop does not
+/// make.
+const LAYER_SECCOMP: &str = "seccomp";
+
+/// What the list says when this kernel can provide no layer at all.
+const LAYER_NONE: &str = "none";
+
+/// `landlock_create_ruleset`'s version query flag.
+///
+/// With a null attribute pointer and a zero size it is a question rather
+/// than a creation: the kernel answers with the Landlock ABI it implements,
+/// allocates nothing and returns no descriptor.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+
+/// How many descriptors the fetcher may hold.
+///
+/// It is given five -- the three standard ones, its socket and the image --
+/// and opens nothing afterwards, so the ceiling bounds what a fetcher that
+/// had been taken over could accumulate rather than anything a correct one
+/// does. The three spare numbers are for the dynamic loader, which opens one
+/// file at a time as it starts the process and is bound by this limit too,
+/// because the limit is set before the `exec`.
+const CHILD_MAX_FILES: libc::rlim_t = 8;
+
 /// How long a fetcher is given to notice its socket has closed and exit by
 /// itself before it is killed.
 ///
@@ -208,6 +255,171 @@ const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// How often the reap looks to see whether the child has gone.
 const REAP_POLL: Duration = Duration::from_millis(10);
+
+/// Which confinement layers the running kernel can provide.
+///
+/// The privileged side asks this once, before it spawns anything, and names
+/// what it found on the fetcher's command line. The fetcher applies exactly
+/// the layers it was named and exits non-zero before answering anything if
+/// it cannot apply one of them, so a layer is either asked for and applied,
+/// or not asked for -- never asked for and quietly missing, which is the
+/// failure a sandbox is most likely to have and least likely to show.
+///
+/// Deciding here also keeps the decision on the side that can be trusted
+/// with it: a fetcher that chose its own confinement would be a process
+/// under an attacker's influence choosing how confined to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KernelConfinement {
+    /// The Landlock ABI this kernel implements, or `None` where it has no
+    /// Landlock at all.
+    ///
+    /// The number is not passed to the fetcher. It asks the same question
+    /// itself and builds its handled-access mask from its own answer,
+    /// because a mask naming an access bit the kernel does not know is
+    /// refused outright rather than narrowed.
+    landlock_abi: Option<u32>,
+    /// Whether this kernel offers the seccomp action the fetcher's filter
+    /// uses, which kills the process rather than failing the call.
+    seccomp_kill: bool,
+}
+
+impl KernelConfinement {
+    /// Ask the running kernel what it can provide.
+    ///
+    /// Both questions are side-effect free: neither confines this process,
+    /// installs anything on it or opens a descriptor that would then cross
+    /// the `fork` into a child whose whole descriptor set is accounted for.
+    fn probe() -> Self {
+        KernelConfinement {
+            landlock_abi: landlock_abi(),
+            seccomp_kill: seccomp_kill_available(),
+        }
+    }
+
+    /// The command-line argument naming every layer this kernel can provide.
+    ///
+    /// A kernel that can provide nothing still gets an explicit `none`
+    /// rather than no argument: the fetcher then refuses a list it cannot
+    /// make sense of, and an argument that went missing between here and
+    /// there cannot read as "nothing was asked for".
+    fn confine_argument(&self) -> String {
+        let mut layers: Vec<&str> = Vec::new();
+        if self.landlock_abi.is_some() {
+            layers.push(LAYER_LANDLOCK);
+        }
+        if self.seccomp_kill {
+            layers.push(LAYER_SECCOMP);
+        }
+        if layers.is_empty() {
+            layers.push(LAYER_NONE);
+        }
+        format!("{CONFINE_FLAG}{}", layers.join(","))
+    }
+
+    /// One line per layer, for a caller that asked for verbosity.
+    ///
+    /// The lines say what this kernel offers and what the fetcher was
+    /// therefore asked for, which is what this side knows: the asking and
+    /// the applying are two different moments, and a line claiming a policy
+    /// is in force belongs with the code that puts it there.
+    ///
+    /// Said on this side because this side is where the answer is known, and
+    /// said only under `--verbose` because a default run of an operation
+    /// reading a local file writes nothing to stderr and a `file://` input
+    /// is not a reason to change that. A kernel that cannot provide a layer
+    /// is not a failure -- the run goes ahead -- so the operator who wants
+    /// to know asks, and the lines name the layer either way.
+    fn report(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(match self.landlock_abi {
+            Some(abi) => format!(
+                "instar: this kernel provides {LAYER_LANDLOCK} (ABI {abi}), so the fetcher is \
+                 asked to leave itself no reachable path"
+            ),
+            None => format!(
+                "instar: this kernel has no {LAYER_LANDLOCK}, so the fetcher runs without a \
+                 filesystem policy"
+            ),
+        });
+        lines.push(if self.seccomp_kill {
+            format!(
+                "instar: this kernel can kill on a {LAYER_SECCOMP} violation, so the fetcher is \
+                 asked to allow itself only the syscalls it serves with"
+            )
+        } else {
+            format!(
+                "instar: this kernel cannot kill on a {LAYER_SECCOMP} violation, so the fetcher \
+                 runs without a syscall policy"
+            )
+        });
+        lines
+    }
+}
+
+/// The Landlock ABI the running kernel implements, or `None` if it has none.
+fn landlock_abi() -> Option<u32> {
+    // SAFETY: landlock_create_ruleset has no glibc wrapper, so it is reached
+    // through syscall(2) with the arguments the version query is defined to
+    // take: a null attribute pointer, a zero size and the version flag. In
+    // that form the kernel reads nothing through the pointer, creates no
+    // ruleset and returns the ABI version, and the result is checked before
+    // it is used.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    u32::try_from(abi).ok().filter(|abi| *abi > 0)
+}
+
+/// Whether this kernel offers the seccomp action that kills the process.
+///
+/// Asked with `SECCOMP_GET_ACTION_AVAIL`, which answers whether the action
+/// exists and changes nothing about the caller: it installs no filter and
+/// leaves this process's own seccomp state as it was. Reading this process's
+/// own seccomp mode is not the same question -- it reports what *this*
+/// process is already under, which says nothing about what a child could
+/// install -- and the kill action is the one the fetcher's filter uses, so
+/// the availability of a weaker action would not do.
+fn seccomp_kill_available() -> bool {
+    let action = libc::SECCOMP_RET_KILL_PROCESS;
+    // SAFETY: seccomp(2) has no glibc wrapper either. The action-availability
+    // operation reads the one u32 the third argument points at -- a local
+    // that outlives the call -- and writes nothing; it returns 0 when the
+    // action exists and -1 with EOPNOTSUPP when it does not.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_GET_ACTION_AVAIL,
+            0_usize,
+            std::ptr::addr_of!(action),
+        )
+    };
+    ret == 0
+}
+
+/// Set both the soft and the hard limit of `resource` to `value`.
+///
+/// Called between `fork` and `exec`, so it builds the limit on the stack and
+/// makes one syscall: no allocation, no lock, no formatting. The hard limit
+/// goes down with the soft one deliberately, because a limit the process can
+/// raise again is not a limit on a process that has been taken over.
+fn set_hard_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    // SAFETY: setrlimit reads the rlimit it is handed and nothing else. The
+    // value lives in this frame for the whole call, and the result is
+    // checked.
+    if unsafe { libc::setrlimit(resource, &limit) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Duplicate `fd` onto a descriptor number at or above [`FIRST_STAGING_FD`],
 /// close-on-exec.
@@ -442,8 +654,14 @@ fn spawn_fetcher_binary(
     let staged_socket_fd = staged_socket.as_raw_fd();
     let staged_file_fd = staged_file.as_raw_fd();
 
+    // Asked before the spawn, so that the layers the child is told to apply
+    // are the ones this kernel really has, and so that the answer can be
+    // reported to a caller who asked for it.
+    let confinement = KernelConfinement::probe();
+
     let mut command = Command::new(fetcher);
     command
+        .arg(confinement.confine_argument())
         .arg(CHILD_SOCKET_FD.to_string())
         .arg(CHILD_FILE_FD.to_string())
         // The child is assumed hostile, and instar's stdout is the output a
@@ -467,20 +685,64 @@ fn spawn_fetcher_binary(
         } else {
             Stdio::null()
         });
+    // What this closure does and does not do is the parent's half of the
+    // confinement, and both halves are deliberate.
+    //
+    // It sets what only a parent can set. The three limits have to be in
+    // place before the image of a new program exists, and `no_new_privs` has
+    // to be set by something the fetcher cannot later be talked out of: once
+    // set it cannot be unset, which is what makes it a promise that no
+    // `exec` of the fetcher's -- it makes none -- could gain privilege, and
+    // it is also the precondition for an unprivileged process installing a
+    // seccomp filter on itself at all.
+    //
+    // It does not set a file-size limit, although a fetcher that writes
+    // nothing looks like a free win for one. Its stderr is a file the caller
+    // chose: `instar info --verbose file:///x 2>log` makes it a regular
+    // file, and a zero file-size limit turns the fetcher's first diagnostic
+    // line into a SIGXFSZ. The limit would kill the process for printing
+    // what it was asked to print.
+    //
+    // It does not make the child undumpable either. What that would protect
+    // against is a process of the same uid attaching to the fetcher, and
+    // such a process can attach to instar itself just as easily, so it is
+    // not a boundary; the fetcher holds no secret of its own beyond an image
+    // the invoking user already owns. What it would cost is this side's own
+    // diagnostics: `/proc/<pid>` of the child becomes unreadable even to its
+    // parent, and reading it is how the descriptor set is asserted and how
+    // an operator straces a fetcher that is misbehaving. The crash-dump
+    // worry it is usually reached for is covered by the core limit below.
+    //
     // SAFETY: the closure runs in the child between `fork` and `exec`, where
     // only async-signal-safe work is permitted: a thread holding a lock in
     // the parent did not come across the fork, so taking that lock here
     // would deadlock a process that can never be released. It therefore
-    // calls `dup2` twice and nothing else. It captures two descriptor
-    // numbers by value, allocates nothing, locks nothing and formats
-    // nothing; `io::Error::last_os_error` only records errno, and the
-    // message for it is rendered by the parent.
+    // makes two `dup2` calls, three `setrlimit` calls and one `prctl`, and
+    // nothing else. It captures two descriptor numbers by value, allocates
+    // nothing, locks nothing and formats nothing; `io::Error::last_os_error`
+    // only records errno, and the message for it is rendered by the parent.
+    //
+    // The limits come after the two `dup2` calls, which is the only order
+    // that works: the descriptors being copied are staged on numbers that
+    // may be above the new ceiling, and lowering it first would leave them
+    // uncopyable.
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(staged_socket_fd, CHILD_SOCKET_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::dup2(staged_file_fd, CHILD_FILE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // A fetcher serves one file on one socket in one thread; it has
+            // no reason to fork, and the limit is enforced at `fork` rather
+            // than at `exec`, so setting it here costs the `exec` nothing.
+            set_hard_limit(libc::RLIMIT_NPROC, 0)?;
+            // A core dump of the fetcher would be the image's bytes written
+            // somewhere nobody asked for them.
+            set_hard_limit(libc::RLIMIT_CORE, 0)?;
+            set_hard_limit(libc::RLIMIT_NOFILE, CHILD_MAX_FILES)?;
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -512,6 +774,16 @@ fn spawn_fetcher_binary(
         client: None,
     };
     source.client = Some(FetchClient::new(ours)?);
+
+    // Said after the init exchange rather than before it, so that the lines
+    // describe what happened: a fetcher that could not apply a layer it was
+    // named exits before it replies, and there would have been no init to
+    // complete.
+    if inherit_stderr {
+        for line in confinement.report() {
+            eprintln!("{line}");
+        }
+    }
     Ok(source)
 }
 
@@ -833,6 +1105,254 @@ mod tests {
             BTreeSet::from([0, 1, 2, CHILD_SOCKET_FD, CHILD_FILE_FD]),
             "the fetcher holds descriptors it was not given"
         );
+    }
+
+    /// The soft and hard limit `/proc/<pid>/limits` reports for `label`.
+    ///
+    /// The file is a fixed-width table whose first column is a label with
+    /// spaces in it, so the line is found by its label and the two numbers
+    /// are the first two fields of what is left.
+    fn reported_limit(limits: &str, label: &str) -> (String, String) {
+        let line = limits
+            .lines()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("/proc/<pid>/limits has no {label:?} line:\n{limits}"));
+        let mut fields = line[label.len()..].split_whitespace();
+        let soft = fields.next().expect("a soft limit").to_string();
+        let hard = fields.next().expect("a hard limit").to_string();
+        (soft, hard)
+    }
+
+    #[test]
+    fn the_child_serves_under_the_limits_the_parent_set() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        // Read of a fetcher that has completed its init exchange, so the
+        // limits are asserted of a process that got far enough to serve
+        // rather than of one that died on its way up.
+        let mut source = spawn_fetcher_binary(&fetcher_binary(), &path, true)
+            .expect("spawn a fetcher under the limits");
+        let mut byte = [0u8; 1];
+        source
+            .client_mut()
+            .read_at(7, &mut byte)
+            .expect("a confined fetcher still answers a read");
+        assert_eq!(byte[0], pattern(7));
+
+        let limits = std::fs::read_to_string(format!("/proc/{}/limits", source.pid()))
+            .expect("a live fetcher has a /proc/<pid>/limits");
+        assert_eq!(
+            reported_limit(&limits, "Max processes"),
+            ("0".to_string(), "0".to_string()),
+            "the fetcher can fork:\n{limits}"
+        );
+        assert_eq!(
+            reported_limit(&limits, "Max core file size"),
+            ("0".to_string(), "0".to_string()),
+            "a crash would write the image's bytes to a core dump:\n{limits}"
+        );
+        assert_eq!(
+            reported_limit(&limits, "Max open files"),
+            (CHILD_MAX_FILES.to_string(), CHILD_MAX_FILES.to_string()),
+            "the fetcher's descriptor ceiling is not the one it was given:\n{limits}"
+        );
+    }
+
+    #[test]
+    fn the_child_cannot_gain_privilege_by_exec() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path, true).expect("spawn a fetcher");
+
+        let status = std::fs::read_to_string(format!("/proc/{}/status", source.pid()))
+            .expect("a live fetcher has a /proc/<pid>/status");
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("NoNewPrivs:"))
+            .expect("a kernel that reports NoNewPrivs");
+        assert_eq!(
+            line.split_whitespace().nth(1),
+            Some("1"),
+            "the fetcher runs without no_new_privs, so a setuid binary it exec'd could gain \
+             privilege and it could not install a filter on itself: {line}"
+        );
+    }
+
+    #[test]
+    fn the_probe_reports_what_this_kernel_answers() {
+        let probed = KernelConfinement::probe();
+
+        // The same two questions, asked independently of the code under
+        // test, so that a probe which answered from a constant or got the
+        // argument order wrong disagrees here.
+        // SAFETY: the version query takes a null attribute pointer and a
+        // zero size by definition, creates nothing and returns the ABI.
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0_usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        assert_eq!(
+            probed.landlock_abi,
+            u32::try_from(abi).ok().filter(|abi| *abi > 0),
+            "the probe disagrees with this kernel's own landlock_create_ruleset version query \
+             (which returned {abi})"
+        );
+
+        let action = libc::SECCOMP_RET_KILL_PROCESS;
+        // SAFETY: the action-availability operation reads the u32 the third
+        // argument points at and writes nothing.
+        let avail = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_GET_ACTION_AVAIL,
+                0_usize,
+                std::ptr::addr_of!(action),
+            )
+        };
+        assert_eq!(
+            probed.seccomp_kill,
+            avail == 0,
+            "the probe disagrees with this kernel's own SECCOMP_GET_ACTION_AVAIL (which \
+             returned {avail})"
+        );
+    }
+
+    /// How many probes the leak test makes.
+    ///
+    /// Many, because the question is asked of a process whose other tests
+    /// are opening and closing descriptors of their own at the same time: a
+    /// probe that created one descriptor each time leaves a mark far larger
+    /// than that churn, where a single probe's leak would be lost in it.
+    const PROBES_FOR_THE_LEAK_TEST: usize = 200;
+
+    /// How much concurrent descriptor churn the leak test tolerates.
+    ///
+    /// The suite runs one test thread per core, and a test of this module
+    /// holds a socketpair, an image and a child while it runs, so the
+    /// descriptors other tests hold during this one's measurement are a
+    /// two-figure number on a sixteen-core machine and larger on a bigger
+    /// one. The allowance is set well above that and still far below the
+    /// mark a probe leaking one descriptor each time would leave.
+    const CHURN_ALLOWANCE: usize = 64;
+
+    #[test]
+    fn probing_confines_nothing_and_opens_nothing() {
+        let before = own_descriptor_count();
+        let mode_before = own_seccomp_mode();
+        for _ in 0..PROBES_FOR_THE_LEAK_TEST {
+            let _ = KernelConfinement::probe();
+        }
+        let after = own_descriptor_count();
+
+        assert_eq!(
+            own_seccomp_mode(),
+            mode_before,
+            "the probe changed the seccomp state of the privileged side, which is the process \
+             holding the user's credentials; asking what the kernel can do must not be a way of \
+             confining the asker"
+        );
+        assert!(
+            after <= before + CHURN_ALLOWANCE,
+            "{PROBES_FOR_THE_LEAK_TEST} probes took this process from {before} descriptors to \
+             {after}, so the probe leaks one; a leaked descriptor crosses the fork into a \
+             fetcher whose whole descriptor set is accounted for"
+        );
+    }
+
+    /// This process's own seccomp mode.
+    ///
+    /// Compared before and against after rather than against zero, because
+    /// it is not zero everywhere this runs: the unit tests run inside a
+    /// container whose runtime has already installed a filter of its own, so
+    /// the mode reads as filtered before instar does anything. That is the
+    /// reason the layer probe does not ask this question of the kernel --
+    /// it describes the asker, not what a child could install -- and the
+    /// property worth asserting is that asking changed nothing.
+    fn own_seccomp_mode() -> libc::c_int {
+        // SAFETY: PR_GET_SECCOMP takes no further argument and only reports
+        // the calling thread's own seccomp mode.
+        unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) }
+    }
+
+    /// How many descriptors this process holds.
+    fn own_descriptor_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("this process has a /proc/self/fd")
+            .count()
+    }
+
+    #[test]
+    fn the_argument_names_every_layer_the_kernel_offers() {
+        let both = KernelConfinement {
+            landlock_abi: Some(6),
+            seccomp_kill: true,
+        };
+        assert_eq!(both.confine_argument(), "--confine=landlock,seccomp");
+
+        let filesystem_only = KernelConfinement {
+            landlock_abi: Some(1),
+            seccomp_kill: false,
+        };
+        assert_eq!(filesystem_only.confine_argument(), "--confine=landlock");
+
+        let syscalls_only = KernelConfinement {
+            landlock_abi: None,
+            seccomp_kill: true,
+        };
+        assert_eq!(syscalls_only.confine_argument(), "--confine=seccomp");
+    }
+
+    #[test]
+    fn a_kernel_that_offers_nothing_is_still_asked_explicitly() {
+        let neither = KernelConfinement {
+            landlock_abi: None,
+            seccomp_kill: false,
+        };
+        assert_eq!(
+            neither.confine_argument(),
+            "--confine=none",
+            "a kernel with no layers has to be named as such, so that a lost argument cannot \
+             read as a run nobody asked to confine"
+        );
+    }
+
+    #[test]
+    fn the_report_names_each_layer_whether_or_not_it_was_applied() {
+        let both = KernelConfinement {
+            landlock_abi: Some(6),
+            seccomp_kill: true,
+        };
+        let applied = both.report();
+        assert_eq!(applied.len(), 2, "one line per layer: {applied:?}");
+        assert!(
+            applied[0].contains(LAYER_LANDLOCK) && applied[0].contains("ABI 6"),
+            "the landlock line does not say what was applied: {:?}",
+            applied[0]
+        );
+        assert!(
+            applied[1].contains(LAYER_SECCOMP),
+            "the seccomp line does not name the layer: {:?}",
+            applied[1]
+        );
+
+        let neither = KernelConfinement {
+            landlock_abi: None,
+            seccomp_kill: false,
+        };
+        let refused = neither.report();
+        assert_eq!(refused.len(), 2, "one line per layer: {refused:?}");
+        for (line, layer) in refused.iter().zip([LAYER_LANDLOCK, LAYER_SECCOMP]) {
+            assert!(
+                line.contains(layer) && line.contains("without"),
+                "a layer this kernel cannot provide is not reported as missing: {line:?}"
+            );
+        }
     }
 
     #[test]
