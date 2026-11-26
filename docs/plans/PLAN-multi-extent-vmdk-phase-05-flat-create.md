@@ -828,3 +828,50 @@ divergence because it matches qemu-img's outcome.
 
 `pre-commit run --all-files` twelve of twelve, including the hook that
 bans source line references under `docs/`.
+
+## Definition of done: results
+
+Run on the committed tree at `f899f08d`, 2026-11-27 (AEDT). All
+eighteen pass. Two items were reworded during execution, both recorded
+above with the measurement that forced it.
+
+| # | Result | How it was checked |
+|---|---|---|
+| 1 | Pass | `test_descriptor_extent_names_and_lengths_match_the_pin` over the six plain pins, and `test_five_gib_writes_three_extents_of_the_pinned_lengths` end to end |
+| 2 | Pass | Same tests; 5 GiB gives 2 GiB, 2 GiB, 1 GiB, and every length asserted is an apparent length |
+| 3 | Pass | `test_instar_info_reads_back_what_create_wrote` at 1 MiB, 5 GiB and 21 GiB |
+| 4 | Pass | `test_one_byte_past_the_ceiling_is_refused_and_writes_nothing` |
+| 5 | Pass | `test_the_largest_accepted_size_writes_sixty_four_extents` |
+| 6 | Pass, **reworded** | The item named a 1025-extent pin that does not exist; it is now the `5G-existing-extent` pin, asserted by two tests -- one reading the measurement out of the pin, one running instar against the same case |
+| 7 | Pass, **reworded** | The user-visible refusal is `create`'s own size check, not the split plan's zero-extent guard, which is unreachable from the CLI; the integration test asserts the real message and 5a's unit test covers the inner guard |
+| 8 | Pass | `test_a_pre_existing_derived_extent_is_refused_byte_for_byte`, by sha256 over each of `f001` to `f003` |
+| 9 | Pass | `test_a_pre_existing_descriptor_is_still_overwritten` |
+| 10 | Pass | 5a's unit tests on the split path, and `vmdk_flat_extent_path_tests` unchanged and passing: `monolithicFlat` reaches the same predicate through a two-line adapter, so its messages are identical by construction |
+| 11 | Pass | 5c's six tests for both subformats, plus the inverted integration test from 5c part two |
+| 12 | Pass | `test_the_sparse_split_subformat_is_refused_with_what_is_supported`, and no `phase`, `PLAN-`, `.md`, "yet" or year anywhere near the refusal text |
+| 13 | Pass | Over the whole phase the `main.rs` diff's hunks run 9903 then 16994 onward; the convert validator is at 16802, so no hunk touches it, and the diff against `src/operations/` is empty |
+| 14 | Pass | The phase diff against `src/shared/` is empty, so `CreateConfig.vmdk_subformat` still documents three values. The host-side number 4 lives only in the VMM's own option struct |
+| 15 | Pass | `tools/mutate-differencing.sh`, four new cases, 4 PASS / 0 FAIL / 0 BROKEN, harness exit 0, re-run by the management session with `src/` confirmed restored. `EXPECTED_CASES` 183 |
+| 16 | Pass | `docs/create.md` carries all three statements: the 128 GiB limit, that it is instar's and qemu-img has none, and the cost of re-running a failed create |
+| 17 | Pass | `pre-commit run --all-files` twelve of twelve with new files `git add -N`'d; `make test-rust` 3178 passed, 0 failed, 3 ignored, summed from 83 `test result:` lines rather than read from an exit code; the integration selection classified by `tools/ci/check-stestr-run.sh` as 292 of 304 executed, 12 skipped, against 304 discovered, no worker lost |
+| 18 | Pass | `scripts/check-binary-sizes.sh` exit 0, every binary inside its region, core at **70672 bytes, 55% of its 128 KiB region**. The before equals the after: the phase diff against `src/core/`, `src/operations/`, `src/shared/` and `src/crates/` is empty, so nothing the guest's memory map depends on moved |
+
+The twelve skips in the integration selection are pre-existing
+baseline-matrix and round-trip cases for qcow2, vhd and raw. All
+thirteen of this phase's integration tests are recorded `success`,
+checked per test rather than inferred from the total, because a
+pin-gated test that skipped would have made the run prove nothing.
+
+## Review gap worth carrying forward
+
+`make test-rust` and `pre-commit run --all-files` both pass on a tree
+whose Python integration suite is failing, which is how step 5c's
+missed pin survived review. **A change to host-visible behaviour needs
+the integration suite run, not only the Rust tests and the gate.**
+
+Three of the seven step rows had factual claims that needed correcting
+during execution -- 5d's site map, 5e's pinned cases, 5g's page set --
+and all three failed the same way: the survey recorded what it expected
+to find rather than enumerating it. A survey claim of the form "there
+are N of these" should be produced by a command whose output is kept,
+not by reading until the expected number appears.
