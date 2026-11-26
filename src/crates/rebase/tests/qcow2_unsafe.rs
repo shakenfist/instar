@@ -25,6 +25,10 @@ fn build_overlay(backing_path: &[u8]) -> Vec<u8> {
 }
 
 fn build_overlay_recording(backing_path: &[u8], format: ImageFormat) -> Vec<u8> {
+    build_overlay_with(backing_path, Some(format))
+}
+
+fn build_overlay_with(backing_path: &[u8], format: Option<ImageFormat>) -> Vec<u8> {
     let opts = Qcow2CreateOpts {
         virtual_size: VIRTUAL_SIZE,
         cluster_size: CLUSTER_SIZE,
@@ -34,7 +38,7 @@ fn build_overlay_recording(backing_path: &[u8], format: ImageFormat) -> Vec<u8> 
         compat_v3: true,
         backing: Some(BackingRef {
             path: backing_path,
-            format: Some(format),
+            format,
         }),
         preallocation: qcow2::create::Preallocation::Off,
     };
@@ -251,6 +255,54 @@ fn a_caller_with_no_format_to_state_leaves_the_record_alone() {
         parse_header_extensions(&bytes, &header_post).backing_format,
         BackingFormat::Qcow2
     );
+}
+
+#[test]
+fn an_overlay_that_records_no_format_keeps_recording_none() {
+    // `qemu-img create -b` without `-F` writes no backing-format
+    // extension at all. There is no slot to rewrite, and adding one
+    // would move every extension behind it, so the record stays
+    // absent: the planner writes the path and the header fields and
+    // nothing else. This branch writes nothing, so only a test tells
+    // "left alone on purpose" from "the record lookup broke".
+    let mut bytes = build_overlay_with(b"old.qcow2", None);
+    let header = QcowHeader::parse(&bytes).expect("parse pre");
+    let exts = parse_header_extensions(&bytes, &header);
+    assert_eq!(exts.backing_format, BackingFormat::None);
+    assert_eq!(exts.backing_format_offset, 0);
+    // Everything between the fixed header and the backing path is
+    // the extension area; none of it may change.
+    let ext_area = header.header_length as usize..header.backing_file_offset as usize;
+    let before = bytes[ext_area.clone()].to_vec();
+
+    let opts = Qcow2RebaseOpts {
+        mode: RebaseMode::Unsafe,
+        overlay_header: &bytes[..4096],
+        overlay_file_size: bytes.len() as u64,
+        refcount_table: &[],
+        refblock_host_offsets: &[],
+        refcount_blocks: &[],
+        refblock_count: 0,
+        new_backing_virtual_size: VIRTUAL_SIZE,
+        new_backing_path: b"new.raw00",
+        detach: false,
+        new_backing_format_name: b"raw",
+    };
+    let mut scratch = vec![0xccu8; 64 * 1024];
+    let out = plan_rebase_qcow2(&opts, &mut scratch).expect("rebase plan");
+    let plan = match out {
+        Qcow2RebaseOutput::Unsafe { plan } => plan,
+        Qcow2RebaseOutput::Safe { .. } => panic!("expected Unsafe"),
+    };
+    apply_rebase(&mut bytes, &plan);
+
+    let header_post = QcowHeader::parse(&bytes).expect("parse post");
+    assert_eq!(parsed_path(&bytes, &header_post), b"new.raw00");
+    assert_eq!(
+        parse_header_extensions(&bytes, &header_post).backing_format,
+        BackingFormat::None
+    );
+    assert_eq!(&bytes[ext_area], &before[..]);
 }
 
 #[test]

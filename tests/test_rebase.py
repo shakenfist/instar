@@ -46,7 +46,7 @@ paths don't.
 """
 
 import json
-import os
+import random
 import shutil
 import subprocess
 import tempfile
@@ -263,6 +263,41 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
             _, stderr, rc = self.run_instar_rebase(
                 td / 'qc.qcow2', '-b', 'nb.qcow2', '-F', 'qcow2')
             self.assertEqual(rc, 0, f'control rebase failed: {stderr!r}')
+
+    def test_unreadable_chain_member_refusal_leaves_a_snapshot_overlay_alone(self):
+        """The chain is refused before the overlay is written to.
+
+        A snapshot-bearing overlay is the case where a safe rebase
+        writes before it copies anything: it grows the refcount
+        structures for the worst-case copy-on-write first. The
+        refusal of a chain member the reader cannot serve has to
+        come before that, or the overlay is refused and changed at
+        once. 512-byte clusters make the worst case outgrow the
+        existing refblocks, so growth really does write here.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            for args in (['create', '-f', 'vmdk', 'base.vmdk', '1M'],
+                         ['create', '-f', 'qcow2', 'nb.qcow2', '1M'],
+                         ['create', '-f', 'qcow2', '-o', 'cluster_size=512',
+                          '-b', 'base.vmdk', '-F', 'vmdk', 'snap.qcow2', '1M'],
+                         ['snapshot', '-c', 's1', 'snap.qcow2']):
+                r = subprocess.run(['qemu-img', *args],
+                                   capture_output=True, text=True,
+                                   timeout=30, cwd=str(td))
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+            overlay = td / 'snap.qcow2'
+            before = overlay.read_bytes()
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'nb.qcow2', '-F', 'qcow2')
+            self.assertNotEqual(rc, 0, 'expected the vmdk member to be refused')
+            self.assertIn('a backing chain member is a format this build '
+                          'cannot read', stderr, f'unexpected stderr: {stderr}')
+            self.assert_bytes_identical(
+                overlay.read_bytes(), before,
+                'a refused rebase must not touch the snapshot-bearing overlay')
 
 
 # ----------------------------------------------------------------------
@@ -1664,7 +1699,7 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             # Headerless, so there is no signature to probe: the
             # recorded format is the only thing that says what this
             # file is.
-            (td / 'nb.raw').write_bytes(os.urandom(1 << 20))
+            (td / 'nb.raw').write_bytes(random.Random(0x6054).randbytes(1 << 20))
             overlay = td / 'ovl.qcow2'
             _, stderr, rc = self.run_instar_create(
                 '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
@@ -1720,7 +1755,7 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             self.assertEqual(r.returncode, 0, r.stderr)
             # Headerless: discovery names it `unknown`, and the format
             # the guest is told to read it as is what gets recorded.
-            (td / 'nb.raw').write_bytes(os.urandom(1 << 20))
+            (td / 'nb.raw').write_bytes(random.Random(0x6054).randbytes(1 << 20))
             overlay = td / 'ovl.qcow2'
             r = subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2', '-b', 'base.qcow2',
@@ -1909,11 +1944,12 @@ class TestRebaseUnidentifiedChainMember(TestRebaseSmoke):
     def _headerless_raw(self, path, size=1 << 20):
         """A raw image with no partition table and no magic.
 
-        `os.urandom` rather than a pattern: a file of repeated
-        bytes could match a format probe by accident, and the
-        point of the fixture is that nothing identifies it.
+        Pseudo-random bytes rather than a pattern: a file of
+        repeated bytes could match a format probe by accident, and
+        the point of the fixture is that nothing identifies it. The
+        seed is fixed so a failure replays with the same bytes.
         """
-        path.write_bytes(os.urandom(size))
+        path.write_bytes(random.Random(0x6054).randbytes(size))
 
     def _overlay_over(self, td, name, backing_name, backing_format):
         """A qcow2 overlay with one written cluster of its own."""

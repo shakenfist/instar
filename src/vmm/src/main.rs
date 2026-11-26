@@ -4532,7 +4532,10 @@ fn discover_backing_chain(
                         .as_ref()
                         .map(|(child, _)| child.as_path()),
                     &current,
-                    &format!("could not be described by the info operation: {e}"),
+                    &format!(
+                        "could not be described by the info operation: {}",
+                        terminal_safe(&e.to_string())
+                    ),
                 ) {
                     eprintln!("{reason}");
                     break;
@@ -13398,7 +13401,7 @@ fn run_rebase_guest(
     // Layout (must match shared::RebaseConfig exactly):
     //    0: magic                u32 ("REBA")
     //    4: overlay_format       u32
-    //    8: new_backing_format   u32 (0 = guest auto-detect)
+    //    8: new_backing_format   u32 (0 = no format stated)
     //   12: flags                u32
     //   16: sector_size          u32
     //   20: overlay_cluster_size u32

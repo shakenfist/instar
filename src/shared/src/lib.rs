@@ -4301,8 +4301,13 @@ pub struct RebaseConfig {
     pub magic: u32,
     /// Overlay format (`ImageFormat as u32`).
     pub overlay_format: u32,
-    /// New backing format (`ImageFormat as u32`); `0` means
-    /// "auto-detect via the standard format-probe path".
+    /// The new backing's format (`ImageFormat as u32`), which
+    /// selects the driver name a qcow2 overlay's backing-format
+    /// header extension records (see
+    /// [`ImageFormat::qemu_driver_name`]). `0` means no format is
+    /// stated: an existing record is left as it is. The host sends
+    /// `0` only for a detach; the guest never probes a format of
+    /// its own from this field.
     pub new_backing_format: u32,
     /// Flags. See `FLAG_*` constants.
     pub flags: u32,

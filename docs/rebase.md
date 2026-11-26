@@ -351,8 +351,11 @@ not be composed
  guest's chain reader, which serves qcow2, raw, VHD and VHDX
  members; a chain holding any other format -- a VMDK backing
  file, say, which `qemu-img rebase` reads -- is refused before
- anything is read, with a message naming the formats it can
- read. It used to be refused inside the per-cluster reader,
+ anything is read or written, with a message naming the formats
+ it can read. That includes an overlay with internal snapshots,
+ where a safe rebase grows the refcount structures before it
+ copies anything: the chain is checked first, so the refused
+ overlay is byte-for-byte what it was. It used to be refused inside the per-cluster reader,
  which could only report that a read had failed, and that
  surfaced as `ERROR_PARSE_FAILED`: "the overlay's header could
  not be parsed", about an overlay that parses perfectly well.
