@@ -276,7 +276,7 @@ in parallel.
 | 5d. CLI wiring | medium | sonnet | worktree | Extend `is_vmdk_flat_create` (`src/vmm/src/main.rs`, two lines) and `create`'s subformat validation to accept `twoGbMaxExtentFlat` and route it to 5b. Refuse `twoGbMaxExtentSparse` per decision 7. Find every create-side subformat validation site -- there is more than one, and the owners are not what this row first claimed. `create`'s own `-o subformat=` mapper (the arm whose error reads `create: bad value`) **must** change, or `-o subformat=twoGbMaxExtentFlat` is refused as a bad value; only `measure`'s identical-looking mapper and its string-to-number match are the ones to leave alone, along with `convert`'s `--subformat` value list and its validator. Note the trap in `apply_create_overrides`: a `-o` subformat round-trips through a number and back to a string with `_ => "monolithicSparse"` as its fallback, so a new string added to the forward mapper and not the reverse one silently creates a monolithicSparse image instead of being refused. Commit subject: "Accept twoGbMaxExtentFlat in create." |
 | 5e. Tests against the real oracle | high | opus | worktree | Integration tests under `tests/`. The descriptor oracle is already committed: phase 1's pinned cases in `tests/golden/qemu-create-pins.json`, reachable through `tests/helpers/qemu_pins.py`, and the static per-version `qemu-img` builds in `instar-testdata`. There are **seven** pinned flat cases, and their names carry their units: `vmdk-multi-flat-1M` (1 extent), `-2G` (1), `-2049M` (2), `-4G` (2), `-5G` (3), `-21G` (11), and `-5G-existing-extent` (3). **Every one of them is within the 64-extent ceiling, so all are comparable** -- the largest is 11 extents. Compare all six plain cases byte for byte; there is no pinned case past the ceiling, so decision 2's refusal is proven by instar's own arithmetic at unit level and not against a pin. The seventh case is the one to read carefully: `vmdk-multi-flat-5G-existing-extent` pins `rc: 0` and an unchanged descriptor for a create whose extent already existed, which is the measurement that makes decision 1 a divergence rather than a preference. Assert against it that instar refuses where qemu succeeded, and cite the pin. Assert instar's end-to-end `create` descriptor is byte-identical to qemu's for the five comparable sizes with `$CID` substituted, and that every extent file exists with the length the pin implies. Extend `scripts/create-vmdk-flat-testdata.sh`'s split-flat case rather than writing a new generator. Remember that `tests/` is copied to `/tmp` for the packaged run, so no test may resolve a path outside it -- `tools/ci/check-tests-relocatable.sh` enforces this and runs in CI. Classify the suite run with `tools/ci/check-stestr-run.sh`, never stestr's totals block. Commit subject: "Test split flat create against qemu's pins." |
 | 5f. Mutation-check the three refusals | medium | sonnet | worktree | The master plan requires it for any test meant to prove a refusal. Break each of 5a's three refusals and decision 5's cleanup fix in turn, on a copy, and confirm a named test fails and names the right thing. Restore from the copy, never with `git checkout <dir>`. Run each mutant under `timeout` and count a timeout as killed. Leave the mutations in a runnable script and record its path and the kill count in the execution notes. Commit subject: "Mutation-check split create's refusals." |
-| 5g. Documentation | medium | sonnet | worktree | `docs/create.md` has three places to change, all found already: the per-format table whose vmdk row lists the three subformats, the `-o` option list that repeats them, and the opening paragraph that says the monolithicFlat path does not require KVM -- which is now true of a second subformat. Add the new subformat, the 128 GiB limit with the reason it is instar's and not qemu's, and the pre-existing-extent refusal stated as the trade-off decision 1 describes, including its cost to the user. `docs/output-formats.md` already names the `twoGbMaxExtent*` subformats on the read side, where it describes the `/extents.N` children; say there that one of them can now be written. `docs/vmdk/vmdk-extents.md` (phase 4's page): the path derivation rule and the refusals, next to the naming rule already there. State the qemu divergences as divergences. Nothing under `docs/` outside `docs/plans/` may carry a `file.rs:123` line reference: the `docs-line-references` pre-commit hook rejects them and excludes only plan files, so name the function rather than the line. Commit subject: "Document split flat create." |
+| 5g. Documentation | medium | sonnet | worktree | This row undercounted the work; the full set was mapped before the step ran. `docs/create.md` has **seven** places, not three: the opening paragraph saying the monolithicFlat path does not require KVM (now true of two subformats), the per-format subformat table row, the backing-file refusal sentence, the `-o subformat` key list, the `backing_file` note, the `zeroed_grain` refusal note, and the "Rejected (instar doesn't emit these subformats)" list, which must keep `twoGbMaxExtentSparse` and drop `twoGbMaxExtentFlat`. **Two pages beyond the three named here also carry the roster:** `docs/format-coverage.md`, which says in prose that `create` and convert write monolithicSparse, streamOptimized and monolithicFlat and that "neither writes the split twoGbMaxExtent subformats" -- now false for `create` and still true for convert -- and whose vmdk create row repeats the list; and `ARCHITECTURE.md`'s creatable-format roster, which names monolithicFlat as the host-written one. Add the new subformat, the 128 GiB limit with the reason it is instar's and not qemu's, and the pre-existing-extent refusal stated as the trade-off decision 1 describes, including its cost to the user. `docs/output-formats.md` already names the `twoGbMaxExtent*` subformats on the read side, where it describes the `/extents.N` children; say there that one of them can now be written. `docs/vmdk/vmdk-extents.md` (phase 4's page): the path derivation rule and the refusals, next to the naming rule already there. State the qemu divergences as divergences. Nothing under `docs/` outside `docs/plans/` may carry a `file.rs:123` line reference: the `docs-line-references` pre-commit hook rejects them and excludes only plan files, so name the function rather than the line. Commit subject: "Document split flat create." |
 
 ## Risks and mitigations
 
@@ -782,3 +782,49 @@ independent directions: this mutant, and the contradicting test pair
 recorded under step 5c part two. The second is the stronger of the
 two, because it shows the defect was pinned as intended behaviour
 rather than merely left untested.
+
+**Step 5g, 2026-11-27.** Documentation. `docs/create.md` gains a
+`twoGbMaxExtentFlat` section -- the naming rule, the holes, the
+sync-before-descriptor order, a refusal table, the divergence with its
+cost, and the unsupported sparse subformat -- plus the seven existing
+places the row's correction above enumerates. `docs/format-coverage.md`,
+`ARCHITECTURE.md`'s creatable roster, `docs/output-formats.md` and
+`docs/vmdk/vmdk-extents.md` carry the rest.
+
+**The row as planned named three pages and three places; the real set
+was five pages and nine places, and the row is corrected above.** Two
+of the pages the survey missed were the ones most likely to mislead:
+`docs/format-coverage.md` stated in prose that neither `create` nor
+convert writes the split subformats, which this phase makes false for
+`create` while leaving it true for convert, and `ARCHITECTURE.md`'s
+roster named `monolithicFlat` as the only host-written one. This is the
+third row whose factual claims needed correcting during execution,
+after 5d's site map and 5e's pin facts, and all three failed the same
+way: **the survey recorded what it expected to find rather than
+enumerating it.** Worth doing differently in the next phase's survey.
+
+**One error found by reading the rendered text rather than the diff,
+which is what this phase's risk table asks of the management session.**
+The new section claimed the descriptor is what qemu-img writes "without
+its DDB lines and with a constant CID". That is backwards: phase 4
+adopted the `ddb.*` block, the emitter writes all six lines, and the
+pinned descriptors contain them -- which is what step 5e asserts byte
+identity against. The one sentence summarising this phase's headline
+property contradicted it. It now says the descriptor is byte for byte
+qemu-img's, disk database lines included, apart from the `CID`, where
+qemu-img writes a random value and instar a constant one.
+
+Two smaller corrections by the management session: `ARCHITECTURE.md`
+wraps at about 71 columns and the new text ran to 94, so the sentence
+was rewrapped (the first attempt only moved the overflow to the next
+line); and `docs/format-coverage.md`'s new prose stated the convert
+case twice, so it was tightened to one sentence.
+
+The grain-size fact is documented as measured: qemu-img has no
+grain-size option for vmdk at any subformat, so `--grain-size` is
+instar's own extension, accepted for the sparse subformats and refused
+for both flat ones, and the refusal is **not** described as a
+divergence because it matches qemu-img's outcome.
+
+`pre-commit run --all-files` twelve of twelve, including the hook that
+bans source line references under `docs/`.

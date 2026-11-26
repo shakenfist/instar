@@ -124,9 +124,10 @@ documented in
 Measurable target formats are raw, qcow2, vmdk and vpc (VHD), plus vhdx
 where qemu-img has no `measure` implementation at all. Creatable target
 formats are raw, qcow2, vmdk (monolithicSparse and streamOptimized in
-the guest, monolithicFlat written on the host), vpc (dynamic and fixed)
-and vhdx (dynamic and fixed). Backing-file references are supported on
-qcow2, vmdk, vpc and vhdx. Of those four, qemu-img
+the guest, monolithicFlat and twoGbMaxExtentFlat written on the
+host), vpc (dynamic and fixed) and vhdx (dynamic and fixed).
+Backing-file references are supported on qcow2, vmdk, vpc and vhdx.
+Of those four, qemu-img
 permits backing references only on qcow2 and vmdk -- it refuses `-b`
 for vpc and vhdx -- so those two are an instar-only capability.
 A differencing VHD (`disk_type=4`) or VHDX (`HasParent` set) child
