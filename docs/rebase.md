@@ -153,7 +153,12 @@ a rebase that changes format rewrites it: without `-F`, to the
 format chain discovery found for the new backing; with `-F`, to
 what `-F` says. `-u` is no exception -- the new backing is still
 opened to discover its format, so `rebase -u -b new.raw` records
-`raw` with no `-F` given.
+`raw` with no `-F` given. A v2 (`compat=0.10`) overlay is no
+exception either: qemu writes the record into v2 headers too, at
+offset 72, and rebase finds and rewrites it there. The record is
+looked for in the overlay's first sector, where qemu and instar
+always put it; one a third-party writer placed further out is left
+as it was.
 
 The name written is the driver's, as `qemu-img rebase -F <driver>`
 would write it, for every format discovery identifies: `vpc` for

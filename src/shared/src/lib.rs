@@ -4495,14 +4495,15 @@ impl RebaseResult {
     /// claiming none). Refused before any image mutation where
     /// staging detects it.
     pub const ERROR_OVERLAY_INCONSISTENT: u32 = 16;
-    /// The overlay records a backing format whose header
-    /// extension cannot hold the new backing's driver name at its
-    /// existing padded width. Recording the truth would move
+    /// The overlay records a backing format in a header extension
+    /// whose padded width differs from the new backing's driver
+    /// name's, in either direction. Recording the truth would move
     /// every extension behind it, and recording nothing would
     /// leave the overlay claiming its old backing's format, so
-    /// the rebase is refused instead. Every name rebase can
-    /// record pads to one 8-byte slot, so this is a guard against
-    /// a hand-made header rather than a workflow a user meets.
+    /// the rebase is refused instead. Every name rebase can record
+    /// pads to one 8-byte slot except `parallels`, which pads to
+    /// 16, so a user meets this only rebasing to or from a
+    /// Parallels backing; otherwise it guards a hand-made header.
     pub const ERROR_BACKING_FORMAT_SLOT: u32 = 17;
     /// A member of the old or new chain is a format this build's
     /// chain reader cannot serve, so the rebase is refused before
@@ -6074,11 +6075,18 @@ mod tests {
                 !name.is_empty(),
                 "{format:?} (code {code}) has no qemu driver name"
             );
-            // The rebase planner rewrites the record in place and has
-            // one 16-byte padded slot of scratch for it.
+            // The rebase planner rewrites the record in place, so a
+            // rebase between two formats works only when their names
+            // pad to the same width (see `push_backing_format_patch`
+            // in crates/rebase). Every name pads to 8 except
+            // `parallels`, which pads to 16 and is what the planner's
+            // scratch slot is sized for. A new 9-to-16 byte name
+            // would join parallels' width class and be refused on
+            // every rebase to or from an 8-byte one, so adding one
+            // has to be a deliberate decision made here.
             assert!(
-                name.len() <= 16,
-                "{format:?}'s driver name {name:?} is wider than a record slot"
+                name.len() <= 8 || name == "parallels",
+                "{format:?}'s driver name {name:?} does not pad to the 8-byte record width"
             );
         }
     }

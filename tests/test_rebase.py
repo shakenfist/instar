@@ -46,13 +46,13 @@ paths don't.
 """
 
 import json
-import random
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.headerless import headerless_bytes
 from helpers.info_json import assert_info_equivalent
 from helpers.snapshot_readback import snapshot_readback
 
@@ -215,7 +215,6 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
             self.assert_bytes_identical(
                 overlay.read_bytes(), before,
                 'a refused rebase must not touch the qed overlay')
-
 
     def test_unreadable_chain_member_names_its_own_reason(self):
         """A VMDK backing is refused as a chain member it cannot read.
@@ -1699,7 +1698,7 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             # Headerless, so there is no signature to probe: the
             # recorded format is the only thing that says what this
             # file is.
-            (td / 'nb.raw').write_bytes(random.Random(0x6054).randbytes(1 << 20))
+            (td / 'nb.raw').write_bytes(headerless_bytes(1 << 20))
             overlay = td / 'ovl.qcow2'
             _, stderr, rc = self.run_instar_create(
                 '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
@@ -1730,6 +1729,50 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             self.assertEqual(r.returncode, 0,
                              f'qemu-img check: {r.stdout!r} {r.stderr!r}')
 
+    def test_v2_overlay_records_the_new_backing_format(self):
+        """A compat=0.10 overlay's record is rewritten as well.
+
+        qemu writes the backing-format extension into a v2 header too,
+        at offset 72, and the extension parser rebase used to locate
+        it reads nothing from a v2 header. So a v2 overlay kept naming
+        its old backing's format, which is #972 for every overlay
+        `qemu-img create -o compat=0.10 -F` made. instar's own create
+        only writes v3, so qemu-img makes this fixture.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(td / 'base.qcow2'), '1M')
+            self.assertEqual(rc, 0, stderr)
+            (td / 'nb.raw').write_bytes(headerless_bytes(1 << 20))
+            overlay = td / 'ovl.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o', 'compat=0.10',
+                 '-b', 'base.qcow2', '-F', 'qcow2', 'ovl.qcow2', '1M'],
+                capture_output=True, text=True, timeout=30, cwd=str(td))
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', 'nb.raw', '-F', 'raw')
+            self.assertEqual(rc, 0, f'rebase failed: stderr={stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+            info = json.loads(r.stdout)
+            self.assertEqual(info['format-specific']['data']['compat'], '0.10')
+            self.assertEqual(info.get('backing-filename'), 'nb.raw')
+            self.assertEqual(
+                info.get('backing-filename-format'), 'raw',
+                'the v2 overlay still records its old backing\'s format')
+            r = subprocess.run(['qemu-img', 'check', str(overlay)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img check: {r.stdout!r} {r.stderr!r}')
 
     def test_safe_rebase_without_f_records_the_discovered_format(self):
         """With no `-F`, the record is the format discovery found.
@@ -1755,7 +1798,7 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             self.assertEqual(r.returncode, 0, r.stderr)
             # Headerless: discovery names it `unknown`, and the format
             # the guest is told to read it as is what gets recorded.
-            (td / 'nb.raw').write_bytes(random.Random(0x6054).randbytes(1 << 20))
+            (td / 'nb.raw').write_bytes(headerless_bytes(1 << 20))
             overlay = td / 'ovl.qcow2'
             r = subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2', '-b', 'base.qcow2',
@@ -1831,7 +1874,6 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
                                        capture_output=True, text=True, timeout=60)
                     self.assertEqual(r.returncode, 0,
                                      f'qemu-img check: {r.stdout!r} {r.stderr!r}')
-
 
     def test_unsafe_rebase_names_a_format_rebase_cannot_read(self):
         """`-u` onto a VDI, VMDK descriptor or qcow records its driver.
@@ -1949,7 +1991,7 @@ class TestRebaseUnidentifiedChainMember(TestRebaseSmoke):
         the point of the fixture is that nothing identifies it. The
         seed is fixed so a failure replays with the same bytes.
         """
-        path.write_bytes(random.Random(0x6054).randbytes(size))
+        path.write_bytes(headerless_bytes(size))
 
     def _overlay_over(self, td, name, backing_name, backing_format):
         """A qcow2 overlay with one written cluster of its own."""

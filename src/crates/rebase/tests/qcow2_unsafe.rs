@@ -330,7 +330,7 @@ fn a_name_that_would_move_the_extensions_is_refused() {
     let mut scratch = vec![0u8; 64 * 1024];
     assert_eq!(
         plan_rebase_qcow2(&opts, &mut scratch).err(),
-        Some(RebaseError::BackingFormatSlotTooSmall)
+        Some(RebaseError::BackingFormatSlotWidth)
     );
 }
 
@@ -346,7 +346,7 @@ fn the_widest_name_is_rewritten_in_its_own_slot() {
         // `BackingFormat` has no Parallels member, so the parsed enum
         // says only "not one we know"; the bytes are the real check.
         (&b"parallels"[..], Ok(BackingFormat::Unknown)),
-        (&b"raw"[..], Err(RebaseError::BackingFormatSlotTooSmall)),
+        (&b"raw"[..], Err(RebaseError::BackingFormatSlotWidth)),
     ] {
         let mut bytes = build_overlay_recording(b"old.hdd", ImageFormat::Parallels);
         let header = QcowHeader::parse(&bytes).expect("parse pre");

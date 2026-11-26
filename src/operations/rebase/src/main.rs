@@ -36,6 +36,7 @@ use qcow2_write_exec::{execute, growth, read_bytes, CallTableIo, Regions};
 use rebase::{
     plan_rebase_qcow2, plan_rebase_vmdk, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError,
     RebaseMode, RebasePatch, RebasePlan, VmdkRebaseOpts, VmdkRebaseOutput,
+    QCOW2_PLAN_SCRATCH_REQUIRED,
 };
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ChainConfig,
@@ -249,8 +250,8 @@ const _: () = assert!(
 const _: () = assert!(PLANNER_BOUNCE_LIMIT >= COMPARE_BUF_SIZE);
 const _: () = assert!(PROBE_L2_LIMIT >= COMPARE_BUF_SIZE);
 const _: () = assert!(OVERLAY_L2_LIMIT / COMPARE_BUF_SIZE >= 2);
-// The deferred-metadata planner needs 12 + 1024 bytes.
-const _: () = assert!(SAFE_PLAN_SCRATCH_LIMIT >= 12 + 1024);
+// The qcow2 planners' scratch carve, summed where they carve it.
+const _: () = assert!(SAFE_PLAN_SCRATCH_LIMIT >= QCOW2_PLAN_SCRATCH_REQUIRED);
 
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
@@ -319,7 +320,7 @@ fn map_rebase_error(e: RebaseError) -> u32 {
         RebaseError::DescriptorTooLarge => RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
         RebaseError::ParseFailed => RebaseResult::ERROR_PARSE_FAILED,
         RebaseError::Overflow => RebaseResult::ERROR_INTERNAL_OVERFLOW,
-        RebaseError::BackingFormatSlotTooSmall => RebaseResult::ERROR_BACKING_FORMAT_SLOT,
+        RebaseError::BackingFormatSlotWidth => RebaseResult::ERROR_BACKING_FORMAT_SLOT,
     }
 }
 
@@ -1968,21 +1969,25 @@ fn chain_segment_is_readable(
 /// v1 supports qcow2, raw, vhd and vhdx chain members: the
 /// rebase binary enables `vhd-input` / `vhdx-input`, so the
 /// shared chain reader composes a differencing VHD or VHDX the
-/// same way `convert` and `bench` do. A vmdk chain member still
-/// forces the call to return `false`, because `vmdk-input` is
-/// not enabled here and without it the qcow2 crate's chain
-/// reader falls through to `read_raw_sectors` for an
-/// unrecognised format, which would silently misread vmdk data
-/// as raw sectors. Future work tracks promotion to a shared
+/// same way `convert` and `bench` do. This function does not
+/// check the member formats itself: `vmdk-input` is not enabled
+/// here, so the qcow2 crate's chain reader would read a vmdk
+/// member through `read_raw_sectors` and silently misread it,
+/// and it is [`chain_segment_is_readable`], run once per segment
+/// before the comparison loop, that keeps such a member from
+/// reaching this call. Future work tracks promotion to a shared
 /// crate that handles the full chain-member set.
 ///
 /// # Safety
 ///
 /// `call_table` must be valid. `chain_config` must describe the
-/// referenced devices. `chain_states` must already be
-/// initialised for every qcow2 member via
-/// [`qcow2::init_chain_states`]. `out_buf` must point to at
-/// least `cluster_size` writable bytes.
+/// referenced devices. [`chain_segment_is_readable`] must have
+/// returned `true` for `[chain_first, chain_first + chain_count)`:
+/// that is the only format check on this path, and the only bound
+/// keeping the segment's indices below `MAX_CHAIN_DEVICES`.
+/// `chain_states` must already be initialised for every qcow2
+/// member via [`qcow2::init_chain_states`]. `out_buf` must point
+/// to at least `cluster_size` writable bytes.
 unsafe fn read_chain_cluster(
     call_table: &CallTable,
     chain_first: u32,
@@ -1994,6 +1999,11 @@ unsafe fn read_chain_cluster(
     out_buf: *mut u8,
     sector_size: usize,
 ) -> bool {
+    debug_assert!(chain_segment_is_readable(
+        chain_config,
+        chain_first,
+        chain_count
+    ));
     if chain_count == 0 {
         // No chain at this slot range: read as zeros. Mirrors
         // the all-unallocated path inside the qcow2 chain

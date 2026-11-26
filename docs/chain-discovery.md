@@ -332,7 +332,17 @@ deliberately never rewritten into POSIX convention before that check
 runs — inventing a host path out of a drive letter and then testing the
 invention against the allowlist would be a path-traversal primitive, not
 a convenience, so a locator of this kind always ends the walk with the
-Windows-absolute-path reason, never a "not found" one. A relative VHDX
+Windows-absolute-path reason, never a "not found" one. Only the Windows
+conventions are classified this way. A protocol-style reference
+(`http://host/path`, `nbd:host:port`, `json:{...}`) is something
+`qemu-img` would hand to a protocol driver, but instar treats it as a
+relative POSIX file name, joins it onto the image's directory and
+resolves it like any other — so a file planted at
+`<dir>/http:/host/path` would be opened. The allowlist still bounds
+where that can land, and treating these as file names rather than
+protocols is the safer choice the CVE-2024-4467 tests pin; whether to
+refuse a leading `<scheme>:` outright is an open policy question rather
+than something this check decides. A relative VHDX
 locator does not have this problem: it arrives already rendered into
 POSIX convention (`vhdx-diff-parent.vhdx`, not `.\vhdx-diff-parent.vhdx`)
 before the host ever sees it, and resolves like any other relative name.

@@ -169,7 +169,7 @@ fuzz_target!(|data: &[u8]| {
     // carved from the pool tail as well. An empty name, or a
     // name whose padded width does not match the slot already
     // in the header, leaves the extension alone or returns
-    // BackingFormatSlotTooSmall; both are ignored below.
+    // BackingFormatSlotWidth; both are ignored below.
     let new_backing_format_name: &[u8] = if detach {
         &[]
     } else {

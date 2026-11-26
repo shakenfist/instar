@@ -120,7 +120,6 @@ The classes are:
 """
 
 import json
-import random
 import re
 import shutil
 import struct
@@ -129,6 +128,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.headerless import headerless_bytes
 
 
 # Every differencing fixture, with the format name that must appear in
@@ -3520,7 +3520,7 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
         # format check has to see the name discovery gave it, not the
         # one the guest would be told to read it as. The seed is fixed
         # so a failure replays with the same bytes.
-        path.write_bytes(random.Random(0x6054).randbytes(16 * 1024 * 1024))
+        path.write_bytes(headerless_bytes(16 * 1024 * 1024))
 
     def _qed_parent(self, path):
         self._qemu_img_parent(path, '-f', 'qed')

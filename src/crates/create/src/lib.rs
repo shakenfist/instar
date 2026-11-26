@@ -2248,6 +2248,25 @@ mod qcow2_plan_tests {
     }
 
     #[test]
+    fn plan_qcow2_records_an_iso_backing_as_raw() {
+        // The record names a qemu *driver*, and qemu has none called
+        // `iso`: an overlay recording it is one qemu-img refuses to
+        // open. An ISO is read through the raw driver, so that is
+        // the name written -- the spelling `rebase` records too,
+        // from the same `ImageFormat::qemu_driver_name` table.
+        let mut opts = default_opts(1 << 30);
+        opts.backing = Some(BackingRef {
+            path: b"base.iso",
+            format: Some(ImageFormat::Iso),
+        });
+        let bytes = run_round_trip(&opts);
+        let parsed = qcow2::QcowHeader::parse(&bytes).expect("parse header");
+        let exts = qcow2::parse_header_extensions(&bytes, &parsed);
+        let data = exts.backing_format_offset;
+        assert_eq!(&bytes[data..data + exts.backing_format_len], b"raw");
+    }
+
+    #[test]
     fn plan_qcow2_minimum_file_size_matches_layout() {
         let opts = default_opts(1 << 30);
         let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
