@@ -495,3 +495,71 @@ reviewed tree, 3168 passed, 0 failed, 3 ignored over 83 binaries --
 the 3164 baseline plus this step's four -- with all four named in the
 run rather than inferred from the total, and `pre-commit run
 --all-files` twelve of twelve.
+
+**Step 5c, 2026-11-27.** The cleanup fix of decision 5, in
+`src/vmm/src/main.rs` alone (+267/-62). `VmdkCreatedFiles` records each
+opened path together with whether this run brought it into existence,
+tested with `symlink_metadata` immediately before the truncating open,
+and `remove_created` removes only the files flagged as this run's. Both
+flat writers open every file through it, which unified the duplicated
+`OpenOptions` closure step 5b left for exactly this purpose.
+
+**The defect was pinned as intended behaviour by its own test.**
+`flat_failure_after_opening_removes_the_descriptor` asserted that a
+failed create leaves no descriptor -- that is, that it deletes the
+pre-existing file it had truncated -- and `git log -S` puts it in
+`6c1cd8f4`, the commit that first shipped host-side `monolithicFlat`
+create. It passed on every tree since, including this branch's. The
+replacement asserts the opposite on the identical scenario, so it
+would have failed before this change; that contradiction is the
+mutation evidence for this step, and step 5f need not re-derive it.
+
+It also settles decision 5's recorded counter-argument more sharply
+than the decision did. Filing the defect as an issue would have left
+it behind a green test asserting it was correct, which is why reading
+the code was the only way to find it.
+
+Six tests, both halves of the guarantee for both subformats: a
+pre-existing descriptor survives a failure, and the files the run did
+create are still removed so a failure leaves no litter. For the split
+subformat the descriptor's contents survive intact, because that
+writer opens it last and a part-way failure never truncates it; a
+pre-existing derived extent cannot arise there at all, since step 5a
+refuses it before anything is opened, so no test pretends to cover it.
+
+Two limits are stated in the code rather than papered over. A
+pre-existing extent for `monolithicFlat`, and the split descriptor
+once truncated, are not injectable end to end -- the only portable
+failure injection fires at an open, and every later failure needs a
+full filesystem or permission games -- so both truncated-then-kept
+cases are proven at the helper's own level, where the bookkeeping
+lives.
+
+A symlink at the output path now counts as the path being taken, so
+the link is no longer unlinked; previously the link was removed and
+its target left truncated. Both leave the target truncated, and
+keeping the link follows the same rule as the rest of the step.
+
+The helper takes a `render` closure so each writer keeps its existing
+path quoting -- `Path::display` for the single-extent path,
+`terminal_safe_path` for the split one. Unifying them on the escaping
+form would be an improvement, but it changes a shipped error message
+in a commit that has to stay revertable alone, so it was left.
+
+Convert shares no part of this cleanup: it shares only
+`vmdk_flat_extent_path`, and its own `EmptyOutputCleanup` /
+`remove_empty_output` pair already removes a zero-length regular file
+only. No convert behaviour changes here, so nothing needed deciding.
+
+**Surfaced, not fixed: `run_create_raw` has the same defect class** --
+a failure after `create_raw_finalize` unlinks the output whether or
+not this run created it. It is a different code path with its own
+callers, this phase has no mandate over `create -f raw`, and widening
+the phase is the operator's call. Reported to the operator on
+2026-11-27 rather than folded in or filed unilaterally.
+
+Verified by the management session: `make test-rust` re-run on the
+reviewed tree, 3173 passed, 0 failed, 3 ignored over 83 binaries --
+3168 plus six new, minus the removed defect test -- with all six named
+in the run and the removed one confirmed absent from it, and
+`pre-commit run --all-files` twelve of twelve.

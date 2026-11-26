@@ -22838,6 +22838,85 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The files a flat VMDK create has opened, and which of them it
+/// brought into existence.
+///
+/// Opening the output truncates it, so a create that fails part-way
+/// through has to undo what it did. Removing everything it opened is
+/// the wrong undo: the descriptor is a path the user named, and create
+/// overwrites a file the user named by design, so a failed create
+/// would delete a file the user had before it ran. Removing only the
+/// files that were not there when this run opened them leaves such a
+/// file where it was found -- empty, because the open truncated it,
+/// which is also what qemu-img leaves behind when its own create
+/// fails. The guarantee is that create does not delete a file it did
+/// not make; keeping the contents of one it truncated would mean
+/// copying the file aside before opening it, which is a different and
+/// much larger promise, and not one qemu-img makes either.
+///
+/// Both flat create paths open every file through here, so there is
+/// one answer for the descriptor and for every extent.
+#[derive(Debug, Default)]
+struct VmdkCreatedFiles {
+    /// One entry per file opened, in the order it was opened: the path,
+    /// and whether this run is what created it.
+    opened: Vec<(std::path::PathBuf, bool)>,
+}
+
+impl VmdkCreatedFiles {
+    /// Open `path` the way create opens its output -- created if it is
+    /// absent, truncated if it is not, mode 0644 -- and record whether
+    /// this run created it.
+    ///
+    /// A file is this run's if it was not there when this run went to
+    /// open it, tested immediately before the open with
+    /// `symlink_metadata`, which is the test the derived-extent
+    /// refusal uses. The test is not atomic and is not claimed to be:
+    /// between the stat and the open, anyone who can write to the
+    /// output's directory could put a file at the path, and a later
+    /// failure would then remove a file this run did not create. The
+    /// output path and its directory are the invoking user's own
+    /// choice, which puts that party outside the untrusted-image
+    /// threat model this project defends. A dangling symlink counts as
+    /// the path being taken, so neither the link nor the file the open
+    /// creates through it is removed.
+    ///
+    /// `render` formats the path for the failure message, because the
+    /// two writers quote their paths differently: the split writer's
+    /// derived names are refused for `"`, CR and LF but not for other
+    /// control characters, so it escapes them before they reach a
+    /// terminal.
+    fn open(
+        &mut self,
+        path: &Path,
+        render: impl Fn(&Path) -> String,
+    ) -> Result<std::fs::File, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let existed = std::fs::symlink_metadata(path).is_ok();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(path)
+            .map_err(|e| format!("create: open '{}' failed: {}", render(path), e))?;
+        self.opened.push((path.to_path_buf(), !existed));
+        Ok(file)
+    }
+
+    /// Remove the files this run created, for a create that failed
+    /// after making some of them. Anything that was already there is
+    /// left exactly as the open found it.
+    fn remove_created(&self) {
+        for (path, created) in &self.opened {
+            if *created {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Host-side monolithicFlat VMDK creation: a sparse raw extent and the
 /// text descriptor that names it.
 ///
@@ -22850,10 +22929,12 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// one convert writes.
 ///
 /// The arguments were validated before this runs, so nothing is opened
-/// for a refused command. Once a file has been opened (and so truncated),
-/// any failure removes every file this call opened. A symlink is followed
-/// when opened and only the link is removed, so the file it points at is
-/// left truncated, as `run_create_raw` leaves it.
+/// for a refused command. Once a file has been opened (and so
+/// truncated), any failure removes the files this call created, and
+/// leaves the ones that were already there -- see `VmdkCreatedFiles`.
+/// A symlink is followed when opened, and counts as the path being
+/// taken, so the link stays and the file it points at is left
+/// truncated.
 fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let size_str = args
         .size
@@ -22865,7 +22946,7 @@ fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
 
     let descriptor_path = Path::new(&args.filename);
     let (extent_path, extent_name) = vmdk_flat_extent_path(descriptor_path, "create")?;
-    let mut opened = Vec::new();
+    let mut opened = VmdkCreatedFiles::default();
     let result = write_vmdk_flat(
         descriptor_path,
         &extent_path,
@@ -22876,9 +22957,7 @@ fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     let descriptor_len = match result {
         Ok(n) => n,
         Err(e) => {
-            for path in &opened {
-                let _ = std::fs::remove_file(path);
-            }
+            opened.remove_created();
             return Err(e);
         }
     };
@@ -22888,32 +22967,21 @@ fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Write a monolithicFlat VMDK for `run_create_vmdk_flat`, returning the
-/// descriptor's length. Each file is pushed onto `opened` as soon as it
-/// has been opened, so the caller can remove exactly those on failure.
+/// descriptor's length. Every file is opened through `opened`, which
+/// records which of them this run created so the caller can remove
+/// exactly those on failure.
 fn write_vmdk_flat(
     descriptor_path: &Path,
     extent_path: &Path,
     extent_name: &str,
     virtual_size: u64,
-    opened: &mut Vec<std::path::PathBuf>,
+    opened: &mut VmdkCreatedFiles,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let open = |path: &Path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o644)
-            .open(path)
-            .map_err(|e| format!("create: open '{}' failed: {}", path.display(), e))
-    };
-
-    let mut descriptor = open(descriptor_path)?;
-    opened.push(descriptor_path.to_path_buf());
-    let extent = open(extent_path)?;
-    opened.push(extent_path.to_path_buf());
+    let render = |path: &Path| path.display().to_string();
+    let mut descriptor = opened.open(descriptor_path, render)?;
+    let extent = opened.open(extent_path, render)?;
 
     extent.set_len(virtual_size).map_err(|e| {
         format!(
@@ -22955,7 +23023,10 @@ fn write_vmdk_flat(
 /// `vmdk_split_create_plan` does all the refusing, before a file is
 /// opened, so nothing is created for a command that will be refused.
 /// Once a file has been opened (and so truncated), any failure removes
-/// every file this call opened.
+/// the files this call created, and leaves the ones that were already
+/// there -- see `VmdkCreatedFiles`. The plan has already refused a
+/// pre-existing extent, so the descriptor is the only file a split
+/// create can find in place.
 #[allow(dead_code)] // Create's subformat routing is its only caller; wiring it removes this.
 fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let size_str = args
@@ -22972,14 +23043,12 @@ fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::erro
     // the extent count, so this is at most 128 GiB and cannot overflow.
     let virtual_size = layout.total_sectors * 512;
 
-    let mut opened = Vec::new();
+    let mut opened = VmdkCreatedFiles::default();
     let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);
     let descriptor_len = match result {
         Ok(n) => n,
         Err(e) => {
-            for path in &opened {
-                let _ = std::fs::remove_file(path);
-            }
+            opened.remove_created();
             return Err(e);
         }
     };
@@ -22989,9 +23058,9 @@ fn run_create_vmdk_split_flat(args: &CreateArgs) -> Result<(), Box<dyn std::erro
 }
 
 /// Write a twoGbMaxExtentFlat VMDK for `run_create_vmdk_split_flat`,
-/// returning the descriptor's length. Each file is pushed onto `opened`
-/// as soon as it has been opened, so the caller can remove exactly those
-/// on failure.
+/// returning the descriptor's length. Every file is opened through
+/// `opened`, which records which of them this run created so the caller
+/// can remove exactly those on failure.
 ///
 /// Every extent is written and `fsync`ed before the descriptor is
 /// created, which is the reverse of the single-extent order and is
@@ -23004,24 +23073,12 @@ fn write_vmdk_split_flat(
     descriptor_path: &Path,
     layout: &vmdk::SplitLayout,
     paths: &VmdkExtentPaths,
-    opened: &mut Vec<std::path::PathBuf>,
+    opened: &mut VmdkCreatedFiles,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let open = |path: &Path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o644)
-            .open(path)
-            .map_err(|e| format!("create: open '{}' failed: {}", terminal_safe_path(path), e))
-    };
 
     for (index, (extent_path, _)) in paths.extents.iter().enumerate() {
-        let extent = open(extent_path)?;
-        opened.push(extent_path.clone());
+        let extent = opened.open(extent_path, terminal_safe_path)?;
         // The extent is a hole of this length, not this many bytes
         // written. The plan bounds the count at 64 extents of 2 GiB, so
         // the multiplication cannot overflow.
@@ -23043,8 +23100,7 @@ fn write_vmdk_split_flat(
     }
 
     let text = vmdk_split_descriptor(layout, &paths.prefix, &paths.postfix);
-    let mut descriptor = open(descriptor_path)?;
-    opened.push(descriptor_path.to_path_buf());
+    let mut descriptor = opened.open(descriptor_path, terminal_safe_path)?;
     descriptor.write_all(&text).map_err(|e| {
         format!(
             "create: write '{}' failed: {}",
@@ -24325,17 +24381,97 @@ mod create_option_tests {
         assert!(!text.contains(&0xAA));
     }
 
+    /// Half one of the create-only cleanup guarantee: a failed create
+    /// does not delete a file that was there before it ran. The
+    /// extent's name is taken by a directory, so opening it fails after
+    /// the descriptor has been opened and truncated.
     #[test]
-    fn flat_failure_after_opening_removes_the_descriptor() {
-        // The extent's name is taken by a directory, so opening it fails
-        // after the descriptor has been opened (and truncated).
+    fn flat_failure_keeps_the_descriptor_it_did_not_create() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("c.vmdk"), b"old").unwrap();
+        let descriptor = dir.path().join("c.vmdk");
+        std::fs::write(&descriptor, b"old").unwrap();
         std::fs::create_dir(dir.path().join("c-flat.vmdk")).unwrap();
         let err = create_flat(dir.path(), "c.vmdk", "1M", &[]).unwrap_err();
         assert!(err.contains("c-flat.vmdk"), "{}", err);
-        assert!(!dir.path().join("c.vmdk").exists());
+        assert!(
+            descriptor.exists(),
+            "a failed create deleted a descriptor it did not create"
+        );
+        // Empty, because the open truncated it before the failure. The
+        // guarantee is that create does not delete what it did not
+        // make, not that it keeps what it overwrote; qemu-img leaves a
+        // truncated file behind too.
+        assert_eq!(std::fs::metadata(&descriptor).unwrap().len(), 0);
         assert!(dir.path().join("c-flat.vmdk").is_dir());
+    }
+
+    /// Half two of the same guarantee: what the run did create is still
+    /// removed, so a failed create leaves no litter. Same injected
+    /// failure, with no descriptor in place beforehand.
+    #[test]
+    fn flat_failure_removes_the_descriptor_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("c-flat.vmdk")).unwrap();
+        let err = create_flat(dir.path(), "c.vmdk", "1M", &[]).unwrap_err();
+        assert!(err.contains("c-flat.vmdk"), "{}", err);
+        assert!(
+            !dir.path().join("c.vmdk").exists(),
+            "a failed create left the descriptor it had made"
+        );
+        assert!(dir.path().join("c-flat.vmdk").is_dir());
+    }
+
+    /// Run the split flat writer for `name` in `dir` with SIZE `size`.
+    /// Create's subformat routing does not reach it yet, so the
+    /// arguments are the ones clap parses rather than resolved ones;
+    /// the writer reads only the filename and the size.
+    fn create_split_flat(dir: &Path, name: &str, size: &str) -> Result<(), String> {
+        let out = dir.join(name);
+        let args = parse_create_cli(&[
+            "-q",
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=twoGbMaxExtentFlat",
+            out.to_str().unwrap(),
+            size,
+        ]);
+        run_create_vmdk_split_flat(&args).map_err(|e| e.to_string())
+    }
+
+    /// Half one of the guarantee for the split subformat. A directory
+    /// in the way of the second extent fails the write after the first
+    /// extent has been made. The descriptor is the only file a split
+    /// create can find in place -- a pre-existing extent is refused
+    /// before anything is opened -- and it survives.
+    ///
+    /// This writer opens the descriptor after every extent, so a
+    /// failure part-way cannot have truncated it; that it is also not
+    /// deleted once truncated is tested where the bookkeeping is.
+    #[test]
+    fn split_failure_keeps_the_descriptor_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = dir.path().join("s.vmdk");
+        std::fs::write(&descriptor, b"old").unwrap();
+        std::fs::create_dir(dir.path().join("s-f002.vmdk")).unwrap();
+        let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
+        assert!(err.contains("s-f002.vmdk"), "{}", err);
+        assert_eq!(std::fs::read(&descriptor).unwrap(), b"old");
+    }
+
+    /// Half two for the split subformat: the extent the run did make is
+    /// removed, and no descriptor is left behind.
+    #[test]
+    fn split_failure_removes_the_extents_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("s-f002.vmdk")).unwrap();
+        let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
+        assert!(err.contains("s-f002.vmdk"), "{}", err);
+        assert!(
+            !dir.path().join("s-f001.vmdk").exists(),
+            "a failed create left the extent it had made"
+        );
+        assert!(!dir.path().join("s.vmdk").exists());
     }
 
     #[test]
@@ -27401,7 +27537,7 @@ mod vmdk_split_flat_writer_tests {
         let dir = TempDir::new().unwrap();
         let descriptor = dir.path().join("out.vmdk");
         let (layout, paths) = plan(dir.path(), 5 * GIB);
-        let mut opened = Vec::new();
+        let mut opened = VmdkCreatedFiles::default();
         write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
 
         let lengths: Vec<u64> = paths.extents.iter().map(|(p, _)| apparent_len(p)).collect();
@@ -27416,7 +27552,7 @@ mod vmdk_split_flat_writer_tests {
         let dir = TempDir::new().unwrap();
         let descriptor = dir.path().join("out.vmdk");
         let (layout, paths) = plan(dir.path(), 5 * GIB);
-        let mut opened = Vec::new();
+        let mut opened = VmdkCreatedFiles::default();
         let reported = write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
 
         let needed = vmdk::build_split_descriptor(&mut [], 0, &layout, b"out", b".vmdk");
@@ -27442,7 +27578,7 @@ mod vmdk_split_flat_writer_tests {
         let dir = TempDir::new().unwrap();
         let descriptor = dir.path().join("out.vmdk");
         let (layout, paths) = plan(dir.path(), MAX_BYTES);
-        let mut opened = Vec::new();
+        let mut opened = VmdkCreatedFiles::default();
         write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened).unwrap();
 
         assert_eq!(paths.extents.len(), vmdk::MAX_EXTENTS);
@@ -27452,8 +27588,8 @@ mod vmdk_split_flat_writer_tests {
         assert!(apparent_len(&descriptor) > 0);
         // Every extent, then the descriptor: the order the files were
         // opened in, which is the order they were created in.
-        assert_eq!(opened.len(), vmdk::MAX_EXTENTS + 1);
-        assert_eq!(opened[vmdk::MAX_EXTENTS], descriptor);
+        assert_eq!(opened.opened.len(), vmdk::MAX_EXTENTS + 1);
+        assert_eq!(opened.opened[vmdk::MAX_EXTENTS].0, descriptor);
     }
 
     /// The descriptor is the only part of a split image that says what
@@ -27467,7 +27603,7 @@ mod vmdk_split_flat_writer_tests {
         let (layout, paths) = plan(dir.path(), 3 * EXTENT_BYTES);
         std::fs::create_dir(&paths.extents[1].0).unwrap();
 
-        let mut opened = Vec::new();
+        let mut opened = VmdkCreatedFiles::default();
         let err = write_vmdk_split_flat(&descriptor, &layout, &paths, &mut opened)
             .unwrap_err()
             .to_string();
@@ -27478,7 +27614,76 @@ mod vmdk_split_flat_writer_tests {
             "the descriptor outlived a write that never finished its extents"
         );
         assert!(!paths.extents[2].0.exists(), "a later extent was opened");
-        assert_eq!(opened, vec![PathBuf::from(&paths.extents[0].0)]);
+        assert_eq!(
+            opened.opened,
+            vec![(PathBuf::from(&paths.extents[0].0), true)]
+        );
         assert_eq!(apparent_len(&paths.extents[0].0), EXTENT_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod vmdk_created_files_tests {
+    //! Unit tests for `VmdkCreatedFiles`, the bookkeeping both flat
+    //! create writers open their files through.
+    //!
+    //! The two halves of its guarantee are tested apart: a file this
+    //! run created is removed when the create fails, and a file that
+    //! was already there is not. End-to-end coverage of both writers'
+    //! failure paths lives with the create tests; these cover what a
+    //! portable failure injection cannot reach through them. A
+    //! directory in the way is the only failure either writer can be
+    //! made to take without permission games or a full filesystem, and
+    //! it fires at an open -- so a monolithicFlat extent and a split
+    //! descriptor, both of which are opened after that point, are
+    //! never truncated-then-kept there.
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Half one: a file that was already there survives the cleanup.
+    #[test]
+    fn a_file_that_was_already_there_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("extent");
+        std::fs::write(&existing, b"bytes this run did not write").unwrap();
+
+        let mut opened = VmdkCreatedFiles::default();
+        opened
+            .open(&existing, |path| path.display().to_string())
+            .expect("the open truncates what it finds");
+        opened.remove_created();
+
+        assert!(
+            existing.exists(),
+            "the cleanup deleted a file this run did not create"
+        );
+        // Empty, because the open truncated it. Not deleted is the
+        // promise; unchanged would mean copying the file aside first.
+        assert_eq!(std::fs::metadata(&existing).unwrap().len(), 0);
+    }
+
+    /// Half two: a file this run created is removed, told apart from
+    /// one that was already there in the same set of open files.
+    #[test]
+    fn a_file_this_run_created_is_removed() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("descriptor");
+        let fresh = dir.path().join("extent");
+        std::fs::write(&existing, b"old").unwrap();
+
+        let mut opened = VmdkCreatedFiles::default();
+        for path in [&existing, &fresh] {
+            opened
+                .open(path, |path| path.display().to_string())
+                .expect("both opens succeed");
+        }
+        assert_eq!(
+            opened.opened,
+            vec![(existing.clone(), false), (fresh.clone(), true)]
+        );
+        opened.remove_created();
+
+        assert!(!fresh.exists(), "the cleanup left a file this run made");
+        assert!(existing.exists());
     }
 }
