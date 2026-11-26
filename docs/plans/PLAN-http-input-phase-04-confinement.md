@@ -225,6 +225,21 @@ plan.
     caller's own mode, which says nothing about whether a filter could
     be installed -- and the first draft of this plan said to use it.
 
+17. **The fetcher's socket I/O is `sendto` and `recvfrom`, so the
+    allowlist must permit both.** Measured on 2026-11-26 by `strace -ff`
+    of a real `instar info file://...` run, with the fetcher's own trace
+    identified by its `recvfrom(3, "INFT\1...")` init request, its
+    `sendto(3, ...)` reply and its `pread64(4, ...)` image reads:
+    `src/crates/fetch-protocol/src/socket.rs` sends with `libc::send`
+    and receives with `libc::recv`, and on x86_64 there is no `send`
+    syscall -- glibc issues `sendto` and `recvfrom`. The first draft of
+    this plan required `sendto` to be absent from the allowlist, which
+    would have killed the fetcher on its init reply. Corrected in row 4c
+    and in definition-of-done item 7. The same trace shows the last
+    `openat` is the runtime's own `/proc/self/maps`, five lines before
+    the first `recvfrom`, so `openat` really is deniable: nothing opens
+    anything after the policy goes on.
+
 What the survey corrected at source, in the master plan's phase 4
 section and the `index.md` row, as part of this phase's planning
 commit: that every layer is applied in the child before `exec`
@@ -314,8 +329,10 @@ step does not need to redo any of that.
     would buy -- no path in the filesystem is reachable -- is what the
     deny-all Landlock ruleset already buys (finding 3), and what an
     empty network namespace would buy is what denying `socket`,
-    `connect`, `sendto` and `bind` in the allowlist already buys, more
-    precisely and with a better failure mode. Against that, a user
+    `socketpair`, `connect` and `bind` in the allowlist already buys,
+    more precisely and with a better failure mode: the fetcher can send
+    only on the descriptor it was handed, because it can obtain no
+    other. Against that, a user
     namespace is a privilege transition: inside it the fetcher holds a
     full capability set over its own namespace, which is a strictly
     larger surface than the one it has now, and it is unavailable in
@@ -367,7 +384,7 @@ step does not need to redo any of that.
 |------|--------|-------|-----------|---------------------|
 | 4a | high | opus | none | **Measure the container tier, then set the parent's half.** First, the measurement the planning session could not make: write a throwaway Rust test that reports, from inside `make test-rust`'s container, the Landlock ABI (`landlock_create_ruleset(NULL, 0, 1)`), whether `prctl(PR_SET_NO_NEW_PRIVS)` then a one-instruction `SECCOMP_MODE_FILTER` install succeeds, and whether `unshare(CLONE_NEWUSER)` succeeds. Report the three results; do not commit that test. Then, in `src/vmm/src/fetch.rs`, add to the existing `pre_exec` closure (which phase 3 keeps allocation-free and lock-free -- read decision 7 and keep it that way): `setrlimit` for `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0 and `RLIMIT_NOFILE` 8, and `prctl(PR_SET_NO_NEW_PRIVS, 1)`. Do **not** set `RLIMIT_FSIZE` and do **not** set `PR_SET_DUMPABLE`; decisions 7, 12 and finding 7 say why, and a reviewer will check. Add a host-side probe module function that returns which layers this kernel can provide -- the Landlock ABI query, and `seccomp(SECCOMP_GET_ACTION_AVAIL)` for `SECCOMP_RET_KILL_PROCESS`, which finding 16 measured as side-effect free; do not use `PR_GET_SECCOMP`, which answers a different question -- and thread `--confine=<list>` into `spawn_fetcher_binary`'s argv from it. Unit-test the limits through `/proc/<pid>/limits` of a live fetcher (readable because decision 12 declined `PR_SET_DUMPABLE`), and the probe against the host's own ABI. Commit subject: "Set the fetcher's resource limits before exec." |
 | 4b | high | opus | none | **Deny the filesystem.** Create `src/fetch/src/confine.rs`, declared from `main.rs`. Implement the deny-all Landlock ruleset of decisions 8 and 17: query the ABI, build the handled-access mask for *that* ABI (finding 4 -- a mask with unknown bits is `EINVAL`), create the ruleset, `prctl(PR_SET_NO_NEW_PRIVS, 1)`, `landlock_restrict_self`, close the ruleset descriptor. The syscall numbers are 444 and 446 on x86_64; there is no glibc wrapper, so go through `libc::syscall`, and write the `SAFETY` comments in the shape `src/fetch/src/main.rs:199` already uses. Parse `--confine=` in `parse_args` per decision 14: unknown token refused, `none` accepted, a named layer that cannot be applied is a non-zero exit before any init reply. Call it from `serve` after `max_datagram` and before `initialise` (decision 6). Unit tests fork a child, apply the policy, and assert from the child's exit status that an inherited-descriptor `pread` still works and a fresh `open` of the same path fails -- finding 3 is the measurement to reproduce. Note for the test: the probe must synchronise before the parent inspects anything, for the reason in finding 6. Commit subject: "Deny the fetcher every path after startup." |
-| 4c | high | fable | none | **Deny every syscall the serving loop does not need.** The hardest step in the phase, and the one where a wrong answer reaches a user as a `SIGSYS` on a distro we did not test. In `src/fetch/src/confine.rs`, add the seccomp allowlist of decisions 9, 10 and 11. Method, in this order: build the fetcher, `strace -f -c` a real `instar info --verbose file:///<fixture>` run and a hostile-peer run from `src/fetch/tests/hostile_peer.rs`, and record the union of syscalls the *fetcher* makes after its setup -- that is the measured set, and it goes in the plan's execution notes with the command that produced it. Then write the cBPF allowlist by hand (`struct sock_filter` is `{u16 code, u8 jt, u8 jf, u32 k}`; check `arch == AUDIT_ARCH_X86_64` first and kill on a mismatch, then dispatch on `nr`), action `SECCOMP_RET_KILL_PROCESS`, installed with `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)` after `PR_SET_NO_NEW_PRIVS`. Add the margin of decision 10 as a separate, commented list -- the reviewer must be able to see which entries are measured and which are insurance. `socket`, `connect`, `bind`, `sendto` and `openat` must be absent, and a test must prove each absence rather than assert the list's contents. The enforcement test forks a child, installs the real filter, attempts the denied call, and asserts `WTERMSIG == SIGSYS`; finding 5 is the working shape. Commit subject: "Allow the fetcher only the syscalls it serves with." |
+| 4c | high | fable | none | **Deny every syscall the serving loop does not need.** The hardest step in the phase, and the one where a wrong answer reaches a user as a `SIGSYS` on a distro we did not test. In `src/fetch/src/confine.rs`, add the seccomp allowlist of decisions 9, 10 and 11. Method, in this order: build the fetcher, `strace -f -c` a real `instar info --verbose file:///<fixture>` run and a hostile-peer run from `src/fetch/tests/hostile_peer.rs`, and record the union of syscalls the *fetcher* makes after its setup -- that is the measured set, and it goes in the plan's execution notes with the command that produced it. Then write the cBPF allowlist by hand (`struct sock_filter` is `{u16 code, u8 jt, u8 jf, u32 k}`; check `arch == AUDIT_ARCH_X86_64` first and kill on a mismatch, then dispatch on `nr`), action `SECCOMP_RET_KILL_PROCESS`, installed with `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)` after `PR_SET_NO_NEW_PRIVS`. Add the margin of decision 10 as a separate, commented list -- the reviewer must be able to see which entries are measured and which are insurance. `socket`, `socketpair`, `connect`, `bind` and `openat` must be absent, and a test must prove each absence rather than assert the list's contents. `sendto` is **not** on that list and must be allowed: the reply path is `libc::send`, which is the `sendto` syscall on x86_64 (finding 17), so denying it kills the fetcher on its first reply. What makes an allowed `sendto` harmless is that `socket` and `socketpair` are denied, so the only descriptor it can ever name is the one the parent passed. The enforcement test forks a child, installs the real filter, attempts the denied call, and asserts `WTERMSIG == SIGSYS`; finding 5 is the working shape. Commit subject: "Allow the fetcher only the syscalls it serves with." |
 | 4d | high | opus | none | **Prove it end to end, and prove the tests bite.** Integration tests in `tests/test_info_safe.py`, in the `TestInfoFileUrl` class phase 3 added: stdout over a `file://` URL is still byte-identical to the path's, for both output formats, with the sandbox on (the parity oracle is the point of the phase 3 work and this is what says confinement did not break it); a default run is still silent on stderr; `--verbose` names the layers that were applied. Put the exit status and the non-emptiness *inside* the comparison, as phase 3's tests do -- comparing two failed runs is how a false pass happens. Then the mutations, one at a time, on a scratch copy restored from that copy rather than with `git checkout`, each under `timeout`: (a) the Landlock install removed -- 4b's open test must fail; (b) the seccomp install removed -- 4c's `SIGSYS` test must fail; (c) `pread64` dropped from the allowlist -- an end-to-end test must fail, and record how it presents; (d) the unknown-`--confine`-token refusal turned into a silent ignore -- a test must fail; (e) the "named layer could not be applied" path changed from a non-zero exit to a warning -- a test must fail. Record all five in `## Mutation results` with the test that caught each, and if one survives, say so and say what enforces the choice instead. Run `tools/ci/check-stestr-run.sh` over the integration run and quote its verdict, not the totals block. Commit subject: "Test the fetcher's sandbox, and the tests." |
 | 4e | medium | sonnet | none | **Document it, then close the phase.** `docs/crates/fetch-protocol.md`: extend the `Lifecycle` section phase 3 added with the confinement -- which layer is applied by which side and at which moment, what a kernel without Landlock means for the run, and what a `SIGSYS` exit tells the operator. Correct the `Current Status` section, which says nothing about confinement, and while in it rewrap the over-long line that ends "nothing here touches the network." `docs/info.md`'s `file://` section gains a sentence on what `--verbose` now prints. No plan, phase, step or decision numbers in any of it (`docs/plans/` is the only place those belong). Then the closeout: this phase's row in `docs/plans/PLAN-http-input.md` and `docs/plans/index.md`, the Future work entry for namespaces from decision 13 with its measurement, and the execution notes. Commit subject: "Document the fetcher's confinement." |
 
@@ -413,9 +430,12 @@ push.
    its exit status in a test that fails rather than hangs.
 6. A child with the real seccomp filter installed dies with `SIGSYS`
    on `socket`, and the test asserts `WTERMSIG`, not an errno.
-7. `socket`, `connect`, `bind`, `sendto` and `openat` are each proved
-   absent from the allowlist by a test that attempts the call, not by
-   an assertion about the filter's contents.
+7. `socket`, `socketpair`, `connect`, `bind` and `openat` are each
+   proved absent from the allowlist by a test that attempts the call,
+   not by an assertion about the filter's contents. `sendto` is allowed,
+   for the reason in finding 17, and what is asserted of it instead is
+   that the calls which would get the fetcher a second descriptor to
+   name are not.
 8. `instar-fetch --confine=nonsense` exits non-zero naming the
    token, and a `--confine=landlock` run on a kernel without Landlock
    exits non-zero before sending an init reply. Both asserted.
