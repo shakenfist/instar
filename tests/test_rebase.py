@@ -1647,8 +1647,11 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
     suite did not notice: every round-trip fixture rebases qcow2
     onto qcow2, where the stale record is accidentally right.
 
-    `-u` is the mode that reaches this on its own: it rewrites the
-    reference without opening either chain.
+    `-u` is the mode that reaches this most widely: it rewrites the
+    reference without reading either chain's data, so it accepts a
+    new backing in a format rebase cannot read. It still opens the
+    new backing to discover what it is, and what discovery found is
+    what gets recorded.
     """
 
     def test_unsafe_rebase_records_the_new_backing_format(self):
@@ -1793,6 +1796,90 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
                                        capture_output=True, text=True, timeout=60)
                     self.assertEqual(r.returncode, 0,
                                      f'qemu-img check: {r.stdout!r} {r.stderr!r}')
+
+
+    def test_unsafe_rebase_names_a_format_rebase_cannot_read(self):
+        """`-u` onto a VDI, VMDK descriptor or qcow records its driver.
+
+        These are backings safe mode refuses to read and `-u` accepts,
+        and `-F` cannot spell any of them, so the host's discovered
+        format is the only statement of what they are. Each used to
+        have no driver name in the record table and left the overlay
+        recording `qcow2` -- a header `qemu-img` then refuses to open,
+        after an instar rebase that exited 0.
+        """
+        self._require_qemu_tools()
+        cases = (
+            ('vdi', [], 'vdi'),
+            ('vmdk', ['-o', 'subformat=monolithicFlat'], 'vmdk'),
+            ('qcow', [], 'qcow'),
+        )
+        for create_format, options, recorded in cases:
+            with self.subTest(format=create_format):
+                with tempfile.TemporaryDirectory() as td:
+                    td = Path(td)
+                    overlay = self._overlay_over_qcow2(td)
+                    backing = f'nb.{create_format}'
+                    r = subprocess.run(
+                        ['qemu-img', 'create', '-f', create_format, *options,
+                         backing, '4M'],
+                        capture_output=True, text=True, timeout=30, cwd=str(td))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+                    _, stderr, rc = self.run_instar_rebase(
+                        overlay, '-u', '-b', backing)
+                    self.assertEqual(rc, 0, f'rebase failed: stderr={stderr!r}')
+
+                    r = subprocess.run(
+                        ['qemu-img', 'info', '--output=json', str(overlay)],
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(
+                        r.returncode, 0,
+                        f'qemu-img could not open the rebased overlay: {r.stderr!r}')
+                    info = json.loads(r.stdout)
+                    self.assertEqual(info.get('backing-filename'), backing)
+                    self.assertEqual(
+                        info.get('backing-filename-format'), recorded,
+                        'the overlay still records its old backing\'s format')
+
+    def test_a_record_that_cannot_change_width_is_refused(self):
+        """Onto a Parallels backing, the rebase refuses and writes nothing.
+
+        `parallels` is the one driver name that pads its record to 16
+        bytes rather than 8, and the record is rewritten in place, so
+        an overlay recording `qcow2` cannot be made to record it
+        without moving every header extension behind it. Leaving the
+        record alone would be the stale `qcow2` again; the refusal is
+        typed, and the overlay is left as it was, reference included.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            overlay = self._overlay_over_qcow2(td)
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'parallels', 'nb.hdd', '4M'],
+                capture_output=True, text=True, timeout=30, cwd=str(td))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            before = overlay.read_bytes()
+
+            _, stderr, rc = self.run_instar_rebase(overlay, '-u', '-b', 'nb.hdd')
+            self.assertNotEqual(rc, 0, 'a width-changing record must be refused')
+            self.assertIn('cannot be updated in place', stderr)
+            self.assertEqual(before, overlay.read_bytes(),
+                             'a refused rebase must leave the overlay untouched')
+
+    def _overlay_over_qcow2(self, td):
+        """A qcow2 overlay recording a `qcow2` backing, in `td`."""
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', 'base.qcow2', '4M'],
+            capture_output=True, text=True, timeout=30, cwd=str(td))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', '-b', 'base.qcow2',
+             '-F', 'qcow2', 'ovl.qcow2', '4M'],
+            capture_output=True, text=True, timeout=30, cwd=str(td))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return td / 'ovl.qcow2'
 
 
 # ----------------------------------------------------------------------

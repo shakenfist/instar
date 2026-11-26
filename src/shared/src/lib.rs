@@ -1938,6 +1938,43 @@ impl ImageFormat {
             ImageFormat::Dmg => "dmg",
         }
     }
+
+    /// The qemu block-driver name for this format: what a qcow2
+    /// overlay records in its `EXT_BACKING_FORMAT` header extension,
+    /// and what `qemu-img -F <driver>` writes there.
+    ///
+    /// This is not [`Self::name`]. qemu spells VHD `vpc`; it reads
+    /// VMDK3 and a VMDK descriptor through its one `vmdk` driver; and
+    /// it has no ISO driver, so an ISO is `raw` to it. A reader opens
+    /// the backing with whatever driver the record names, so a name
+    /// qemu does not have is refused as an unknown driver, and the
+    /// name of the wrong one is refused as the wrong format.
+    ///
+    /// `create` and `rebase` both write the record from this one
+    /// table, so they cannot come to spell a format differently. The
+    /// match is exhaustive so that a new format is given its driver
+    /// name here rather than falling into a default.
+    ///
+    /// `Unknown` has no driver and returns the empty string, which
+    /// both callers take as "record no format".
+    pub fn qemu_driver_name(&self) -> &'static str {
+        match self {
+            ImageFormat::Unknown => "",
+            ImageFormat::Raw | ImageFormat::Iso => "raw",
+            ImageFormat::Qcow2 => "qcow2",
+            ImageFormat::Qcow1 => "qcow",
+            ImageFormat::Vmdk4 | ImageFormat::Vmdk3 | ImageFormat::VmdkDescriptor => "vmdk",
+            ImageFormat::Vhd => "vpc",
+            ImageFormat::Vhdx => "vhdx",
+            ImageFormat::Vdi => "vdi",
+            ImageFormat::Qed => "qed",
+            ImageFormat::Luks => "luks",
+            ImageFormat::Parallels => "parallels",
+            ImageFormat::Bochs => "bochs",
+            ImageFormat::Cloop => "cloop",
+            ImageFormat::Dmg => "dmg",
+        }
+    }
 }
 
 /// Configuration for the info operation.
@@ -6011,6 +6048,44 @@ pub type OperationEntry = unsafe extern "C" fn() -> u64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_identified_format_has_a_qemu_driver_name() {
+        // A format with no driver name records none, and a rebase
+        // then leaves the overlay naming its *old* backing's format
+        // -- the stale record qemu-img refuses to open. Only
+        // `Unknown` may come back empty, and it is the code the host
+        // sends for "no format stated". Walking the wire codes rather
+        // than the variants means a new code that `from_u32` learns
+        // is checked here without anyone adding it.
+        assert_eq!(ImageFormat::from_u32(0).qemu_driver_name(), "");
+        for code in 1..=u8::MAX as u32 {
+            let format = ImageFormat::from_u32(code);
+            if format == ImageFormat::Unknown {
+                continue;
+            }
+            let name = format.qemu_driver_name();
+            assert!(
+                !name.is_empty(),
+                "{format:?} (code {code}) has no qemu driver name"
+            );
+            // The rebase planner rewrites the record in place and has
+            // one 16-byte padded slot of scratch for it.
+            assert!(
+                name.len() <= 16,
+                "{format:?}'s driver name {name:?} is wider than a record slot"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_names_are_qemus_not_instars() {
+        // The three that differ from `name()`, each a name qemu has
+        // no driver for.
+        assert_eq!(ImageFormat::Vhd.qemu_driver_name(), "vpc");
+        assert_eq!(ImageFormat::Vmdk3.qemu_driver_name(), "vmdk");
+        assert_eq!(ImageFormat::Iso.qemu_driver_name(), "raw");
+    }
 
     #[test]
     fn compare_failure_results_carry_no_verdict() {

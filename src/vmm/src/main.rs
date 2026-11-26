@@ -4793,6 +4793,14 @@ fn discover_backing_chain(
                 // requirement, so every other hop clears it: a qcow2
                 // reached through a VHD link has whatever parent its own
                 // header names, and that is not a differencing link.
+                //
+                // "Leaving a VHD-family image that named a parent" is
+                // exactly "leaving a differencing image", which is what
+                // lets the refusal call the child differencing: the info
+                // operation reports a VHD parent only when the footer's
+                // disk type is differencing (4), and a VHDX parent only
+                // when `HasParent` is set, so no other VHD or VHDX reaches
+                // this hop.
                 differencing_child = if leaving_vhd_family {
                     Some((current.clone(), image_format))
                 } else {
@@ -10326,9 +10334,10 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
 
     // Resolve the new-backing-format hint. Honour `-F`; without it,
     // state the format chain discovery found for the new backing,
-    // and fall back to 0 (auto-detect by the guest probe path) only
-    // when there is no new chain to have discovered one -- a detach,
-    // or `-u`, which does not open the new backing at all.
+    // and fall back to 0 ("no format stated") only when there is no
+    // new chain to have discovered one, which is a detach. `-u` is
+    // not that case: it still opens the new backing to discover its
+    // chain, so it states the discovered format like a safe rebase.
     //
     // The guest records this in the overlay's backing-format header
     // extension, so "no format stated" is not free: an overlay
@@ -11330,10 +11339,11 @@ fn map_rebase_error(code: u32) -> String {
         }
         c if c == shared::RebaseResult::ERROR_BACKING_FORMAT_SLOT => {
             "the overlay's recorded backing format cannot be updated in place: \
-             its header extension is a width this rebase cannot rewrite \
-             without moving the extensions behind it. Use -u on an overlay \
-             whose recorded format already matches the new backing, or fall \
-             back to `qemu-img rebase`"
+             the new format's name needs a header extension of a different \
+             width (`parallels` is wider than every other name), and this \
+             rebase does not move the extensions behind it. -u does not \
+             avoid this, because it rewrites the record too; fall back to \
+             `qemu-img rebase`"
                 .into()
         }
         c if c == shared::RebaseResult::ERROR_CHAIN_UNREADABLE => {

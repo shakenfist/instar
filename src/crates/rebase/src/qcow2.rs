@@ -55,13 +55,14 @@ const _: () = assert!(
 
 /// Widest backing-format record the planner will rewrite in
 /// place: the extension's own length word plus the padded room
-/// its name occupies. Every driver name a rebase can record is
-/// 3 to 5 bytes, so one 8-byte padded slot covers them all; the
-/// extra 8 is headroom for a record an image declares longer
-/// than any name needs, which is still rewritten rather than
-/// refused. A record wider than this is refused instead of
-/// rewritten -- not because the write is hard, but because the
-/// scratch carve has to be a constant.
+/// its name occupies. The widest driver name a rebase records is
+/// `parallels`, 9 bytes padded to 16; every other is 3 to 5
+/// bytes and pads to 8. So this is sized for the widest name, and
+/// a record wider than it can never be rewritten anyway, because
+/// no name pads to its width -- the width check refuses it first.
+/// The bound is kept separately because the scratch carve has to
+/// be a constant, and the fuzz target, which passes arbitrary
+/// names, is what reaches it.
 const BACKING_FORMAT_REWRITE_MAX: usize = 4 + 16;
 
 /// Round an extension's declared length up to the 8-byte
@@ -124,7 +125,7 @@ pub struct Qcow2RebaseOpts<'a> {
     pub detach: bool,
     /// The driver name to record for the new backing in the
     /// overlay's `EXT_BACKING_FORMAT` header extension, spelled
-    /// as qemu spells it (`raw`, `qcow2`, `vmdk`).
+    /// as qemu spells it (`raw`, `qcow2`, `vpc`, `vdi`, ...).
     ///
     /// Empty means the caller has no format to state, and the
     /// extension is left exactly as it is: an overlay that
@@ -377,9 +378,9 @@ fn fixed_header_end(parsed: &QcowHeader) -> u64 {
 /// The rewrite is in place, which is what makes it safe to do
 /// here rather than in a header relayout: the record's padded
 /// width is preserved, so the extension chain behind it does not
-/// move. Every name a rebase can record (`raw`, `qcow2`, `vmdk`)
-/// pads to the same 8 bytes, so the common cross-format rebase
-/// fits; a record whose width would have to change is refused
+/// move. Every name a rebase can record pads to the same 8 bytes
+/// except `parallels`, so the common cross-format rebase fits; a
+/// record whose width would have to change is refused
 /// rather than written at the wrong width, because a shifted
 /// chain is a corrupt header.
 ///

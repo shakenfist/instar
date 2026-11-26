@@ -69,9 +69,10 @@ Each subcommand has a full reference under docs/:
 ## Security
 
 Security is the point of this project. Beyond the KVM sandbox, instar
-tightens qemu-img's riskiest behaviours (for example, RAW files must
-carry a valid partition table before being accepted — the root cause of
-several backing-file disclosure CVEs), and the codebase undergoes
+tightens qemu-img's riskiest behaviours (for example, a backing-file
+reference must resolve inside an allowlist of directories before
+anything is opened — the defence against several backing-file disclosure
+CVEs), and the codebase undergoes
 periodic security audits covering unsafe code review, adversarial
 images, CVE reproduction, and the VMM boundary. See
 [docs/format-detection-safety.md](https://github.com/shakenfist/instar/blob/develop/docs/format-detection-safety.md),

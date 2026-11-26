@@ -781,7 +781,12 @@ qcow2-luks).
 
 1. **MBR/GPT Partition Table Detection** - Implemented as part of `--unsafe-quirks`
    feature. By default, files without recognized format headers must have a valid
-   partition table (MBR or GPT) to be accepted as RAW disk images.
+   partition table (MBR or GPT) to be *named* RAW; one without is named
+   `unknown`. Each operation decides what that name means for it: `bench`
+   declines an `unknown` input, while the chain reader reads an `unknown`
+   backing member as raw, as qemu-img does. The backing-path allowlist, not this
+   detection, is what keeps a backing reference away from files like
+   `/etc/shadow` -- see [chain-discovery.md](chain-discovery.md#path-validation).
 
    - MBR: Valid 0x55AA signature at offset 510, plus valid boot indicators (0x00/0x80)
    - GPT: Protective MBR with partition type 0xEE

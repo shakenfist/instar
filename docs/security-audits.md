@@ -247,8 +247,12 @@ These architectural properties are verified during every audit:
    dangerous features are blocked.
 
 6. **Raw format hardening:** Files without valid format headers or
-   partition tables are rejected by default. The `--unsafe-quirks`
-   flag is required to accept them (matching qemu-img behaviour).
+   partition tables are named `unknown` rather than `raw` by default
+   (the `--unsafe-quirks` flag names them `raw`, matching qemu-img).
+   Each operation decides what the name means for it; in backing
+   position the chain reader reads such a file as raw, as qemu-img
+   does, and the backing-path allowlist is what keeps a backing
+   reference away from files that are not images.
 
 7. **Checked arithmetic:** All critical address calculations
    (L1/L2 lookups, BAT indexing, grain table offsets) use Rust's

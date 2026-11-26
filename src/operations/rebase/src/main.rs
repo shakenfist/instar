@@ -328,33 +328,36 @@ fn map_rebase_error(e: RebaseError) -> u32 {
 ///
 /// Every format a rebase can put under an overlay is named, not
 /// just the three `-F` spells: without `-F` the host states what
-/// chain discovery found for the new backing, and a VHD or VHDX
-/// backing is both discovered and readable by this build, so
-/// leaving those two unnamed left the overlay recording its old
-/// backing's format -- the exact symptom this record exists to
-/// avoid.
+/// chain discovery found for the new backing, and `-u` reaches
+/// formats this build cannot read (a VDI, a VMDK descriptor) as
+/// well as the ones it can. An unnamed format would leave the
+/// overlay recording its *old* backing's format, and a stale
+/// record is worse than none -- a reader with no record probes
+/// the backing, while a reader with a wrong one opens it with the
+/// wrong driver and refuses the overlay.
 ///
-/// The spelling is the *driver's*, not instar's enum name -- qemu
-/// writes `vpc` for VHD, where `ImageFormat::name()` says `vhd` --
-/// so a format whose driver spelling this table has not settled
-/// returns an empty name and the planner leaves the record alone,
-/// rather than writing a name no reader would recognise. A host
-/// that states no format at all (`new_backing_format == 0`, the
-/// auto-detect code) lands here too.
+/// The spelling is the driver's, from
+/// [`ImageFormat::qemu_driver_name`] -- the same table `create`
+/// writes the record from -- so a format instar can discover is a
+/// format it can name.
 ///
-/// All five names pad to the same single 8-byte record slot
-/// (`raw`, `vpc`, `vhdx`, `vmdk`, `qcow2`), so any of them can
-/// replace any other in place; see `push_backing_format_patch`,
-/// which refuses a width change rather than shifting the chain.
+/// The one empty answer is `Unknown`, and here it means "no
+/// format stated": the host sends 0 only when there is no new
+/// backing to have discovered a format for (a detach), because
+/// discovery's own `unknown` is sent as `raw`. The planner then
+/// leaves the record alone.
+///
+/// The names pad to one 8-byte record slot except `parallels`,
+/// which pads to 16. `push_backing_format_patch` refuses a width
+/// change rather than shifting the extensions behind the record,
+/// so rebasing an overlay between an 8-byte name and `parallels`
+/// is refused with `ERROR_BACKING_FORMAT_SLOT` -- a typed refusal,
+/// where leaving the record alone would have written a header no
+/// reader can open.
 fn backing_format_record_name(format_code: u32) -> &'static [u8] {
-    match ImageFormat::from_u32(format_code) {
-        ImageFormat::Raw => b"raw",
-        ImageFormat::Qcow2 => b"qcow2",
-        ImageFormat::Vmdk4 => b"vmdk",
-        ImageFormat::Vhd => b"vpc",
-        ImageFormat::Vhdx => b"vhdx",
-        _ => b"",
-    }
+    ImageFormat::from_u32(format_code)
+        .qemu_driver_name()
+        .as_bytes()
 }
 
 /// Map a `qcow2_write::Gate` envelope refusal on the OVERLAY

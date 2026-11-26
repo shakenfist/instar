@@ -155,12 +155,24 @@ what `-F` says. `-u` is no exception -- the new backing is still
 opened to discover its format, so `rebase -u -b new.raw` records
 `raw` with no `-F` given.
 
-The name written is the driver's, as `qemu-img` spells it: `raw`,
-`qcow2`, `vmdk`, `vpc` for VHD and `vhdx`. The first three are what
-`-F` accepts; the last two are reachable without `-F`, since
-discovery identifies a VHD or VHDX backing and the chain reader can
-serve one. A format outside that set leaves the record as it was,
-rather than writing a name no reader would recognise.
+The name written is the driver's, as `qemu-img rebase -F <driver>`
+would write it, for every format discovery identifies: `vpc` for
+VHD, `vmdk` for a VMDK descriptor or a VMDK3 image as well as a
+VMDK4 one, `qcow` for qcow version 1, `vdi`, and so on; an ISO is
+`raw`, since qemu has no ISO driver. `-F` spells only `qcow2`,
+`vmdk` and `raw`, so the rest are reached without it -- `-u` in
+particular accepts a backing in a format rebase cannot read, and
+records it all the same. `create` writes the record from the same
+table, so the two cannot come to spell a format differently.
+
+The record is rewritten in place, at the width it already has.
+Every driver name pads to the same 8 bytes except `parallels`,
+which pads to 16, so a rebase that would change an overlay's record
+between `parallels` and any other name is refused, in either mode,
+with "the overlay's recorded backing format cannot be updated in
+place", and the overlay is left untouched. Leaving the old name
+behind instead would write an overlay that `qemu-img` refuses to
+open. `qemu-img rebase` relays the header out and handles this.
 
 An overlay that recorded no format keeps recording
 none -- a reader then probes the backing file, as it did before --

@@ -114,10 +114,10 @@ pub enum RebaseError {
     /// The overlay's `EXT_BACKING_FORMAT` record cannot hold the
     /// new backing's driver name at its existing padded width, so
     /// recording the truth would mean moving every header
-    /// extension behind it. Unreachable for the names rebase can
-    /// record -- `raw`, `qcow2` and `vmdk` all pad to one 8-byte
-    /// slot -- so this guards a hand-made header rather than a
-    /// user's workflow. Maps to
+    /// extension behind it. Every driver name pads to one 8-byte
+    /// slot except `parallels`, which pads to 16, so this is a
+    /// rebase between a Parallels backing and any other format,
+    /// or a hand-made header. Maps to
     /// `RebaseResult::ERROR_BACKING_FORMAT_SLOT`.
     BackingFormatSlotTooSmall,
 }

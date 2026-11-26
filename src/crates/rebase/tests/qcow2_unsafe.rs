@@ -21,6 +21,10 @@ const CLUSTER_SIZE: u32 = 65536;
 const VIRTUAL_SIZE: u64 = 1 << 20;
 
 fn build_overlay(backing_path: &[u8]) -> Vec<u8> {
+    build_overlay_recording(backing_path, ImageFormat::Qcow2)
+}
+
+fn build_overlay_recording(backing_path: &[u8], format: ImageFormat) -> Vec<u8> {
     let opts = Qcow2CreateOpts {
         virtual_size: VIRTUAL_SIZE,
         cluster_size: CLUSTER_SIZE,
@@ -30,7 +34,7 @@ fn build_overlay(backing_path: &[u8]) -> Vec<u8> {
         compat_v3: true,
         backing: Some(BackingRef {
             path: backing_path,
-            format: Some(ImageFormat::Qcow2),
+            format: Some(format),
         }),
         preallocation: qcow2::create::Preallocation::Off,
     };
@@ -253,9 +257,10 @@ fn a_caller_with_no_format_to_state_leaves_the_record_alone() {
 fn a_name_that_would_move_the_extensions_is_refused() {
     // `parallels` is nine bytes, so its record would pad to 16
     // where `qcow2` pads to 8: recording it in place would move
-    // every extension behind it. No `-F` value reaches this, so
-    // it is a guard rather than a path a user takes -- but the
-    // alternative to refusing is a corrupt extension chain.
+    // every extension behind it. A rebase onto a Parallels backing
+    // reaches this without `-F`, since discovery names the format;
+    // the alternative to refusing is a corrupt extension chain, and
+    // the alternative to recording is a stale `qcow2` record.
     let bytes = build_overlay(b"old.qcow2");
     let opts = Qcow2RebaseOpts {
         mode: RebaseMode::Unsafe,
@@ -275,6 +280,58 @@ fn a_name_that_would_move_the_extensions_is_refused() {
         plan_rebase_qcow2(&opts, &mut scratch).err(),
         Some(RebaseError::BackingFormatSlotTooSmall)
     );
+}
+
+#[test]
+fn the_widest_name_is_rewritten_in_its_own_slot() {
+    // `parallels` pads to 16, the one name that does not fit an
+    // 8-byte slot, and it is what `BACKING_FORMAT_REWRITE_MAX` is
+    // sized for. An overlay that already records it -- `qemu-img
+    // create -F parallels` writes one -- can still be rebased onto
+    // another Parallels backing; it is a width *change* that is
+    // refused, which the second half pins.
+    for (name, expected) in [
+        // `BackingFormat` has no Parallels member, so the parsed enum
+        // says only "not one we know"; the bytes are the real check.
+        (&b"parallels"[..], Ok(BackingFormat::Unknown)),
+        (&b"raw"[..], Err(RebaseError::BackingFormatSlotTooSmall)),
+    ] {
+        let mut bytes = build_overlay_recording(b"old.hdd", ImageFormat::Parallels);
+        let header = QcowHeader::parse(&bytes).expect("parse pre");
+        assert_eq!(
+            parse_header_extensions(&bytes, &header).backing_format_len,
+            9
+        );
+        let header_bytes = bytes[..4096].to_vec();
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: &header_bytes,
+            overlay_file_size: bytes.len() as u64,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: VIRTUAL_SIZE,
+            new_backing_path: b"new.hdd",
+            detach: false,
+            new_backing_format_name: name,
+        };
+        let mut scratch = vec![0xccu8; 64 * 1024];
+        match (plan_rebase_qcow2(&opts, &mut scratch), expected) {
+            (Ok(Qcow2RebaseOutput::Unsafe { plan }), Ok(format)) => {
+                apply_rebase(&mut bytes, &plan);
+                let header_post = QcowHeader::parse(&bytes).expect("parse post");
+                let exts = parse_header_extensions(&bytes, &header_post);
+                assert_eq!(exts.backing_format, format);
+                assert_eq!(exts.backing_format_len, 9);
+                let data = exts.backing_format_offset;
+                assert_eq!(&bytes[data..data + 16], b"parallels\0\0\0\0\0\0\0");
+                assert_eq!(parsed_path(&bytes, &header_post), b"new.hdd");
+            }
+            (Err(e), Err(want)) => assert_eq!(e, want),
+            (got, want) => panic!("{name:?}: got {:?}, want {want:?}", got.err()),
+        }
+    }
 }
 
 #[test]
