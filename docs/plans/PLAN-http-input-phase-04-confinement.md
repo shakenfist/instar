@@ -638,6 +638,27 @@ gained a `verbose` argument, because nothing in the suite had needed
 `--verbose` on an `info` run before; `--verbose` is a global flag, so it
 goes before the subcommand.
 
+**The definition of done, checked by the management session after the
+last step.** Every one of the sixteen items passed. The two that are
+runs rather than greps, repeated independently of the step that claimed
+them: the whole host integration suite with both `INSTAR_REQUIRE_`
+variables set gave `Ran: 4595 tests`, 3920 passed, 671 skipped, 4
+expected failures, 0 failed, no worker at `N/A`, classified as "3924 of
+4595 tests executed, 671 skipped, against 3127 discovered; no worker
+lost"; and the unit suite gave 3158 passed, 0 failed. The discovered
+count differs by one from step 4d's record of the same suite because the
+two runs counted the selection with different greps, not because the
+suite changed.
+
+One thing the items do not cover, measured here because a mutation is
+not the only way to see a policy bite: a library preloaded into the
+fetcher with `LD_PRELOAD`, making one call outside the allowlist on
+every image read, kills it with `SIGSYS` in the shipped binary, and the
+privileged side prints the sentence step 4d added. The same preload on
+the plain-path route changes nothing, which is what says the kill is the
+policy's doing rather than the library's. The probe is
+`p04-step-4d-review/outside-the-policy.c` in the session scratchpad.
+
 ## Mutation results
 
 Five mutations, one at a time, applied to a copy of the tree in the

@@ -271,11 +271,18 @@ cannot be resynchronised without knowing how many answers are outstanding.
 ### Fetcher side
 
 ```
-instar-fetch <socket-fd> <file-fd>
+instar-fetch [--confine=<layers>] <socket-fd> <file-fd>
 ```
 
-Both arguments are descriptor numbers the parent has already opened. The
-fetcher takes no paths and opens nothing, so it can in principle be given no
+`--confine` names what the fetcher applies to itself once it is running, as a
+comma-separated list of `landlock` and `seccomp`, or `none` when nothing is
+asked for; see Confinement under Lifecycle. An unknown name, an empty one,
+`none` alongside a layer, or the flag given twice is refused. Run without the
+flag, the fetcher applies nothing: choosing a policy is the privileged side's
+job, not a default the fetcher picks for itself.
+
+Both descriptors are numbers the parent has already opened. The fetcher takes
+no paths and opens nothing, so it can in principle be given no
 filesystem access at all. It is single-threaded, answers each read with
 `pread` on the file, and never panics on anything the peer sends: a malformed
 request is answered with a status, or noted on stderr. It exits 0 when the
@@ -358,6 +365,90 @@ through `main` rather than exiting underneath them. `instar info` does. A
 read-only operation that calls `exit` on an error path cannot be given a
 remote input until it stops.
 
+**Confinement.** The fetcher is the half of the partition that is assumed
+hostile, so it is confined in two stages, by whichever side can do each part.
+
+The host probes the running kernel once, before it spawns anything, for two
+things: the Landlock ABI, and whether the kernel offers the seccomp action
+that kills a process. Neither question confines the host or opens a
+descriptor. It names what it found on the child's command line as
+`--confine=landlock,seccomp`, or `--confine=none` when the kernel offers
+neither, and the fetcher applies exactly the layers it was named. A layer that
+is named and cannot be applied is a non-zero exit before the init reply, so a
+layer is either not asked for or applied: the fetcher never runs with one
+quietly missing. The sandbox is not reported over the wire, which has no field
+for it; the host already knows the answer because it chose it.
+
+*Between `fork` and `exec`, the host sets what only a parent can set.* The
+child's `RLIMIT_NPROC`, `RLIMIT_CORE` and `RLIMIT_NOFILE` are set to 0, 0 and
+8, hard limit and soft alike so the child cannot raise them, and
+`PR_SET_NO_NEW_PRIVS` is set, which is also what lets an unprivileged process
+install a seccomp filter on itself. These are `setrlimit` and `prctl` calls,
+so the closure stays free of allocation, locks and formatting. There is
+deliberately no file-size limit, because the fetcher's stderr is whatever the
+caller chose and a regular file under a zero limit kills the fetcher on its
+first diagnostic line. The child is not made undumpable either, because that
+would make `/proc/<pid>` of the child unreadable to its own parent, which is
+how the descriptor set above is asserted.
+
+*After its setup and before its first read from the peer, the fetcher applies
+the rest to itself.* A Landlock ruleset that handles every filesystem access
+the running kernel's ABI knows and permits none goes on first, then a seccomp
+allowlist of nineteen syscalls that kills the process on anything else. The
+filter goes on last, because it denies the calls the filesystem step makes.
+
+**Why a filesystem denial cannot precede the `exec`.** A ruleset that permits
+nothing, applied before the `exec`, denies the kernel's loader the fetcher
+binary itself, and the `exec` fails with `EACCES`; a seccomp filter installed
+there would deny the loader's own calls for the same reason. A policy that
+leaves the fetcher no path at all is therefore only reachable once the loader
+has finished, which means the fetcher applies it to itself. This costs it
+nothing it needs, because Landlock binds paths and not open files: the socket
+and the image arrive as descriptors, `pread` and `recv` on them keep working,
+and `open` of the very same image path fails.
+
+**What the syscall allowlist is.** It is a hand-written filter with no
+dependency. It checks the architecture first, which is x86_64 only and a build
+error elsewhere, and kills the process on a mismatch. Eleven of the calls were
+measured by tracing the release binary serving real requests and misbehaving
+peers: `recvfrom`, `pread64`, `sendto`, `write`, `close`, `exit_group`, `brk`,
+`mmap`, `munmap`, `gettid` and `futex`. Seven of those appear on every run.
+`mmap` and `munmap` appear once the caller's environment lowers the size at
+which an allocation gets a mapping of its own, and `gettid` and `futex` on a
+panic, so each was provoked rather than waited for. `recvfrom` and `sendto`
+are what the C library issues for `recv` and `send` on this architecture.
+Eight more were never seen and are allowed as insurance against another C
+library, kept in a separate list so a reader can tell the two kinds of entry
+apart. Absent are `socket`, `socketpair`, `connect`, `bind`, `openat` and
+`tgkill`, among the rest. With every call that makes a descriptor denied, the
+`sendto` that is allowed can only name the socket the host passed. Without
+`tgkill`, an abort or a stack overflow reaches the host as `SIGSYS`, which is
+a less precise cause of death in return for the fetcher having no way to
+signal the process that spawned it; a panic still ends as a panic, with its
+own exit status. The allowlist is the file backend's own, so a backend with
+other needs brings a list of its own rather than widening this one.
+
+**A kernel that cannot provide a layer.** The run proceeds without that layer
+and says so only under `--verbose`; a default run writes nothing to stderr.
+Under `--verbose` the host prints one line per layer after the init exchange:
+either that the kernel provides it and the fetcher has applied it (`has left
+itself no reachable path`, `has left itself only the syscalls it serves
+with`), or that the kernel cannot and the fetcher runs without it (`runs
+without a filesystem policy`, `runs without a syscall policy`).
+
+**What a signal exit tells the operator.** The reap reads the status it used
+to discard. A fetcher that exited by itself, with any status, is reported as
+nothing, since a failure it knew about already reached the user as a sentence
+the host wrote from a `Status`. A fetcher killed by a signal is reported
+whatever verbosity was asked for, naming the signal and saying the input was
+not read to the end: the protocol carries nothing for that case, so the signal
+is the only account anyone has, and a diagnosis printed only on a second run
+with another flag is one nobody gets. `SIGSYS` has its own sentence. It means
+the fetcher made a system call its sandbox does not allow, which is a bug in
+instar and not a fault in the input or in how it was invoked. The fetcher
+inherits the caller's environment, so a library preloaded with `LD_PRELOAD`
+that makes calls outside the list produces the same signal.
+
 **Behind the VMM's backing store.** A store reading through a client answers
 `read_at` with the client's own `read_at`, adding no bounds logic of its own.
 It refuses a write, naming the input as read-only. A flush succeeds: a guest's
@@ -375,10 +466,21 @@ buffered that a success could be lying about.
 The only thing that speaks this protocol today is `instar-fetch` serving one
 open file. It is built and packaged, and `instar info` starts it for a
 `file://` input and reads the sandbox's virtual disk through the client; no
-other operation does yet, and nothing here touches the network. Tests cover the layout, each malformed shape
-decoding to a typed error, an end-to-end comparison of the fetcher against
-`pread`, a set of hostile peers, and a fuzz target on every decode entry
-point.
+other operation does yet, and nothing here touches the network.
+
+The fetcher is confined: the host limits its processes, core size and open
+files and sets `no_new_privs` before the `exec`, and the fetcher then leaves
+itself no reachable path and only the syscalls it serves with, on every kernel
+that provides those layers. Landlock needs a kernel that has it, and the
+syscall layer one that can kill a process for a violation; a kernel without
+either runs the fetcher without that layer. There are no user or mount
+namespaces, which a process that opens nothing has no use for.
+
+Tests cover the layout, each malformed shape decoding to a typed error, an
+end-to-end comparison of the fetcher against `pread`, a set of hostile peers,
+a fuzz target on every decode entry point, and each confinement layer biting:
+a path denied while an inherited descriptor still reads, and each denied call
+ending in `SIGSYS`.
 
 ## Limitations
 

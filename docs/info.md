@@ -68,6 +68,18 @@ so a default run is silent on stderr for a URL exactly as it is for a path.
 Nothing is lost on a failure: the message the user reads is written by instar
 from the fetcher's status, not taken from its output.
 
+The fetcher is confined before it reads anything from its peer: it can open no
+path and make only the system calls it serves with. `--verbose` prints one
+line per layer saying either that the kernel provides it and the fetcher has
+applied it, or that the kernel cannot and the fetcher runs without it, so on a
+kernel without Landlock or without the seccomp kill action the run still goes
+ahead and tells you which layer it lacked. If the fetcher is killed by a
+signal, instar reports it on stderr whatever verbosity was asked for, naming
+the signal and saying the input was not read to the end. `SIGSYS` means the
+fetcher made a system call its sandbox does not allow. That is a bug in
+instar, not a fault in your image or in how you ran the command, and worth
+reporting with the pid and the command line.
+
 The virtual disk's size comes from the capacity the fetcher advertises. The
 `disk size` figure still comes from the host's `stat` of the file, because
 the fetcher reports an apparent size and nothing for how much of it is

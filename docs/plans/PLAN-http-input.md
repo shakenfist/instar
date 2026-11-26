@@ -683,6 +683,30 @@ privileged side probes the kernel, names the layers it requires on the
 child's command line, and the child exits non-zero rather than
 silently skipping one.
 
+Built 2026-11-26, with the departures from the phase plan recorded in
+its execution notes and all five mutations caught. What later phases
+need from them: the confinement is two-stage, with the parent setting
+`RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 8 and
+`PR_SET_NO_NEW_PRIVS` between the fork and the exec, and the fetcher
+applying a deny-all Landlock ruleset and then a nineteen-call seccomp
+allowlist to itself before it reads from the peer; the host probes the
+kernel and names the layers as `--confine=`, and a named layer the
+fetcher cannot apply is a non-zero exit before the init reply; the
+allowlist is the file backend's own and phase 5 adds a policy for the
+HTTP backend beside it rather than widening it; `sendto` and
+`recvfrom` are on it, because `send` and `recv` are those syscalls on
+x86_64, and `close` is on it because `serve` drops its descriptors
+after the filter; a killed fetcher is reported by the privileged side
+whatever verbosity was asked for, with its own sentence for `SIGSYS`;
+the protocol is unchanged and `VERSION` is 1; and the sandbox is
+tested against the real policy in the container tier, since
+`make test-rust` measured Landlock ABI 6 and a seccomp install that
+succeeds there. A kernel that cannot provide a layer runs without it
+and says so under `--verbose`. `INSTAR_REQUIRE_LANDLOCK` and
+`INSTAR_REQUIRE_SECCOMP` make the weaker assertion a failure, and the
+`build-and-test` job sets both. Its findings for phases 5, 8 and 9 are
+in Future work below.
+
 **5. HTTP backend.** Ranged GETs, sizing from `Content-Length`, the
 `206` probe, `ETag`/`Last-Modified` pinning so a source that changes
 mid-transfer fails cleanly, retry with backoff, redirects refused,
@@ -1288,6 +1312,24 @@ chosen to defer to here, so that we do not forget them.
   was not taken in phase 4, because the fetcher is installed beside
   libraries a packaged layout may need a path for, and that needs
   measuring against the packages rather than asserting.
+* **A failing `subTest` loses its test's result under stestr, for
+  phase 9.** Found proving a mutation in phase 4 and not caused by it:
+  every test in `TestInfoFileUrl` loops over fixtures inside `with
+  self.subTest(...)`, and when one subtest fails the test's own result
+  never arrives. The mutated run reported `Ran: 7, Passed: 3, Failed: 1`
+  with three workers at `N/A`, and the one test alone under
+  `--concurrency 1` reported that no tests ran, although every subtest
+  failure and its message were printed in full. A regression there is
+  therefore red as a truncated run, not as a named test, and
+  `tools/ci/check-stestr-run.sh` is what refuses it. Phase 9 should
+  decide whether the fixture loop stays a `subTest` or becomes a
+  generated test per fixture.
+* **A killed fetcher is reported once, in a sentence the privileged
+  side writes, for phase 8.** Phase 4 made the report unconditional
+  because a signal death is abnormal whatever the caller's flags, and
+  put the wording in the VMM. Phase 8 owns failure semantics and
+  should treat that sentence, including the claim that `SIGSYS` is
+  instar's bug, as the starting point and not as settled wording.
 * **`run_check` and `compare_images` call `std::process::exit`, which
   blocks phase 7.** The fetcher is reaped by a `Drop`, and a `Drop`
   does not run on `exit`. `info` returns its errors through `main`, so
