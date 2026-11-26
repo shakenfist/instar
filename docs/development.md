@@ -1274,7 +1274,6 @@ Each review item has an `action` field:
 - `.github/workflows/agent-context.yml` - skillsaw lint of `AGENTS.md`, `CLAUDE.md` and `.claude/`, by running the pre-commit hook (PR and push to develop, both path-filtered)
 - `.github/workflows/lint.yml` - rustfmt and clippy in the containerised toolchain (PR, path-filtered to the Rust tree)
 - `.github/workflows/export-repo-config.yml` - nightly export of this repository's GitHub settings for the fleet configuration audit
-- `.github/workflows/renovate.yml` - self-hosted Renovate dependency updates (hourly)
 - `.github/workflows/mermaid-lint.yml` - renders every mermaid diagram in the repository's markdown and fails on any that does not parse (PR, push to develop, and workflow_dispatch; path-filtered to markdown)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
