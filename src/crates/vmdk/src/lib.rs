@@ -300,6 +300,107 @@ pub fn build_flat_descriptor(
     pos - offset
 }
 
+/// Sectors in every extent of a split VMDK except possibly the last:
+/// 2 GiB, which is the size qemu cuts a `twoGbMaxExtent` image at.
+pub const SPLIT_EXTENT_SECTORS: u64 = 4_194_304;
+
+/// Heads in the CHS geometry qemu writes for a split VMDK. It is a
+/// constant whatever the size of the disk.
+pub const SPLIT_HEADS: u32 = 16;
+
+/// Sectors per track in the CHS geometry qemu writes for a split VMDK.
+/// Also a constant whatever the size of the disk.
+pub const SPLIT_SECTORS_PER_TRACK: u32 = 63;
+
+/// Which of the two split subformats a descriptor describes. They share
+/// a layout rule and differ only in how each extent is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitKind {
+    /// `twoGbMaxExtentSparse`: every extent is a sparse VMDK4 file.
+    Sparse,
+    /// `twoGbMaxExtentFlat`: every extent is a raw file.
+    Flat,
+}
+
+/// How a split VMDK of a given virtual size is cut into extents, and
+/// the CHS geometry its descriptor records.
+///
+/// Everything here is a pure function of the virtual size, so no caller
+/// supplies `cylinders` or an extent size and two callers cannot derive
+/// them differently. Use `split_layout` to build one, and
+/// `sectors_of_extent` rather than re-deriving the short last extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitLayout {
+    /// The virtual size in 512-byte sectors, rounded up.
+    pub total_sectors: u64,
+    /// Number of extent files. Zero only for a zero-byte disk.
+    pub extent_count: u64,
+    /// Sectors in the final extent: `SPLIT_EXTENT_SECTORS` when the size
+    /// is an exact multiple of it, never a zero-length trailing extent.
+    pub last_extent_sectors: u64,
+    /// `total_sectors / (heads * sectors)`, truncating. Deliberately not
+    /// clamped to the 65535 a real CHS geometry allows, because qemu
+    /// does not: its 33 GiB split image records 68656.
+    pub cylinders: u64,
+    /// Always `SPLIT_HEADS`.
+    pub heads: u32,
+    /// Always `SPLIT_SECTORS_PER_TRACK`.
+    pub sectors: u32,
+    /// The subformat this layout is for.
+    pub kind: SplitKind,
+}
+
+impl SplitLayout {
+    /// The sector count of extent `index` (zero-based): a full extent
+    /// for every one but the last, the remainder for the last, and zero
+    /// for an index past the end.
+    pub fn sectors_of_extent(&self, index: u64) -> u64 {
+        if index >= self.extent_count {
+            0
+        } else if index + 1 == self.extent_count {
+            // index < extent_count, so index + 1 cannot overflow.
+            self.last_extent_sectors
+        } else {
+            SPLIT_EXTENT_SECTORS
+        }
+    }
+}
+
+/// Work out the extent layout and CHS geometry for a split VMDK of
+/// `virtual_size_bytes`.
+///
+/// A size that is not a multiple of 512 is rounded up to the next
+/// sector, and a size of zero gives zero extents and zero cylinders. No
+/// pinned qemu case covers either: both are this function's own choice
+/// of the least surprising answer. All arithmetic is overflow-free for
+/// any `u64`, since the largest sector count is 2^55. Rounding up means
+/// a size in the last 511 bytes of the `u64` range describes a disk
+/// marginally larger than the one asked for; nothing reaches that,
+/// because a caller bounds the virtual size long before it.
+pub fn split_layout(virtual_size_bytes: u64, kind: SplitKind) -> SplitLayout {
+    let total_sectors = virtual_size_bytes.div_ceil(VMDK_SECTOR);
+    let extent_count = total_sectors.div_ceil(SPLIT_EXTENT_SECTORS);
+    let remainder = total_sectors % SPLIT_EXTENT_SECTORS;
+    let last_extent_sectors = if extent_count == 0 {
+        0
+    } else if remainder == 0 {
+        SPLIT_EXTENT_SECTORS
+    } else {
+        remainder
+    };
+    let cylinders = total_sectors / (SPLIT_HEADS as u64 * SPLIT_SECTORS_PER_TRACK as u64);
+
+    SplitLayout {
+        total_sectors,
+        extent_count,
+        last_extent_sectors,
+        cylinders,
+        heads: SPLIT_HEADS,
+        sectors: SPLIT_SECTORS_PER_TRACK,
+        kind,
+    }
+}
+
 /// Format a u64 as a decimal string in a fixed buffer.
 /// Returns a slice of the formatted digits.
 fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
@@ -314,6 +415,141 @@ fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
         val /= 10;
     }
     &buf[pos..20]
+}
+
+/// Format `val` in decimal, left-padded with zeros to at least `min_width`
+/// digits, in a fixed buffer. Returns a slice of the formatted digits.
+///
+/// The width is a floor, not a cap: a value with more digits than
+/// `min_width` is written in full, which is what qemu does for the
+/// thousandth extent of a split image (`image-s1000.vmdk`). A
+/// `min_width` over 20 is treated as 20.
+fn format_u64_padded(mut val: u64, min_width: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let width = if min_width > 20 { 20 } else { min_width };
+    let mut pos = 20;
+    while val > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    while 20 - pos < width {
+        pos -= 1;
+        buf[pos] = b'0';
+    }
+    if pos == 20 {
+        pos = 19;
+        buf[pos] = b'0';
+    }
+    &buf[pos..20]
+}
+
+/// Build a `twoGbMaxExtentSparse` or `twoGbMaxExtentFlat` descriptor into
+/// `buf` starting at `offset`. Returns the number of bytes the descriptor
+/// needs.
+///
+/// Like the other descriptor builders this has `snprintf` semantics: the
+/// cursor advances past the end of the buffer but bytes are copied only
+/// when they fit, so the return value is the full length whatever buffer
+/// was given. Call it once with an empty slice to measure, allocate, and
+/// call it again to write. That matters more here than for the
+/// single-extent descriptors, because the length grows with the number of
+/// extents and is not bounded by a constant.
+///
+/// Extent files are named `<prefix>-s<NNN><postfix>` for a sparse layout
+/// and `<prefix>-f<NNN><postfix>` for a flat one, where `NNN` is the
+/// one-based extent number zero-padded to at least three digits. `prefix`
+/// is the base name without extension (e.g. `b"image"`) and `postfix` is
+/// the extension including its dot (e.g. `b".vmdk"`). The geometry is
+/// taken from `layout`, and the `CID` is a fixed value rather than the
+/// random one qemu writes, so output is reproducible.
+///
+/// `prefix` and `postfix` are copied verbatim into a quoted field on a
+/// newline-terminated line, so the caller must reject a name that is not
+/// UTF-8 or that holds a `"`, CR or LF: such a name would name a file
+/// other than the extent, or close the quote and add descriptor lines of
+/// its own. `vmdk_flat_extent_path` in the host already refuses exactly
+/// those for the single-extent subformat, and is the rule to follow.
+///
+/// Both passes cost one iteration per extent, measuring as well as
+/// writing, and nothing here bounds `layout.extent_count`: a virtual
+/// size of `u64::MAX` yields 2^33 extents and hours of work in the
+/// measuring call alone. A caller must bound the virtual size before it
+/// measures, not only before it writes. That matters most for a size
+/// derived from an image rather than from an argument.
+///
+/// Two further bounds are the caller's, and both are narrower than the
+/// cost bound. A layout of zero extents emits a descriptor with no
+/// extent lines at all, which `parse_descriptor_extents` refuses as
+/// `NoExtents`, so a caller must refuse a zero virtual size rather than
+/// write a descriptor instar cannot read. And past `MAX_EXTENTS`
+/// extents the descriptor is well formed but still unreadable here, for
+/// `TooManyExtents`: the read side is capped by the guest configuration
+/// page and the write side is not, so a caller that wants its own
+/// output readable must bound `extent_count` at `MAX_EXTENTS`.
+pub fn build_split_descriptor(
+    buf: &mut [u8],
+    offset: usize,
+    layout: &SplitLayout,
+    prefix: &[u8],
+    postfix: &[u8],
+) -> usize {
+    let mut pos = offset;
+
+    let mut put = |bytes: &[u8]| {
+        let end = pos.saturating_add(bytes.len());
+        if let Some(dst) = buf.get_mut(pos..end) {
+            dst.copy_from_slice(bytes);
+        }
+        pos = end;
+    };
+
+    // `trailer` closes the quoted name and ends the line: a flat extent
+    // line carries the start offset qemu writes, a sparse one does not.
+    let (create_type, keyword, tag, trailer): (&[u8], &[u8], &[u8], &[u8]) = match layout.kind {
+        SplitKind::Sparse => (b"twoGbMaxExtentSparse", b" SPARSE \"", b"-s", b"\"\n"),
+        SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\" 0\n"),
+    };
+
+    put(b"# Disk DescriptorFile\n");
+    put(b"version=1\n");
+    put(b"CID=fffffffe\n");
+    put(b"parentCID=ffffffff\n");
+    put(b"createType=\"");
+    put(create_type);
+    put(b"\"\n\n");
+    put(b"# Extent description\n");
+
+    let mut num_buf = [0u8; 20];
+    let mut index = 0u64;
+    while index < layout.extent_count {
+        put(b"RW ");
+        put(format_u64(layout.sectors_of_extent(index), &mut num_buf));
+        put(keyword);
+        put(prefix);
+        put(tag);
+        // index < extent_count <= 2^33, so index + 1 cannot overflow.
+        put(format_u64_padded(index + 1, 3, &mut num_buf));
+        put(postfix);
+        put(trailer);
+        index += 1;
+    }
+
+    put(b"\n# The Disk Data Base\n");
+    put(b"#DDB\n\n");
+    put(b"ddb.virtualHWVersion = \"4\"\n");
+    put(b"ddb.geometry.cylinders = \"");
+    put(format_u64(layout.cylinders, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.geometry.heads = \"");
+    put(format_u64(layout.heads as u64, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.geometry.sectors = \"");
+    put(format_u64(layout.sectors as u64, &mut num_buf));
+    put(b"\"\n");
+    put(b"ddb.adapterType = \"ide\"\n");
+    put(b"ddb.toolsVersion = \"2147483647\"\n");
+
+    pos.saturating_sub(offset)
 }
 
 /// Build a metadata marker into a 512-byte buffer.
@@ -2608,6 +2844,845 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
         let without_flag = classify_vmdk_gt_entry(ZERO_GRAIN_MARKER, 0, 65536, false);
         assert_eq!(with_flag.state, MapExtentState::ZeroAllocated);
         assert_eq!(without_flag.state, MapExtentState::ZeroAllocated);
+    }
+
+    // ====================================================================
+    // split_layout tests
+    // ====================================================================
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Assert extent count, last-extent sectors and cylinders for a size.
+    fn check_layout(bytes: u64, count: u64, last: u64, cyl: u64) {
+        let l = split_layout(bytes, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, bytes / 512, "total_sectors for {bytes}");
+        assert_eq!(l.extent_count, count, "extent_count for {bytes}");
+        assert_eq!(
+            l.last_extent_sectors, last,
+            "last_extent_sectors for {bytes}"
+        );
+        assert_eq!(l.cylinders, cyl, "cylinders for {bytes}");
+        assert_eq!(l.heads, 16);
+        assert_eq!(l.sectors, 63);
+    }
+
+    #[test]
+    fn split_layout_matches_every_pinned_size() {
+        // vmdk-multi-sparse-1M
+        check_layout(MIB, 1, 2048, 2);
+        // vmdk-multi-sparse-2G: exactly one full extent, not two.
+        check_layout(2 * GIB, 1, 4_194_304, 4161);
+        // vmdk-multi-sparse-2049M
+        check_layout(2049 * MIB, 2, 2048, 4163);
+        // vmdk-multi-sparse-4G
+        check_layout(4 * GIB, 2, 4_194_304, 8322);
+        // vmdk-multi-sparse-5G
+        check_layout(5 * GIB, 3, 2_097_152, 10402);
+        // vmdk-multi-sparse-21G
+        check_layout(21 * GIB, 11, 2_097_152, 43690);
+    }
+
+    #[test]
+    fn split_layout_does_not_clamp_cylinders() {
+        // custom/format-coverage/vmdk-split-sparse-33g.vmdk records
+        // ddb.geometry.cylinders = "68656", past the 16-bit 65535.
+        check_layout(33 * GIB, 17, 2_097_152, 68656);
+    }
+
+    #[test]
+    fn split_layout_kind_is_carried_through() {
+        assert_eq!(split_layout(MIB, SplitKind::Flat).kind, SplitKind::Flat);
+        assert_eq!(split_layout(MIB, SplitKind::Sparse).kind, SplitKind::Sparse);
+    }
+
+    #[test]
+    fn split_layout_sectors_of_extent() {
+        let l = split_layout(5 * GIB, SplitKind::Flat);
+        assert_eq!(l.sectors_of_extent(0), 4_194_304);
+        assert_eq!(l.sectors_of_extent(1), 4_194_304);
+        assert_eq!(l.sectors_of_extent(2), 2_097_152);
+        assert_eq!(l.sectors_of_extent(3), 0);
+        assert_eq!(l.sectors_of_extent(u64::MAX), 0);
+        let whole = split_layout(4 * GIB, SplitKind::Flat);
+        assert_eq!(whole.sectors_of_extent(1), 4_194_304);
+        assert_eq!(whole.sectors_of_extent(2), 0);
+    }
+
+    #[test]
+    fn split_layout_extent_sectors_sum_to_total() {
+        for bytes in [MIB, 2 * GIB, 2049 * MIB, 5 * GIB, 33 * GIB] {
+            let l = split_layout(bytes, SplitKind::Sparse);
+            let mut sum = 0u64;
+            for i in 0..l.extent_count {
+                sum += l.sectors_of_extent(i);
+            }
+            assert_eq!(sum, l.total_sectors, "extents of {bytes}");
+        }
+    }
+
+    #[test]
+    fn split_layout_zero_size() {
+        // No pin covers a zero-byte disk. Chosen answer: no extents, no
+        // sectors, no cylinders, and every extent index is out of range.
+        let l = split_layout(0, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, 0);
+        assert_eq!(l.extent_count, 0);
+        assert_eq!(l.last_extent_sectors, 0);
+        assert_eq!(l.cylinders, 0);
+        assert_eq!(l.sectors_of_extent(0), 0);
+    }
+
+    #[test]
+    fn split_layout_rounds_unaligned_size_up() {
+        // No pin covers a size that is not a multiple of 512. Chosen
+        // answer: round up to the next sector, as for the other builders.
+        let l = split_layout(MIB + 1, SplitKind::Sparse);
+        assert_eq!(l.total_sectors, 2049);
+        assert_eq!(l.extent_count, 1);
+        assert_eq!(l.last_extent_sectors, 2049);
+        // One byte over a full extent spills a one-sector extent.
+        let l = split_layout(2 * GIB + 1, SplitKind::Sparse);
+        assert_eq!(l.extent_count, 2);
+        assert_eq!(l.last_extent_sectors, 1);
+    }
+
+    #[test]
+    fn split_layout_u64_max_does_not_overflow() {
+        let l = split_layout(u64::MAX, SplitKind::Flat);
+        assert_eq!(l.total_sectors, 1u64 << 55);
+        assert_eq!(l.extent_count, 1u64 << 33);
+        assert_eq!(l.last_extent_sectors, SPLIT_EXTENT_SECTORS);
+        assert_eq!(
+            l.sectors_of_extent(l.extent_count - 1),
+            SPLIT_EXTENT_SECTORS
+        );
+    }
+
+    // ====================================================================
+    // build_split_descriptor mechanics tests
+    // ====================================================================
+
+    /// Large enough for the descriptor of a 1000-extent image.
+    const DESC_BUF: usize = 65536;
+
+    fn split_len(extents: u64, kind: SplitKind) -> usize {
+        let layout = split_layout(extents * SPLIT_EXTENT_SECTORS * 512, kind);
+        assert_eq!(layout.extent_count, extents);
+        build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk")
+    }
+
+    #[test]
+    fn split_descriptor_measured_length_equals_written_length() {
+        for kind in [SplitKind::Sparse, SplitKind::Flat] {
+            for extents in [1u64, 2, 17, 1000] {
+                let layout = split_layout(extents * SPLIT_EXTENT_SECTORS * 512, kind);
+                let measured = build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk");
+                assert!(measured < DESC_BUF);
+                let mut buf = [0xAAu8; DESC_BUF];
+                let written = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+                assert_eq!(measured, written, "{extents} extents, {kind:?}");
+                assert_eq!(buf[written - 1], b'\n');
+                // A sentinel rather than a zero fill, over the whole tail
+                // rather than one position: zero would be caught only
+                // because every emitted byte happens to be non-zero ASCII,
+                // and one position would miss a discontiguous write.
+                assert!(
+                    buf[written..].iter().all(|&b| b == 0xAA),
+                    "wrote past the reported length: {extents} extents, {kind:?}"
+                );
+            }
+        }
+        assert!(split_len(1000, SplitKind::Sparse) > split_len(17, SplitKind::Sparse));
+    }
+
+    #[test]
+    fn split_descriptor_of_no_extents_is_one_the_parser_refuses() {
+        let layout = split_layout(0, SplitKind::Sparse);
+        assert_eq!(layout.extent_count, 0);
+        let mut buf = [0u8; 1024];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        // Well formed, and empty of extents: the header, the geometry and
+        // no `RW` line anywhere.
+        assert!(text.contains("createType=\"twoGbMaxExtentSparse\"\n"));
+        assert!(text.contains("ddb.geometry.cylinders = \"0\"\n"));
+        assert!(!text.contains("RW "));
+        // So the crate can write a descriptor it cannot read. A caller has
+        // to refuse the size; this pins what happens if one does not.
+        assert!(matches!(
+            parse_descriptor_extents(text),
+            Err(ExtentParseError::NoExtents)
+        ));
+    }
+
+    #[test]
+    fn split_descriptor_short_buffer_returns_needed_length() {
+        let layout = split_layout(5 * GIB, SplitKind::Sparse);
+        let mut full = [0u8; 4096];
+        let need = build_split_descriptor(&mut full, 0, &layout, b"image", b".vmdk");
+        assert!(need < full.len());
+
+        let mut short = [0xAAu8; 4096];
+        let got = build_split_descriptor(&mut short[..need - 1], 0, &layout, b"image", b".vmdk");
+        assert_eq!(got, need);
+        // The final write does not fit, so it is skipped entirely: the
+        // buffer holds the output up to that line and none of the line.
+        let copied = need - b"ddb.toolsVersion = \"2147483647\"\n".len();
+        assert_eq!(short[..copied], full[..copied]);
+        // Past what was copied, and still inside the slice the emitter was
+        // given, the bytes are the caller's own. That is what separates an
+        // all-or-nothing `put` from a byte-level truncation, and it has to
+        // be asserted inside the slice: index `need - 1` was never handed
+        // to the emitter, so it reads 0xAA whatever the emitter does.
+        assert!(copied < need - 1);
+        assert!(short[copied..need - 1].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn split_descriptor_empty_buffer_writes_nothing() {
+        let layout = split_layout(5 * GIB, SplitKind::Flat);
+        let need = build_split_descriptor(&mut [], 0, &layout, b"image", b".vmdk");
+        assert!(need > 0);
+        // An offset past the end of the buffer is measured, not a panic.
+        let mut buf = [0x55u8; 8];
+        let got = build_split_descriptor(&mut buf, 1 << 20, &layout, b"image", b".vmdk");
+        assert_eq!(got, need);
+        assert_eq!(buf, [0x55u8; 8]);
+    }
+
+    #[test]
+    fn split_descriptor_writes_at_an_offset_within_the_buffer() {
+        let layout = split_layout(GIB, SplitKind::Sparse);
+        let mut plain = [0u8; 1024];
+        let n = build_split_descriptor(&mut plain, 0, &layout, b"image", b".vmdk");
+
+        // The same descriptor, written 16 bytes in. The return value is the
+        // descriptor's length, not the position the cursor ended at.
+        let mut buf = [0x5Au8; 1024];
+        let got = build_split_descriptor(&mut buf, 16, &layout, b"image", b".vmdk");
+        assert_eq!(got, n);
+        assert!(buf[..16].iter().all(|&b| b == 0x5A));
+        assert_eq!(buf[16..16 + n], plain[..n]);
+        assert!(buf[16 + n..].iter().all(|&b| b == 0x5A));
+    }
+
+    #[test]
+    fn split_descriptor_sparse_5g_text() {
+        let want = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+createType=\"twoGbMaxExtentSparse\"\n\n# Extent description\n\
+RW 4194304 SPARSE \"image-s001.vmdk\"\nRW 4194304 SPARSE \"image-s002.vmdk\"\n\
+RW 2097152 SPARSE \"image-s003.vmdk\"\n\n# The Disk Data Base\n#DDB\n\n\
+ddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\n\
+ddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\n\
+ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
+        let layout = split_layout(5 * GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 2048];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        assert_eq!(&buf[..n], &want[..]);
+    }
+
+    #[test]
+    fn format_u64_padded_pads_to_a_floor_and_clamps_the_width() {
+        let mut buf = [0u8; 20];
+        // Zero at width zero takes the fallback that writes one digit.
+        assert_eq!(format_u64_padded(0, 0, &mut buf), &b"0"[..]);
+        assert_eq!(format_u64_padded(0, 3, &mut buf), &b"000"[..]);
+        assert_eq!(format_u64_padded(7, 1, &mut buf), &b"7"[..]);
+        // A floor, so a longer value is written in full and not truncated.
+        assert_eq!(format_u64_padded(12345, 3, &mut buf), &b"12345"[..]);
+        assert_eq!(
+            format_u64_padded(u64::MAX, 3, &mut buf),
+            &b"18446744073709551615"[..]
+        );
+        // A width past the twenty digits a u64 can need is clamped to the
+        // buffer rather than running off it.
+        assert_eq!(
+            format_u64_padded(1, 25, &mut buf),
+            &b"00000000000000000001"[..]
+        );
+    }
+
+    #[test]
+    fn split_descriptor_flat_5g_text() {
+        let want = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+createType=\"twoGbMaxExtentFlat\"\n\n# Extent description\n\
+RW 4194304 FLAT \"image-f001.vmdk\" 0\nRW 4194304 FLAT \"image-f002.vmdk\" 0\n\
+RW 2097152 FLAT \"image-f003.vmdk\" 0\n\n# The Disk Data Base\n#DDB\n\n\
+ddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\n\
+ddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\n\
+ddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n";
+        let layout = split_layout(5 * GIB, SplitKind::Flat);
+        let mut buf = [0u8; 2048];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        assert_eq!(&buf[..n], &want[..]);
+    }
+
+    #[test]
+    fn split_descriptor_index_padding_is_a_floor() {
+        let layout = split_layout(1000 * SPLIT_EXTENT_SECTORS * 512, SplitKind::Sparse);
+        let mut buf = [0u8; DESC_BUF];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+        let text = &buf[..n];
+        let has = |needle: &[u8]| text.windows(needle.len()).any(|w| w == needle);
+        // A floor: a short index is zero-padded up to three digits ...
+        assert!(has(b"\"image-s001.vmdk\""));
+        assert!(has(b"\"image-s099.vmdk\""));
+        // ... and not a cap: a longer one is written in full.
+        assert!(has(b"\"image-s999.vmdk\""));
+        assert!(has(b"\"image-s1000.vmdk\""));
+        // The whole thousandth line, not just the name: qemu writes this
+        // verbatim at a thousand extents, measured on four builds.
+        assert!(has(b"RW 4194304 SPARSE \"image-s1000.vmdk\"\n"));
+    }
+
+    #[test]
+    fn split_descriptor_names_an_extent_with_an_empty_prefix() {
+        // Splitting a name that is nothing but an extension at its last
+        // dot leaves an empty prefix, so the tag leads the name. This is
+        // what qemu's own decompose produces for `.hid`.
+        let layout = split_layout(GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 1024];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"", b".hid");
+        let text = &buf[..n];
+        let has = |needle: &[u8]| text.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"RW 2097152 SPARSE \"-s001.hid\"\n"));
+    }
+
+    // ====================================================================
+    // split descriptor parity with qemu
+    // ====================================================================
+    //
+    // The descriptors below are what `qemu-img create -f vmdk -o
+    // subformat=twoGbMaxExtentSparse|twoGbMaxExtentFlat` writes, copied from
+    // `tests/golden/qemu-create-pins.json`: the 6.2.0-to-10.2.0 version group,
+    // with the CID written as `fffffffe` and the extent names filled in from the
+    // stem `image`. Every pinned qemu build in that range agrees on them, and
+    // each constant names the pin case it came from. The crate tests cannot
+    // read that file (the container mounts only this repository, and the
+    // workspace has no JSON parser), so a change to the pins has to be copied
+    // here by hand; `tools/ci/check-vmdk-split-pins.py` guards the copy.
+    //
+    // The literals keep the shape of `FLAT_DESCRIPTOR` above (real newlines,
+    // every line at column zero) so that the guard can find them as text.
+
+    /// Pin case `vmdk-multi-sparse-1M`.
+    const PIN_SPARSE_1M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 2048 SPARSE \"image-s001.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"2\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-2G`.
+    const PIN_SPARSE_2G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4161\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-2049M`.
+    const PIN_SPARSE_2049M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 2048 SPARSE \"image-s002.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4163\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-4G`.
+    const PIN_SPARSE_4G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"8322\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-5G`.
+    const PIN_SPARSE_5G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+RW 2097152 SPARSE \"image-s003.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"10402\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-sparse-21G`.
+    const PIN_SPARSE_21G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"image-s001.vmdk\"
+RW 4194304 SPARSE \"image-s002.vmdk\"
+RW 4194304 SPARSE \"image-s003.vmdk\"
+RW 4194304 SPARSE \"image-s004.vmdk\"
+RW 4194304 SPARSE \"image-s005.vmdk\"
+RW 4194304 SPARSE \"image-s006.vmdk\"
+RW 4194304 SPARSE \"image-s007.vmdk\"
+RW 4194304 SPARSE \"image-s008.vmdk\"
+RW 4194304 SPARSE \"image-s009.vmdk\"
+RW 4194304 SPARSE \"image-s010.vmdk\"
+RW 2097152 SPARSE \"image-s011.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"43690\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-1M`.
+    const PIN_FLAT_1M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 2048 FLAT \"image-f001.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"2\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-2G`.
+    const PIN_FLAT_2G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4161\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-2049M`.
+    const PIN_FLAT_2049M: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 2048 FLAT \"image-f002.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"4163\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-4G`.
+    const PIN_FLAT_4G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"8322\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-5G`.
+    const PIN_FLAT_5G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+RW 2097152 FLAT \"image-f003.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"10402\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Pin case `vmdk-multi-flat-21G`.
+    const PIN_FLAT_21G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"image-f001.vmdk\" 0
+RW 4194304 FLAT \"image-f002.vmdk\" 0
+RW 4194304 FLAT \"image-f003.vmdk\" 0
+RW 4194304 FLAT \"image-f004.vmdk\" 0
+RW 4194304 FLAT \"image-f005.vmdk\" 0
+RW 4194304 FLAT \"image-f006.vmdk\" 0
+RW 4194304 FLAT \"image-f007.vmdk\" 0
+RW 4194304 FLAT \"image-f008.vmdk\" 0
+RW 4194304 FLAT \"image-f009.vmdk\" 0
+RW 4194304 FLAT \"image-f010.vmdk\" 0
+RW 2097152 FLAT \"image-f011.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"43690\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// The descriptor of `custom/format-coverage/vmdk-split-sparse-33g.vmdk` in
+    /// instar-testdata, written by qemu-img with its `CID=` line replaced.
+    const QEMU_SPLIT_SPARSE_33G: &str = "\
+# Disk DescriptorFile
+version=1
+CID=fffffffe
+parentCID=ffffffff
+createType=\"twoGbMaxExtentSparse\"
+
+# Extent description
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s001.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s002.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s003.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s004.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s005.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s006.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s007.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s008.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s009.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s010.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s011.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s012.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s013.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s014.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s015.vmdk\"
+RW 4194304 SPARSE \"vmdk-split-sparse-33g-s016.vmdk\"
+RW 2097152 SPARSE \"vmdk-split-sparse-33g-s017.vmdk\"
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = \"4\"
+ddb.geometry.cylinders = \"68656\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.sectors = \"63\"
+ddb.adapterType = \"ide\"
+ddb.toolsVersion = \"2147483647\"
+";
+
+    /// Parity table: (pin case, virtual size in bytes, kind, expected text).
+    ///
+    /// The two existing-extent cases deliberately share the plain 5 GiB
+    /// text: a file already sitting where an extent goes does not change
+    /// what qemu writes in the descriptor. That the two pinned descriptors
+    /// really are identical is checked where the pin file can be read, in
+    /// `tools/ci/check-vmdk-split-pins.py`; asserting it here would
+    /// only compare a constant with itself.
+    fn pin_table() -> [(&'static str, u64, SplitKind, &'static str); 14] {
+        [
+            (
+                "vmdk-multi-sparse-1M",
+                1048576,
+                SplitKind::Sparse,
+                PIN_SPARSE_1M,
+            ),
+            (
+                "vmdk-multi-sparse-2G",
+                2147483648,
+                SplitKind::Sparse,
+                PIN_SPARSE_2G,
+            ),
+            (
+                "vmdk-multi-sparse-2049M",
+                2148532224,
+                SplitKind::Sparse,
+                PIN_SPARSE_2049M,
+            ),
+            (
+                "vmdk-multi-sparse-4G",
+                4294967296,
+                SplitKind::Sparse,
+                PIN_SPARSE_4G,
+            ),
+            (
+                "vmdk-multi-sparse-5G",
+                5368709120,
+                SplitKind::Sparse,
+                PIN_SPARSE_5G,
+            ),
+            (
+                "vmdk-multi-sparse-21G",
+                22548578304,
+                SplitKind::Sparse,
+                PIN_SPARSE_21G,
+            ),
+            (
+                "vmdk-multi-sparse-5G-existing-extent",
+                5368709120,
+                SplitKind::Sparse,
+                PIN_SPARSE_5G,
+            ),
+            ("vmdk-multi-flat-1M", 1048576, SplitKind::Flat, PIN_FLAT_1M),
+            (
+                "vmdk-multi-flat-2G",
+                2147483648,
+                SplitKind::Flat,
+                PIN_FLAT_2G,
+            ),
+            (
+                "vmdk-multi-flat-2049M",
+                2148532224,
+                SplitKind::Flat,
+                PIN_FLAT_2049M,
+            ),
+            (
+                "vmdk-multi-flat-4G",
+                4294967296,
+                SplitKind::Flat,
+                PIN_FLAT_4G,
+            ),
+            (
+                "vmdk-multi-flat-5G",
+                5368709120,
+                SplitKind::Flat,
+                PIN_FLAT_5G,
+            ),
+            (
+                "vmdk-multi-flat-21G",
+                22548578304,
+                SplitKind::Flat,
+                PIN_FLAT_21G,
+            ),
+            (
+                "vmdk-multi-flat-5G-existing-extent",
+                5368709120,
+                SplitKind::Flat,
+                PIN_FLAT_5G,
+            ),
+        ]
+    }
+
+    #[test]
+    fn split_descriptor_matches_every_pinned_qemu_descriptor() {
+        for (case, bytes, kind, want) in pin_table() {
+            let layout = split_layout(bytes, kind);
+            let mut buf = [0u8; 4096];
+            let n = build_split_descriptor(&mut buf, 0, &layout, b"image", b".vmdk");
+            assert!(n <= buf.len(), "{case}: descriptor needs {n} bytes");
+            assert_eq!(
+                core::str::from_utf8(&buf[..n]).unwrap(),
+                want,
+                "descriptor differs from qemu's for pin case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_descriptor_matches_qemu_written_33g_fixture() {
+        // Seventeen extents and 68656 cylinders: past both the sixteen-extent
+        // and the 65535-cylinder points a smaller case cannot reach.
+        let layout = split_layout(33 * GIB, SplitKind::Sparse);
+        let mut buf = [0u8; 4096];
+        let n = build_split_descriptor(&mut buf, 0, &layout, b"vmdk-split-sparse-33g", b".vmdk");
+        assert!(n <= buf.len());
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap(),
+            QEMU_SPLIT_SPARSE_33G
+        );
+    }
+
+    /// Build `<stem><letter><NNN>.vmdk` for a 1-based extent index below 1000.
+    fn extent_name<'a>(out: &'a mut [u8; 64], stem: &[u8], letter: u8, index: usize) -> &'a str {
+        let mut n = 0;
+        for part in [
+            stem,
+            &[
+                b'-',
+                letter,
+                b'0' + (index / 100) as u8,
+                b'0' + (index / 10 % 10) as u8,
+                b'0' + (index % 10) as u8,
+            ][..],
+            b".vmdk",
+        ] {
+            out[n..n + part.len()].copy_from_slice(part);
+            n += part.len();
+        }
+        core::str::from_utf8(&out[..n]).unwrap()
+    }
+
+    /// Emit a descriptor, parse it back, and check every extent against the
+    /// shape qemu pins for the size: all extents 4194304 sectors except the
+    /// last, which holds `last` sectors.
+    fn check_round_trip(bytes: u64, kind: SplitKind, stem: &[u8], count: usize, last: u64) {
+        let layout = split_layout(bytes, kind);
+        let mut buf = [0u8; 4096];
+        let n = build_split_descriptor(&mut buf, 0, &layout, stem, b".vmdk");
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        let parsed = parse_descriptor_extents(text).unwrap();
+        assert_eq!(parsed.len(), count);
+        let (want_kind, letter) = match kind {
+            SplitKind::Sparse => (ExtentKind::Sparse, b's'),
+            SplitKind::Flat => (ExtentKind::Flat, b'f'),
+        };
+        for i in 0..count {
+            let e = parsed.get(i).unwrap();
+            let mut name = [0u8; 64];
+            assert_eq!(e.filename, extent_name(&mut name, stem, letter, i + 1));
+            assert_eq!(e.kind, want_kind, "extent {i}");
+            assert_eq!(e.access, ExtentAccess::Rw, "extent {i}");
+            assert_eq!(e.offset_sectors, 0, "extent {i}");
+            let sectors = if i + 1 == count { last } else { 4194304 };
+            assert_eq!(e.size_sectors, sectors, "extent {i}");
+        }
+    }
+
+    #[test]
+    fn split_descriptor_round_trips_through_the_extent_parser() {
+        // 5 GiB: three extents, the last half-sized (pin case
+        // vmdk-multi-sparse-5G / vmdk-multi-flat-5G).
+        check_round_trip(5 * GIB, SplitKind::Sparse, b"image", 3, 2097152);
+        check_round_trip(5 * GIB, SplitKind::Flat, b"image", 3, 2097152);
+        // 21 GiB: eleven extents (pin case vmdk-multi-*-21G).
+        check_round_trip(21 * GIB, SplitKind::Sparse, b"image", 11, 2097152);
+        check_round_trip(21 * GIB, SplitKind::Flat, b"image", 11, 2097152);
+        // 1 MiB: one extent holding 2048 sectors (pin case vmdk-multi-*-1M).
+        check_round_trip(MIB, SplitKind::Sparse, b"image", 1, 2048);
+        // 33 GiB: seventeen extents (vmdk-split-sparse-33g.vmdk).
+        check_round_trip(
+            33 * GIB,
+            SplitKind::Sparse,
+            b"vmdk-split-sparse-33g",
+            17,
+            2097152,
+        );
     }
 }
 

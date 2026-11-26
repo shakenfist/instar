@@ -464,6 +464,28 @@ jobs:
       - name: Test the NamedTemporaryFile guard
         run: tools/ci/test-check-no-named-temporary-file.sh
 
+      # A test that reaches out of tests/ into the repository passes on
+      # the PR gate, which runs the suite from the checkout, and fails on
+      # every package-matrix leg, which copies tests/ alone to /tmp and
+      # runs it there against an installed package. Two such tests ejected
+      # #968 from the queue after a green PR. Pure text parsing: no
+      # docker, no cargo, no testdata.
+      - name: Check tests build no path outside tests/
+        run: tools/ci/check-tests-relocatable.sh
+
+      - name: Test the relocatable tests guard
+        run: tools/ci/test-check-tests-relocatable.sh
+
+      # The split VMDK descriptor literals against the qemu pin. This is
+      # the check that moved out of tests/ for the reason above. Its
+      # fixture half needs a testdata clone, which this job does not have,
+      # so that half runs in integration-core.
+      - name: Check the split VMDK descriptor literals
+        run: tools/ci/check-vmdk-split-pins.py --no-fixture
+
+      - name: Test the split VMDK pin guard
+        run: tools/ci/test-check-vmdk-split-pins.sh
+
       # The testdata fixture guard. Every test that reads these
       # fixtures skips rather than fails when its file is absent, so a
       # partial checkout used to shrink the suite with CI still green.
@@ -1108,6 +1130,16 @@ jobs:
       # behaviour being guarded is one constant away from regressing,
       # so the skip has to be loud here; see
       # tests/test_slow_host_read.py.
+      # The fixture half of the split VMDK literal guard, which needs a
+      # testdata clone; the pin-against-source half runs in ci-tooling.
+      # The 33 GiB fixture is the only committed witness past sixteen
+      # extents and past 65535 cylinders, so the guard fails rather than
+      # passes quietly when the clone is absent. Text only: no instar.
+      - name: Check the split VMDK fixture literal
+        run: >-
+          ${GITHUB_WORKSPACE}/instar/tools/ci/check-vmdk-split-pins.py
+          --testdata "${TESTDATA_PATH}"
+
       - name: Run core integration tests
         env:
           INSTAR_REQUIRE_LIBVHDI: '1'

@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=172
+EXPECTED_CASES=179
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -3071,6 +3071,59 @@ integration_case 'oracle-vhdx-has-parent-bit' "${CREATE_LIB}" \
     '        false,
     );' \
     "${ORACLE_VHDX}"
+
+# --- the split VMDK descriptor emitter ---------------------------------
+#
+# build_split_descriptor writes the text qemu writes for a
+# twoGbMaxExtentSparse or twoGbMaxExtentFlat image, and the tests pin it
+# byte for byte against the descriptors qemu-img produced. Each case
+# breaks one property of that text that a reader would not notice:
+# every one still parses as a descriptor.
+
+VMDK_LIB='src/crates/vmdk/src/lib.rs'
+
+rust_case 'vmdk-split-descriptor-drops-tools-version' "${VMDK_LIB}" \
+    '    put(b"ddb.toolsVersion = \"2147483647\"\n");' \
+    '    // MUTATED' \
+    vmdk 'split_descriptor_sparse_5g_text'
+
+rust_case 'vmdk-split-descriptor-sparse-named-flat' "${VMDK_LIB}" \
+    'SplitKind::Sparse => (b"twoGbMaxExtentSparse", b" SPARSE \"", b"-s", b"\"\n"),' \
+    'SplitKind::Sparse => (b"twoGbMaxExtentSparse", b" SPARSE \"", b"-f", b"\"\n"), // MUTATED' \
+    vmdk 'split_descriptor_sparse_5g_text'
+
+rust_case 'vmdk-split-descriptor-index-width-two' "${VMDK_LIB}" \
+    '        put(format_u64_padded(index + 1, 3, &mut num_buf));' \
+    '        put(format_u64_padded(index + 1, 2, &mut num_buf)); // MUTATED' \
+    vmdk 'split_descriptor_index_padding_is_a_floor'
+
+rust_case 'vmdk-split-descriptor-last-extent-not-clamped' "${VMDK_LIB}" \
+    '            self.last_extent_sectors
+        } else {' \
+    '            SPLIT_EXTENT_SECTORS // MUTATED
+        } else {' \
+    vmdk 'split_layout_sectors_of_extent'
+
+rust_case 'vmdk-split-descriptor-blank-line-after-ddb-removed' "${VMDK_LIB}" \
+    '    put(b"#DDB\n\n");' \
+    '    put(b"#DDB\n"); // MUTATED' \
+    vmdk 'split_descriptor_sparse_5g_text'
+
+rust_case 'vmdk-split-descriptor-flat-drops-start-offset' "${VMDK_LIB}" \
+    'SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\" 0\n"),' \
+    'SplitKind::Flat => (b"twoGbMaxExtentFlat", b" FLAT \"", b"-f", b"\"\n"), // MUTATED' \
+    vmdk 'split_descriptor_flat_5g_text'
+
+rust_case 'vmdk-split-descriptor-put-truncates-a-line' "${VMDK_LIB}" \
+    '        if let Some(dst) = buf.get_mut(pos..end) {
+            dst.copy_from_slice(bytes);
+        }' \
+    '        // MUTATED
+        let fits = buf.len().saturating_sub(pos).min(bytes.len());
+        if let Some(dst) = buf.get_mut(pos..pos + fits) {
+            dst.copy_from_slice(&bytes[..fits]);
+        }' \
+    vmdk 'split_descriptor_short_buffer_returns_needed_length'
 
 # ---------------------------------------------------------------------
 # Totals
