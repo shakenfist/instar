@@ -118,10 +118,10 @@ fi
 # and restores exactly the failure mode.
 #
 # The `# renovate:` comments are the other silent-failure surface. They
-# are what puts each pin under Renovate's 3-day minimumReleaseAge, and a
-# comment that stops matching does not error anywhere: the pin simply
-# freezes forever, which is worse than the floating installs it
-# replaced.
+# are what puts each pin under the fleet preset's 3-day
+# minimumReleaseAge, and a comment that stops matching does not error
+# anywhere: the pin simply freezes forever, which is worse than the
+# floating installs it replaced.
 #
 # Rather than check those two things directly, the checks below make the
 # whole chain derivable from the crate name:

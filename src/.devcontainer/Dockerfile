@@ -10,9 +10,9 @@
 # image ships is the differential fuzzer's reference oracle, so a
 # silent base change would move that oracle). The :debian tag is kept
 # alongside the digest so Renovate's Docker manager walks the digest
-# forward with a PR whenever the rolling tag is rebuilt upstream; the
-# renovate.json digest rule routes those as reviewable (non-automerged)
-# PRs.
+# forward with a PR whenever the rolling tag is rebuilt upstream. The
+# fleet preset that renovate.json extends keeps digest updates
+# non-automerged, so those arrive as reviewable PRs.
 FROM mcr.microsoft.com/devcontainers/base:debian@sha256:025b74bb5f7ac53edd77e01aa7188c359aab100e23a2f6220bde50bbb9fd31dd
 
 # Retry transient apt fetch failures rather than failing the image
@@ -114,8 +114,9 @@ RUN umask 0000 && rustup component add rust-src llvm-tools-preview
 #   broke this layer for every PR until upstream shipped 1.13.2.
 #
 #   The version pins keep the tools themselves out of that same race, and
-#   put them under Renovate -- whose repo-wide minimumReleaseAge of 3
-#   days is what actually holds a fresh bad release back. The
+#   put them under Renovate -- whose fleet-wide minimumReleaseAge of 3
+#   days, set in the fleet preset, is what actually holds a fresh bad
+#   release back. The
 #   `# renovate:` comments drive the customManagers entry in
 #   renovate.json, so keep each comment directly above its ARG.
 #

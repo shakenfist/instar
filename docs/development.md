@@ -1261,6 +1261,32 @@ Note the interaction with the Renovate rule that freezes
 2.31 sets the floor of the shipped binary) while leaving the crate
 pins in the same file managed.
 
+## Dependency updates
+
+No workflow here runs Renovate. It runs centrally, from
+`shakenfist/development`'s fleet runner, over every repository in the
+organisation, and `renovate.json` extends that repository's
+`renovate-fleet` preset. The preset holds the policy shared across the
+fleet: the schedule (Saturdays, Sydney time, with majors and the
+grouped "CI tooling" pull request on the first of the month), the
+3-day `minimumReleaseAge`, automerge off, the pre-commit manager, SHA
+pins for third-party actions, the dependency dashboard and the
+assignee. [The Renovate audit](https://github.com/shakenfist/development/blob/main/docs/audits/renovate.md)
+describes the runner, its cadence and the preset's contents.
+
+`renovate.json` keeps only what is instar's own: the bullseye freeze on
+the release image's base (see "Do not bump the release image's base"
+above), the crate groups, and the `customManagers` entry for the cargo
+tool pins, which `tools/ci/check-devcontainer-pins.sh` cross-checks
+against both Dockerfiles. Local `packageRules` are applied after the
+preset's, so they win where the two overlap.
+
+Do not add a `.github/workflows/renovate.yml` back: two Renovate
+instances over one repository race on branch creation. If updates seem
+to have stopped, the dependency dashboard issue shows when Renovate
+last saw this repository, and the fleet runner's run history in
+`shakenfist/development` shows why.
+
 ## CI tooling guards
 
 The `ci-tooling` CI job runs the cheap guards over CI's own tooling:
@@ -1333,7 +1359,6 @@ Each review item has an `action` field:
 - `.github/workflows/agent-context.yml` - skillsaw lint of `AGENTS.md`, `CLAUDE.md` and `.claude/`, by running the pre-commit hook (PR and push to develop, both path-filtered)
 - `.github/workflows/lint.yml` - rustfmt and clippy in the containerised toolchain (PR, path-filtered to the Rust tree)
 - `.github/workflows/export-repo-config.yml` - nightly export of this repository's GitHub settings for the fleet configuration audit
-- `.github/workflows/renovate.yml` - self-hosted Renovate dependency updates (hourly)
 - `.github/workflows/mermaid-lint.yml` - renders every mermaid diagram in the repository's markdown and fails on any that does not parse (PR, push to develop, and workflow_dispatch; path-filtered to markdown)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
