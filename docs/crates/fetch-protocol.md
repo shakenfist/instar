@@ -306,8 +306,10 @@ since the request header is fixed-size.
 ## Lifecycle
 
 The fetcher is a child of the host process, started and stopped by it. The
-code is in the VMM's `fetch.rs`; a `RemoteSource` owns the child process and
-the `FetchClient` together, because they are one lifetime.
+code is in the VMM's `fetch` module, with the probe of what the kernel can
+confine and the limits set before `exec` in `fetch/confine.rs`; a
+`RemoteSource` owns the child process and the `FetchClient` together, because
+they are one lifetime.
 
 **Spawning.** The host resolves `instar-fetch` from the directory it loads its
 guest binaries from (`INSTAR_BIN_DIR`, then the executable's own directory,

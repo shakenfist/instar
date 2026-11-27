@@ -35,7 +35,7 @@
 8711 src/shared/src/lib.rs
 2802 src/vmm/src/chain.rs
 26795 src/vmm/src/main.rs
-1594 tests/base.py
+1601 tests/base.py
 1520 tests/test_adversarial.py
 2253 tests/test_bench.py
 1553 tests/test_bitmap.py

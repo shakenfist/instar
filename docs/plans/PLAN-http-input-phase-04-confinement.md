@@ -437,7 +437,7 @@ push.
 3. `/proc/<pid>/limits` of a live fetcher shows `Max processes` 0,
    `Max core file size` 0 and `Max open files` 8, asserted as those
    three values.
-4. `grep -n 'RLIMIT_FSIZE\|PR_SET_DUMPABLE' src/vmm/src/fetch.rs
+4. `grep -rn 'RLIMIT_FSIZE\|PR_SET_DUMPABLE' src/vmm/src/fetch/
    src/fetch/src/` finds nothing: decisions 7 and 12 held.
 5. A child with the real Landlock policy installed can `pread` an
    inherited descriptor and cannot `open` the same path, asserted from
@@ -658,6 +658,21 @@ privileged side prints the sentence step 4d added. The same preload on
 the plain-path route changes nothing, which is what says the kill is the
 policy's doing rather than the library's. The probe is
 `p04-step-4d-review/outside-the-policy.c` in the session scratchpad.
+
+**The source size ratchet, 2026-11-28.** Rebasing onto develop brought
+in `tools/source-size-ratchet.py`, which this phase's work had not yet
+met: `src/vmm/src/fetch.rs` had grown to 1,630 lines, over the 1,500-line
+threshold and not in the baseline. It was split rather than baselined,
+because phase 5 adds the HTTP route to the same file. The module became
+`src/vmm/src/fetch/mod.rs`, following `virtio/`, and the half of the
+confinement that runs in instar -- the layer constants, the kernel probe,
+the `--verbose` report, `set_hard_limit` and `CHILD_MAX_FILES` -- moved
+to `fetch/confine.rs` with the unit tests that exercise only those. The
+tests that spawn a fetcher stayed in `mod.rs`, because they test the
+spawn. The code moved unchanged apart from `pub(super)` on what the
+parent uses and two comments that said "here" or "this module".
+`tests/base.py` grew by seven lines in step 4d and its baseline entry was
+raised to match.
 
 ## Mutation results
 
