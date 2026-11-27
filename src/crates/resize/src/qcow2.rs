@@ -1896,12 +1896,9 @@ fn ensure_block_staged(
             return Ok(());
         }
     }
-    // Block not staged. The block-identification helper is the
-    // single source of truth for which blocks a flavour touches, so
-    // this means that helper is wrong (or QCOW2_MAX_REQUIRED_BLOCKS
-    // is too small), not that a caller should restage more. Nothing
-    // retries on it, deliberately: see "Image-size ceiling" in
-    // docs/resize.md.
+    // Block not staged: the block-identification helper, the single source of truth for which
+    // blocks a flavour touches, is wrong (or QCOW2_MAX_REQUIRED_BLOCKS is too small); a wider
+    // restage would not help, so nothing retries on it: see "Image-size ceiling" in docs/resize.md.
     Err(ResizeError::ScratchTooSmall)
 }
 
