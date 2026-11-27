@@ -933,3 +933,37 @@ and path-quoting follow-ups are
 reproducible in one command -- is
 [#985](https://github.com/shakenfist/instar/issues/985). Both are named
 in the master plan's Future work.
+
+## Merge queue: the source size ratchet (#984)
+
+2026-11-28. The first merge-queue run failed `Check the source size
+ratchet` (run
+[45940303198](https://github.com/shakenfist/instar/actions/runs/45940303198)).
+The ratchet landed in #967 after this branch was cut, so the pull
+request's own CI never ran it; the merge group, built on the new
+`develop`, did. Three files had grown past their entries:
+`src/vmm/src/main.rs` by 1,082 lines, `tests/test_create.py` by 6 and
+`tools/mutate-differencing.sh` by 37.
+
+The branch was rebased onto `develop` and the flat VMDK create path
+moved out of `main.rs` into `src/vmm/src/vmdk_create.rs`: the extent
+naming and path set, both descriptor builders, `VmdkCreatedFiles`, both
+writers and their `run_create_*` entry points, the two subformat
+predicates, the flat argument validator, and the four unit test modules
+that cover them. It is a move with no change of behaviour; seven
+functions became `pub(super)` because `main.rs` still calls them from
+convert, `run_create` and `validate_create_args`. `main.rs` is now
+26,795 lines, below the 26,811 it was baselined at, and its entry was
+lowered with `--update`.
+
+The five mutation cases this phase added named `main.rs` as their
+target and now name `vmdk_create.rs`; `--check-patterns` lands all
+184, and the five re-run 5 PASS, 0 FAIL, 0 BROKEN.
+
+The other two entries were raised by hand. `test_create.py`'s growth is
+one existing test renamed and re-asserted for the cleanup fix, with a
+docstring saying why the truncated file survives; the test belongs
+beside the rest of `TestCreateVmdkFlat`, and the phase's new tests
+already went to a file of their own. `mutate-differencing.sh` is one
+case list by design -- `EXPECTED_CASES` asserts its total -- and
+splitting it would split that count.

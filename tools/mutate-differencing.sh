@@ -3132,22 +3132,24 @@ rust_case 'vmdk-split-descriptor-put-truncates-a-line' "${VMDK_LIB}" \
 # as `unwrap_err` on an `Ok`; the fourth is caught by an assertion on
 # the surviving file.
 
-rust_case 'vmdk-split-create-extent-ceiling-off-by-one' "${VMM_MAIN_LIB}" \
+VMM_VMDK_CREATE='src/vmm/src/vmdk_create.rs'
+
+rust_case 'vmdk-split-create-extent-ceiling-off-by-one' "${VMM_VMDK_CREATE}" \
     '    if layout.extent_count > vmdk::MAX_EXTENTS as u64 {' \
     '    if layout.extent_count > vmdk::MAX_EXTENTS as u64 + 1 { // MUTATED' \
     instar 'one_byte_past_the_table_is_refused'
 
-rust_case 'vmdk-split-create-zero-size-guard-removed' "${VMM_MAIN_LIB}" \
+rust_case 'vmdk-split-create-zero-size-guard-removed' "${VMM_VMDK_CREATE}" \
     '    if layout.extent_count == 0 {' \
     '    if false && layout.extent_count == 0 { // MUTATED' \
     instar 'a_zero_size_is_refused_with_its_own_message'
 
-rust_case 'vmdk-split-create-existing-extent-not-refused' "${VMM_MAIN_LIB}" \
+rust_case 'vmdk-split-create-existing-extent-not-refused' "${VMM_VMDK_CREATE}" \
     '        if std::fs::symlink_metadata(path).is_ok() {' \
     '        if false && std::fs::symlink_metadata(path).is_ok() { // MUTATED' \
     instar 'a_derived_extent_that_exists_is_refused_by_name'
 
-rust_case 'vmdk-create-cleanup-removes-every-opened-file' "${VMM_MAIN_LIB}" \
+rust_case 'vmdk-create-cleanup-removes-every-opened-file' "${VMM_VMDK_CREATE}" \
     '        self.opened.push((path.to_path_buf(), !existed));' \
     '        self.opened.push((path.to_path_buf(), true)); // MUTATED' \
     instar 'a_file_that_was_already_there_is_kept'
@@ -3157,7 +3159,7 @@ rust_case 'vmdk-create-cleanup-removes-every-opened-file' "${VMM_MAIN_LIB}" \
 # identifies this one. The case exists because the tests that used to
 # cover this call survived its removal: they planted their failure at a
 # path the plan refuses, so the writer never ran.
-rust_case 'vmdk-split-create-failure-keeps-its-extents' "${VMM_MAIN_LIB}" \
+rust_case 'vmdk-split-create-failure-keeps-its-extents' "${VMM_VMDK_CREATE}" \
     $'    let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);\n    let descriptor_len = match result {\n        Ok(n) => n,\n        Err(e) => {\n            opened.remove_created();\n' \
     $'    let result = write_vmdk_split_flat(descriptor_path, &layout, &paths, &mut opened);\n    let descriptor_len = match result {\n        Ok(n) => n,\n        Err(e) => {\n            // MUTATED: no cleanup\n' \
     instar 'split_failure_removes_the_extents_it_created'

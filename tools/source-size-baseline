@@ -34,7 +34,7 @@
 2212 src/operations/snapshot/src/main.rs
 8711 src/shared/src/lib.rs
 2802 src/vmm/src/chain.rs
-26811 src/vmm/src/main.rs
+26795 src/vmm/src/main.rs
 1594 tests/base.py
 1520 tests/test_adversarial.py
 2253 tests/test_bench.py
@@ -43,10 +43,10 @@
 1822 tests/test_commit.py
 1831 tests/test_compare.py
 7537 tests/test_convert.py
-3245 tests/test_create.py
+3251 tests/test_create.py
 2047 tests/test_dd.py
 5175 tests/test_differencing.py
 1623 tests/test_measure.py
 1573 tests/test_rebase.py
 1842 tests/test_resize.py
-3155 tools/mutate-differencing.sh
+3194 tools/mutate-differencing.sh
