@@ -12,13 +12,13 @@
 
 2006 scripts/create-vhd-testdata.sh
 6057 scripts/differential-fuzz.py
-3049 src/crates/create/src/lib.rs
+3042 src/crates/create/src/lib.rs
 3301 src/crates/create/tests/round_trip.rs
 3564 src/crates/measure/src/lib.rs
 1937 src/crates/qcow2-write-exec/src/lib.rs
 4426 src/crates/qcow2-write/src/lib.rs
 1711 src/crates/qcow2-write/tests/ordering.rs
-21160 src/crates/qcow2/src/lib.rs
+21316 src/crates/qcow2/src/lib.rs
 2297 src/crates/resize/src/qcow2.rs
 3280 src/crates/snapshot/src/qcow2.rs
 5424 src/crates/vhd/src/lib.rs
@@ -30,11 +30,11 @@
 1988 src/operations/commit/src/main.rs
 5459 src/operations/convert/src/main.rs
 2700 src/operations/info/src/main.rs
-2029 src/operations/rebase/src/main.rs
+2137 src/operations/rebase/src/main.rs
 2212 src/operations/snapshot/src/main.rs
-8711 src/shared/src/lib.rs
-2802 src/vmm/src/chain.rs
-26795 src/vmm/src/main.rs
+8820 src/shared/src/lib.rs
+2975 src/vmm/src/chain.rs
+26961 src/vmm/src/main.rs
 1594 tests/base.py
 1520 tests/test_adversarial.py
 2253 tests/test_bench.py
@@ -45,7 +45,7 @@
 7537 tests/test_convert.py
 3251 tests/test_create.py
 2047 tests/test_dd.py
-5175 tests/test_differencing.py
+5182 tests/test_differencing.py
 1623 tests/test_measure.py
 1573 tests/test_rebase.py
 1842 tests/test_resize.py
