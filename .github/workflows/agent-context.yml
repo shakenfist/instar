@@ -7,9 +7,9 @@
 # directly, so .pre-commit-config.yaml's rev is the only place the
 # skillsaw version is written down. skillsaw's rule set moves between
 # releases, and Renovate's pre-commit manager raises the hook bump as
-# its own reviewable pull request (automerge is off for minor and patch
-# here), so a second pin in this workflow would drift without anyone
-# choosing it. pre-commit itself is pinned, in
+# its own reviewable pull request (the fleet preset keeps automerge off;
+# see "Dependency updates" in docs/development.md), so a second pin in
+# this workflow would drift without anyone choosing it. pre-commit itself is pinned, in
 # tools/ci/pre-commit-requirements.txt: the harness that enforces the
 # hook rev should not be the one floating thing in the job.
 #

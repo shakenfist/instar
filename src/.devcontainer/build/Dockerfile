@@ -154,7 +154,7 @@ RUN umask 0000 && rustup component add rust-src llvm-tools-preview
 # src/.devcontainer/Dockerfile: --locked stops a broken transitive
 # dependency published upstream from breaking every from-scratch image
 # build (tinyvec 1.13.0, 2026-09-03), and the pins put the tool versions
-# under Renovate's 3-day minimumReleaseAge.
+# under the fleet preset's 3-day minimumReleaseAge.
 #
 # These are the same crates and the same versions the dev image installs.
 # Renovate raises one PR per crate covering every occurrence, so both
