@@ -1,4 +1,4 @@
-//! Large-image qcow2 grow tests (followup-01).
+//! Large-image qcow2 grow tests.
 //!
 //! These exercise the targeted refcount-block pre-pass at image
 //! sizes that the previous "stage every non-zero refcount block"

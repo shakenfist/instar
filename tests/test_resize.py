@@ -1696,7 +1696,7 @@ for _target in _CONSISTENCY_TARGETS:
 
 
 # ----------------------------------------------------------------------
-# Large-image grows (followup-01: targeted refcount-block pre-pass).
+# Large-image grows, which the targeted refcount-block pre-pass allows.
 # ----------------------------------------------------------------------
 #
 # Before the targeted pre-pass, the guest staged every non-zero

@@ -103,7 +103,7 @@ pub(crate) fn compute_append_requirements(
 }
 
 // ----------------------------------------------------------------
-// Targeted refcount-block pre-pass query (followup-01).
+// Targeted refcount-block pre-pass query.
 // ----------------------------------------------------------------
 
 /// Implementation of [`crate::compute_qcow2_grow_query`].  Mirrors
@@ -1896,9 +1896,9 @@ fn ensure_block_staged(
             return Ok(());
         }
     }
-    // Block not staged. The guest's pre-pass should have caught
-    // this; surface as ScratchTooSmall so the host can retry
-    // with a wider stage list.
+    // Block not staged: the block-identification helper, the single source of truth for which
+    // blocks a flavour touches, is wrong (or QCOW2_MAX_REQUIRED_BLOCKS is too small); a wider
+    // restage would not help, so nothing retries on it: see "Image-size ceiling" in docs/resize.md.
     Err(ResizeError::ScratchTooSmall)
 }
 
@@ -2073,7 +2073,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // compute_grow_query unit tests (followup-01).
+    // compute_grow_query unit tests.
     // ------------------------------------------------------------------
 
     /// Build a `Qcow2ResizeGrowQuery` for a small synthetic qcow2

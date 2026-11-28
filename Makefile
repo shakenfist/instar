@@ -201,6 +201,18 @@ metadata: instar-devcontainer
 # Run cargo audit against the workspace dependency tree. Reports
 # any open RUSTSEC advisories, exits non-zero on any vulnerability.
 # Used as part of the pre-release audit checklist.
+#
+# Two kinds of finding are not release blockers, and both have cost a
+# release gate an afternoon before. A *yanked crate* warning is read
+# from whatever Cargo.lock the working tree happens to hold, and
+# lockfiles are gitignored here: release.yml resolves dependencies
+# fresh, and a fresh resolution cannot select a yanked version, so the
+# fix is to update the local lock rather than to hold the release. An
+# advisory against a function instar never calls is deferred with the
+# unreachability recorded -- RUSTSEC-2026-0190, an unsound
+# anyhow::Error::downcast_mut, was deferred that way for v0.3.0, and
+# instar still calls no downcast_mut. Say which of the two a finding
+# is before deciding, because the advisory text cannot tell you.
 audit: instar-devcontainer
 	@echo "Running cargo audit..."
 	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
