@@ -530,6 +530,16 @@ impl QcowHeader {
 pub struct HeaderExtensionResults {
     /// Backing format from EXT_BACKING_FORMAT extension.
     pub backing_format: BackingFormat,
+    /// Byte offset of the backing-format name within the header
+    /// buffer (0 if no EXT_BACKING_FORMAT extension found). A
+    /// caller rewriting the recorded format patches here; the
+    /// extension's own length word is the four bytes before it.
+    pub backing_format_offset: usize,
+    /// Length of the backing-format name in bytes (0 if absent).
+    /// The bytes the record occupies are this rounded up to the
+    /// 8-byte boundary the next extension starts on, which is the
+    /// room a rewrite has without relaying out the header.
+    pub backing_format_len: usize,
     /// Byte offset of the data file name within the header buffer
     /// (0 if no DATA extension found).
     pub data_file_name_offset: usize,
@@ -562,14 +572,20 @@ pub struct HeaderExtensionResults {
 /// Parse QCOW2 header extensions from a header buffer.
 ///
 /// Walks all v3+ header extensions and returns the backing format
-/// and external data file name location (if present). Only applicable
-/// to v3+ headers (v2 has no extensions at the standard offsets).
+/// and external data file name location (if present). A v2 header
+/// returns nothing, although qemu does write extensions into v2
+/// headers from offset 72: the guest-side gates built on this
+/// (LUKS, external data file, bitmaps) read only v3 extensions, and
+/// widening that is its own change. A caller that must find a
+/// specific record in either version uses [`find_header_extension`].
 ///
 /// `header` is the same buffer passed to `QcowHeader::parse()`.
 /// `parsed` is the parsed header (needed for version check).
 pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExtensionResults {
     let mut result = HeaderExtensionResults {
         backing_format: BackingFormat::None,
+        backing_format_offset: 0,
+        backing_format_len: 0,
         data_file_name_offset: 0,
         data_file_name_len: 0,
         luks_header_offset: 0,
@@ -606,6 +622,8 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
         if ext_type == EXT_BACKING_FORMAT && ext_len > 0 {
             let format_bytes = &header[ext_offset + 8..ext_offset + 8 + ext_len];
             result.backing_format = BackingFormat::from_bytes(format_bytes);
+            result.backing_format_offset = ext_offset + 8;
+            result.backing_format_len = ext_len;
         } else if ext_type == EXT_EXTERNAL_DATA_FILE && ext_len > 0 {
             result.data_file_name_offset = ext_offset + 8;
             result.data_file_name_len = ext_len;
@@ -688,6 +706,44 @@ pub fn header_extension_area_end(cluster: &[u8], start: usize) -> Option<usize> 
             return None;
         }
         off = next;
+    }
+}
+
+/// Find one header extension record by type, walking from `start`.
+///
+/// Version-agnostic, like [`header_extension_area_end`]: pass
+/// [`QcowHeader::header_length`], which `parse` sets to
+/// [`V2_HEADER_EXTENSION_OFFSET`] for v2. qemu writes extensions
+/// into v2 headers too -- `qemu-img create -o compat=0.10 -F` records
+/// the backing format at offset 72 -- whereas
+/// [`parse_header_extensions`] returns nothing for v2, so a caller
+/// that must *rewrite* a record uses this.
+///
+/// Returns `(data_offset, data_len)` for the first record of type
+/// `wanted` whose body lies inside `header`. Returns `None` when
+/// the chain ends first, and equally when the walk runs off the end
+/// of `header` before finding it: a record past the buffer is
+/// indistinguishable from an absent one, so a caller holding less
+/// than the first cluster is only told about the part it holds.
+pub fn find_header_extension(header: &[u8], start: usize, wanted: u32) -> Option<(usize, usize)> {
+    let mut off = start;
+    loop {
+        let body = off.checked_add(8)?;
+        if body > header.len() {
+            return None;
+        }
+        let ext_type = be_u32(header, off);
+        let ext_len = be_u32(header, off + 4) as usize;
+        if ext_type == EXT_END {
+            return None;
+        }
+        if body.checked_add(ext_len)? > header.len() {
+            return None;
+        }
+        if ext_type == wanted {
+            return Some((body, ext_len));
+        }
+        off = body.checked_add((ext_len + 7) & !7)?;
     }
 }
 
@@ -4186,6 +4242,106 @@ mod tests {
         assert_eq!(
             parse_header_extensions(&buf, &hdr).backing_format,
             BackingFormat::None,
+        );
+    }
+
+    // ---- find_header_extension ----
+
+    /// Lay `(type, data)` records down from `off`, each padded to 8,
+    /// and close the chain with `EXT_END`.
+    fn put_extensions(buf: &mut [u8], mut off: usize, records: &[(u32, &[u8])]) {
+        for (ext_type, data) in records {
+            buf[off..off + 4].copy_from_slice(&ext_type.to_be_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&(data.len() as u32).to_be_bytes());
+            buf[off + 8..off + 8 + data.len()].copy_from_slice(data);
+            off += 8 + ((data.len() + 7) & !7);
+        }
+        buf[off..off + 8].fill(0);
+    }
+
+    #[test]
+    fn find_header_extension_reads_a_v2_header() {
+        // What `qemu-img create -o compat=0.10 -F qcow2` writes: the
+        // record at offset 72, where `parse` puts a v2 header's end.
+        // `parse_header_extensions` reports nothing for the same bytes.
+        let mut buf = make_qcow2_header();
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
+        put_extensions(
+            &mut buf,
+            V2_HEADER_EXTENSION_OFFSET,
+            &[(EXT_BACKING_FORMAT, b"qcow2")],
+        );
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.header_length as usize, V2_HEADER_EXTENSION_OFFSET);
+        assert_eq!(
+            find_header_extension(&buf, hdr.header_length as usize, EXT_BACKING_FORMAT),
+            Some((V2_HEADER_EXTENSION_OFFSET + 8, 5))
+        );
+        assert_eq!(
+            parse_header_extensions(&buf, &hdr).backing_format,
+            BackingFormat::None
+        );
+    }
+
+    #[test]
+    fn find_header_extension_matches_the_v3_walk() {
+        // Behind two other records, so the walk has to step over
+        // them: the feature name table, which qemu writes into every
+        // v3 header and this crate has no constant for, and an
+        // unknown record whose 5 bytes pad to 8, so a walk that
+        // forgot the padding would land mid-record.
+        const EXT_FEATURE_NAME_TABLE: u32 = 0x6803_f857;
+        let mut buf = make_qcow2_header();
+        put_extensions(
+            &mut buf,
+            112,
+            &[
+                (EXT_FEATURE_NAME_TABLE, &[0u8; 48]),
+                (0x1234_5678, b"odd!!"),
+                (EXT_BACKING_FORMAT, b"raw"),
+            ],
+        );
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        let exts = parse_header_extensions(&buf, &hdr);
+        assert_eq!(
+            find_header_extension(&buf, hdr.header_length as usize, EXT_BACKING_FORMAT),
+            Some((exts.backing_format_offset, exts.backing_format_len))
+        );
+        assert_eq!(exts.backing_format_offset, 112 + (8 + 48) + (8 + 8) + 8);
+    }
+
+    #[test]
+    fn find_header_extension_stops_at_the_chain_end() {
+        // A record after EXT_END is not part of the chain.
+        let mut buf = make_qcow2_header();
+        put_extensions(&mut buf, 112, &[]);
+        put_extensions(&mut buf, 120, &[(EXT_BACKING_FORMAT, b"raw")]);
+        assert_eq!(find_header_extension(&buf, 112, EXT_BACKING_FORMAT), None);
+    }
+
+    #[test]
+    fn find_header_extension_does_not_read_past_the_buffer() {
+        let mut buf = make_qcow2_header();
+        put_extensions(&mut buf, 112, &[(EXT_BACKING_FORMAT, b"qcow2")]);
+        // Body cut short, then record header cut short: both absent.
+        assert_eq!(
+            find_header_extension(&buf[..124], 112, EXT_BACKING_FORMAT),
+            None
+        );
+        assert_eq!(
+            find_header_extension(&buf[..119], 112, EXT_BACKING_FORMAT),
+            None
+        );
+        assert_eq!(
+            find_header_extension(&buf[..125], 112, EXT_BACKING_FORMAT),
+            Some((120, 5))
+        );
+        // A declared length that would wrap is refused, not followed.
+        buf[116..120].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(find_header_extension(&buf, 112, EXT_BACKING_FORMAT), None);
+        assert_eq!(
+            find_header_extension(&buf, usize::MAX - 4, EXT_BACKING_FORMAT),
+            None
         );
     }
 

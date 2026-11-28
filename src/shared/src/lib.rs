@@ -1938,6 +1938,43 @@ impl ImageFormat {
             ImageFormat::Dmg => "dmg",
         }
     }
+
+    /// The qemu block-driver name for this format: what a qcow2
+    /// overlay records in its `EXT_BACKING_FORMAT` header extension,
+    /// and what `qemu-img -F <driver>` writes there.
+    ///
+    /// This is not [`Self::name`]. qemu spells VHD `vpc`; it reads
+    /// VMDK3 and a VMDK descriptor through its one `vmdk` driver; and
+    /// it has no ISO driver, so an ISO is `raw` to it. A reader opens
+    /// the backing with whatever driver the record names, so a name
+    /// qemu does not have is refused as an unknown driver, and the
+    /// name of the wrong one is refused as the wrong format.
+    ///
+    /// `create` and `rebase` both write the record from this one
+    /// table, so they cannot come to spell a format differently. The
+    /// match is exhaustive so that a new format is given its driver
+    /// name here rather than falling into a default.
+    ///
+    /// `Unknown` has no driver and returns the empty string, which
+    /// both callers take as "record no format".
+    pub fn qemu_driver_name(&self) -> &'static str {
+        match self {
+            ImageFormat::Unknown => "",
+            ImageFormat::Raw | ImageFormat::Iso => "raw",
+            ImageFormat::Qcow2 => "qcow2",
+            ImageFormat::Qcow1 => "qcow",
+            ImageFormat::Vmdk4 | ImageFormat::Vmdk3 | ImageFormat::VmdkDescriptor => "vmdk",
+            ImageFormat::Vhd => "vpc",
+            ImageFormat::Vhdx => "vhdx",
+            ImageFormat::Vdi => "vdi",
+            ImageFormat::Qed => "qed",
+            ImageFormat::Luks => "luks",
+            ImageFormat::Parallels => "parallels",
+            ImageFormat::Bochs => "bochs",
+            ImageFormat::Cloop => "cloop",
+            ImageFormat::Dmg => "dmg",
+        }
+    }
 }
 
 /// Configuration for the info operation.
@@ -4264,8 +4301,13 @@ pub struct RebaseConfig {
     pub magic: u32,
     /// Overlay format (`ImageFormat as u32`).
     pub overlay_format: u32,
-    /// New backing format (`ImageFormat as u32`); `0` means
-    /// "auto-detect via the standard format-probe path".
+    /// The new backing's format (`ImageFormat as u32`), which
+    /// selects the driver name a qcow2 overlay's backing-format
+    /// header extension records (see
+    /// [`ImageFormat::qemu_driver_name`]). `0` means no format is
+    /// stated: an existing record is left as it is. The host sends
+    /// `0` only for a detach; the guest never probes a format of
+    /// its own from this field.
     pub new_backing_format: u32,
     /// Flags. See `FLAG_*` constants.
     pub flags: u32,
@@ -4453,6 +4495,25 @@ impl RebaseResult {
     /// claiming none). Refused before any image mutation where
     /// staging detects it.
     pub const ERROR_OVERLAY_INCONSISTENT: u32 = 16;
+    /// The overlay records a backing format in a header extension
+    /// whose padded width differs from the new backing's driver
+    /// name's, in either direction. Recording the truth would move
+    /// every extension behind it, and recording nothing would
+    /// leave the overlay claiming its old backing's format, so
+    /// the rebase is refused instead. Every name rebase can record
+    /// pads to one 8-byte slot except `parallels`, which pads to
+    /// 16, so a user meets this only rebasing to or from a
+    /// Parallels backing; otherwise it guards a hand-made header.
+    pub const ERROR_BACKING_FORMAT_SLOT: u32 = 17;
+    /// A member of the old or new chain is a format this build's
+    /// chain reader cannot serve, so the rebase is refused before
+    /// it reads anything. Distinct from
+    /// [`Self::ERROR_UNSUPPORTED_FORMAT`], which is about the
+    /// overlay being acted on, and from
+    /// [`Self::ERROR_PARSE_FAILED`], which this used to be reported
+    /// as -- "the overlay's header could not be parsed", about an
+    /// overlay that parsed fine.
+    pub const ERROR_CHAIN_UNREADABLE: u32 = 18;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5995,6 +6056,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_identified_format_has_a_qemu_driver_name() {
+        // A format with no driver name records none, and a rebase
+        // then leaves the overlay naming its *old* backing's format
+        // -- the stale record qemu-img refuses to open. Only
+        // `Unknown` may come back empty, and it is the code the host
+        // sends for "no format stated". Walking the wire codes rather
+        // than the variants means a new code that `from_u32` learns
+        // is checked here without anyone adding it.
+        assert_eq!(ImageFormat::from_u32(0).qemu_driver_name(), "");
+        for code in 1..=u8::MAX as u32 {
+            let format = ImageFormat::from_u32(code);
+            if format == ImageFormat::Unknown {
+                continue;
+            }
+            let name = format.qemu_driver_name();
+            assert!(
+                !name.is_empty(),
+                "{format:?} (code {code}) has no qemu driver name"
+            );
+            // The rebase planner rewrites the record in place, so a
+            // rebase between two formats works only when their names
+            // pad to the same width (see `push_backing_format_patch`
+            // in crates/rebase). Every name pads to 8 except
+            // `parallels`, which pads to 16 and is what the planner's
+            // scratch slot is sized for. A new 9-to-16 byte name
+            // would join parallels' width class and be refused on
+            // every rebase to or from an 8-byte one, so adding one
+            // has to be a deliberate decision made here.
+            assert!(
+                name.len() <= 8 || name == "parallels",
+                "{format:?}'s driver name {name:?} does not pad to the 8-byte record width"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_names_are_qemus_not_instars() {
+        // The three that differ from `name()`, each a name qemu has
+        // no driver for.
+        assert_eq!(ImageFormat::Vhd.qemu_driver_name(), "vpc");
+        assert_eq!(ImageFormat::Vmdk3.qemu_driver_name(), "vmdk");
+        assert_eq!(ImageFormat::Iso.qemu_driver_name(), "raw");
+    }
+
+    #[test]
     fn compare_failure_results_carry_no_verdict() {
         let setup = CompareResult::setup_failed();
         assert!(setup.has_failure());
@@ -6423,10 +6529,11 @@ mod tests {
     #[test]
     fn rebase_result_error_codes_distinct() {
         // Codes 0..=13 are the planner and guest refusals, 14 the
-        // snapshot gate (issue #421), and 15 and 16 the
-        // qcow2-write overlay classification codes. Confirm every
-        // code is distinct so the host's match arms don't
-        // accidentally alias.
+        // snapshot gate (issue #421), 15 and 16 the qcow2-write
+        // overlay classification codes, 17 the backing-format-record
+        // width guard and 18 the unreadable-chain-member refusal.
+        // Confirm every code is distinct so the host's match arms
+        // don't accidentally alias.
         let codes = [
             RebaseResult::ERROR_OK,
             RebaseResult::ERROR_UNSUPPORTED_FORMAT,
@@ -6445,13 +6552,15 @@ mod tests {
             RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
             RebaseResult::ERROR_OVERLAY_UNSUPPORTED,
             RebaseResult::ERROR_OVERLAY_INCONSISTENT,
+            RebaseResult::ERROR_BACKING_FORMAT_SLOT,
+            RebaseResult::ERROR_CHAIN_UNREADABLE,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=16 numbering.
+        // Confirm contiguous 0..=18 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }

@@ -129,7 +129,11 @@ discovery infrastructure as `instar info --chain`), sets up each image as a
 separate virtio-block device in the KVM guest, and validates:
 
 - Format consistency: each backing image's format matches what chain
-  discovery found
+  discovery found. A backing file that discovery could not identify --
+  a raw image with no partition table, which secure-mode `info` names
+  `unknown` -- is checked as raw, because that is how every operation
+  that reads the chain reads it; it is not reported as a mismatch
+  against the name discovery gave it
 - Virtual size validity: backing images must have non-zero virtual size
 - QCOW2 header validation: backing images that are QCOW2 get basic header
   checks (magic, version, cluster_bits, L1/refcount table bounds, corrupt

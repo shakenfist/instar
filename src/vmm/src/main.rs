@@ -54,10 +54,10 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use backing::BackingStore;
 use chain::{
-    check_chain_depth, check_circular_reference, peek_is_qcow2_v3, peek_is_vmdk_descriptor,
-    reference_spells_path, resolve_vmdk_flat_descriptor, validate_backing_path,
-    validate_backing_write_target, BackingChain, ChainError, ChainImage, ExternalDataFile,
-    ImageFormat, InfoOperationResult,
+    check_chain_depth, check_circular_reference, is_windows_absolute_reference, peek_is_qcow2_v3,
+    peek_is_vmdk_descriptor, reference_spells_path, resolve_vmdk_flat_descriptor,
+    validate_backing_path, validate_backing_write_target, BackingChain, ChainError, ChainImage,
+    ExternalDataFile, ImageFormat, InfoOperationResult,
 };
 use escape::{json_escape, terminal_safe, terminal_safe_path};
 use io_thread::{DeviceRole, IoDevice};
@@ -2181,6 +2181,14 @@ mod differencing_parent_classification_tests {
         assert!(is_windows_absolute_reference(r"\\server\share\p.vhdx"));
         // Boundary: the shortest possible drive-letter root.
         assert!(is_windows_absolute_reference(r"C:\"));
+        // Either separator after the drive letter. This spelling used
+        // to be classified relative, and so was joined onto the
+        // image's directory -- the #899 hazard, reached by the form
+        // qemu-img refuses for exactly the same reason it refuses the
+        // backslash one.
+        assert!(is_windows_absolute_reference("C:/images/base.qcow2"));
+        assert!(is_windows_absolute_reference("z:/p.vhdx"));
+        assert!(is_windows_absolute_reference("C:/"));
     }
 
     #[test]
@@ -2190,7 +2198,10 @@ mod differencing_parent_classification_tests {
         assert!(!is_windows_absolute_reference("/abs/parent.vhdx"));
         assert!(!is_windows_absolute_reference(""));
         assert!(!is_windows_absolute_reference("C:"));
-        assert!(!is_windows_absolute_reference("C:/unix/style"));
+        // A colon alone is not enough: the third byte has to be a
+        // separator. `C:x` is a legal POSIX name and names a file
+        // relative to the image, which is what instar resolves it as.
+        assert!(!is_windows_absolute_reference("C:relative"));
         // Shorter than three bytes: nothing at index 2 to check.
         assert!(!is_windows_absolute_reference("C"));
         assert!(!is_windows_absolute_reference("ab"));
@@ -2212,9 +2223,14 @@ mod differencing_parent_classification_tests {
         assert!(backing_reference_is_absolute("/abs/parent.vhdx"));
         assert!(backing_reference_is_absolute(r"C:\images\parent.vhdx"));
         assert!(backing_reference_is_absolute(r"\\attacker\share\probe"));
+        // Either separator after the drive letter: the forward-slash
+        // spelling was classified relative here too, so `info` printed
+        // a joined "actual path" for it while the reading operations
+        // opened the file at that path.
+        assert!(backing_reference_is_absolute("C:/unix/style"));
         assert!(!backing_reference_is_absolute("parent.vhdx"));
         assert!(!backing_reference_is_absolute("../sub/parent.vhdx"));
-        assert!(!backing_reference_is_absolute("C:/unix/style"));
+        assert!(!backing_reference_is_absolute("C:relative"));
     }
 
     // --- resolve_reported_parent: Windows-absolute classification ------
@@ -4288,29 +4304,6 @@ impl UnresolvedParent {
     }
 }
 
-/// Is this parent reference a Windows absolute path?
-///
-/// True for a drive-letter path (`C:\images\parent.vhdx`, the VHDX
-/// `absolute_win32_path` locator key) and for anything rooted at `\\`
-/// (`\\?\Volume{GUID}\...`, the `volume_path` key, and plain UNC
-/// shares). Both keys reach the host verbatim, in Windows convention,
-/// because that is what the image says and `info` prints what the
-/// image says.
-///
-/// This is a *classification*, never a conversion. The caller uses the
-/// answer to stop walking, and builds no host path from the value. The
-/// VHDX `relative_path` key does not arrive in Windows convention at
-/// all -- the guest renders it into POSIX before reporting it -- so a
-/// `.\parent.vhdx` locator reaches the host as `parent.vhdx` and
-/// resolves like any other relative name.
-fn is_windows_absolute_reference(reference: &str) -> bool {
-    if reference.starts_with(r"\\") {
-        return true;
-    }
-    let bytes = reference.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
-}
-
 /// Is this backing reference absolute, in either convention?
 ///
 /// `info` joins a relative reference onto the image's directory to show
@@ -4322,6 +4315,38 @@ fn is_windows_absolute_reference(reference: &str) -> bool {
 /// absolute one it is reported only as the image records it.
 fn backing_reference_is_absolute(reference: &str) -> bool {
     Path::new(reference).is_absolute() || is_windows_absolute_reference(reference)
+}
+
+/// The stderr line a reporting walk prints when it stops at a
+/// differencing parent it cannot use, or `None` when the caller is not
+/// a reporting one and the condition must be an error instead.
+///
+/// The fail-soft already covers *resolving* a differencing parent;
+/// this extends it by one step, to a parent that resolved and then
+/// turned out to be unusable. The argument is the same one: `info`
+/// reports and refuses nothing, so a listing must not become a
+/// non-zero exit because a parent was replaced by the wrong file. The
+/// listing ends at the child, whose own line still prints the
+/// reference it named, and the reason goes to stderr.
+///
+/// `what` completes the sentence "the parent ...", and is already
+/// terminal-safe at every call site.
+fn differencing_listing_stops(
+    chain_use: ChainUse,
+    differencing_child: Option<&Path>,
+    parent: &Path,
+    what: &str,
+) -> Option<String> {
+    let child = differencing_child?;
+    if chain_use != ChainUse::Report {
+        return None;
+    }
+    Some(format!(
+        "instar: backing chain stops at {}: its parent {} {}",
+        terminal_safe_path(child),
+        terminal_safe_path(parent),
+        what
+    ))
 }
 
 /// Resolve a differencing parent for a caller that only reports the
@@ -4414,6 +4439,15 @@ fn discover_backing_chain(
     let mut current = top_image
         .canonicalize()
         .map_err(|e| ChainError::PathResolutionError(format!("{}: {}", top_image.display(), e)))?;
+    // Set when the hop that produced `current` left a differencing VHD
+    // or VHDX, to that child's own format and path. The VHD and VHDX
+    // specifications require a differencing child's parent to be the
+    // same format as the child, and the walk never checked: a VHD child
+    // whose parent file had been replaced by a qcow2 was listed as
+    // having a qcow2 parent, and `convert` of that chain exited 0
+    // (issue #608). Carrying the link is what lets the next iteration
+    // judge the parent it is about to examine.
+    let mut differencing_child: Option<(std::path::PathBuf, ImageFormat)> = None;
 
     loop {
         // Check for circular references
@@ -4483,8 +4517,32 @@ fn discover_backing_chain(
 
         // Run the sandboxed info operation
         // Always use secure mode (unsafe_quirks=false) for backing chain discovery
-        let info_result = execute_info_operation(&current, sector_size, false)
-            .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
+        //
+        // Past a differencing link, a reporting walk ends the listing
+        // rather than the command, as it already does for a parent it
+        // could not resolve. `info` reports and refuses nothing, and a
+        // parent that resolved but cannot be described is the same kind
+        // of dead end as one that did not resolve.
+        let info_result = match execute_info_operation(&current, sector_size, false) {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(reason) = differencing_listing_stops(
+                    chain_use,
+                    differencing_child
+                        .as_ref()
+                        .map(|(child, _)| child.as_path()),
+                    &current,
+                    &format!(
+                        "could not be described by the info operation: {}",
+                        terminal_safe(&e.to_string())
+                    ),
+                ) {
+                    eprintln!("{reason}");
+                    break;
+                }
+                return Err(ChainError::InfoOperationFailed(e.to_string()));
+            }
+        };
 
         // Refuse detected-but-unsupported input formats instead of
         // silently reading them as raw. The guest info op can *name* and
@@ -4512,6 +4570,20 @@ fn discover_backing_chain(
             ImageFormat::Unknown
         ) && !matches!(info_result.format.as_str(), "raw" | "unknown" | "iso")
         {
+            if let Some(reason) = differencing_listing_stops(
+                chain_use,
+                differencing_child
+                    .as_ref()
+                    .map(|(child, _)| child.as_path()),
+                &current,
+                &format!(
+                    "is {}, a format detected but not supported for reading",
+                    terminal_safe(&info_result.format)
+                ),
+            ) {
+                eprintln!("{reason}");
+                break;
+            }
             return Err(ChainError::UnsupportedInputFormat(
                 info_result.format.clone(),
             ));
@@ -4592,6 +4664,34 @@ fn discover_backing_chain(
         } else {
             info_result.virtual_size
         };
+        // A differencing child's parent must be the same format as the
+        // child. Checked here, before the member is listed or attached:
+        // listing a qcow2 as a VHD's parent misdescribes the chain, and
+        // composing one reads a qcow2's bytes through the VHD parent
+        // arm, which exited 0 on a chain no reader should accept.
+        if let Some((child, child_format)) = &differencing_child {
+            if image_format != *child_format {
+                if let Some(reason) = differencing_listing_stops(
+                    chain_use,
+                    Some(child.as_path()),
+                    &current,
+                    &format!(
+                        "is {image_format}, and a differencing {child_format} \
+                         child's parent must be {child_format} too"
+                    ),
+                ) {
+                    eprintln!("{reason}");
+                    break;
+                }
+                return Err(ChainError::DifferencingParentFormat {
+                    child: child.clone(),
+                    child_format: child_format.to_string(),
+                    parent: current.clone(),
+                    parent_format: image_format.to_string(),
+                });
+            }
+        }
+
         let chain_image = ChainImage {
             path: current.clone(),
             format: image_format,
@@ -4691,6 +4791,24 @@ fn discover_backing_chain(
                 // the policy of the image it is leaving.
                 let leaving_vhd_family =
                     matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
+
+                // Only a VHD-family hop carries the same-format
+                // requirement, so every other hop clears it: a qcow2
+                // reached through a VHD link has whatever parent its own
+                // header names, and that is not a differencing link.
+                //
+                // "Leaving a VHD-family image that named a parent" is
+                // exactly "leaving a differencing image", which is what
+                // lets the refusal call the child differencing: the info
+                // operation reports a VHD parent only when the footer's
+                // disk type is differencing (4), and a VHDX parent only
+                // when `HasParent` is set, so no other VHD or VHDX reaches
+                // this hop.
+                differencing_child = if leaving_vhd_family {
+                    Some((current.clone(), image_format))
+                } else {
+                    None
+                };
 
                 match classify_parent_walk(chain_use, differencing_composition, leaving_vhd_family)
                 {
@@ -5179,8 +5297,14 @@ fn write_chain_device_entries(
         }
 
         let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
+        // `read_format`, not `format`: the guest is being told how to
+        // read these bytes, not what to call them. The two differ only
+        // for a member the secure-mode info gate named `unknown`, which
+        // the guest's chain reader already reads through its raw arm --
+        // so this is what the operations that allowlist their readable
+        // formats needed to see all along.
         guest_mem.write_obj(
-            image.format.to_shared_format_u32(),
+            image.format.read_format().to_shared_format_u32(),
             GuestAddress(dev_offset),
         )?;
         // The flags are the info operation's, which runs on the image's
@@ -8243,6 +8367,16 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
 
     // The discovered top-of-chain format is authoritative; `-f` is only
     // a hint.
+    //
+    // Deliberately `format` and not `read_format`: this is the image the
+    // user named, and a headerless raw file -- one the secure-mode info
+    // gate names `unknown` for want of a partition table -- is refused
+    // as an input rather than benched. That refusal is instar's
+    // registered posture for a named input (the `secure-raw-detection`
+    // entry in `tests/test_bench.py`'s divergence table), not an
+    // accident of this value, so it stays. What `read_format` settles is
+    // how a *backing* member's bytes are read once the posture has
+    // already let the chain be opened.
     let top_format = chain.images()[0].format;
     let top_format_name = top_format.to_string();
 
@@ -10201,10 +10335,26 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     let total_input_devices_final = old_chain_input_devices + new_chain_input_devices;
     debug_assert_eq!(total_input_devices_final, total_input_devices);
 
-    // Resolve the new-backing-format hint. None / "" → 0
-    // (auto-detect by the guest probe path). Honour `-F`.
+    // Resolve the new-backing-format hint. Honour `-F`; without it,
+    // state the format chain discovery found for the new backing,
+    // and fall back to 0 ("no format stated") only when there is no
+    // new chain to have discovered one, which is a detach. `-u` is
+    // not that case: it still opens the new backing to discover its
+    // chain, so it states the discovered format like a safe rebase.
+    //
+    // The guest records this in the overlay's backing-format header
+    // extension, so "no format stated" is not free: an overlay
+    // rebased from a qcow2 backing onto a raw one would go on
+    // recording `qcow2`, and a reader that trusts the field refuses
+    // the overlay. Passing what discovery found makes the common
+    // `instar rebase overlay.qcow2 -b new.raw`, with no `-F`,
+    // record the truth.
     let new_backing_format_code = match args.backing_format.as_deref() {
-        None => 0u32,
+        None => new_chain_full
+            .as_ref()
+            .and_then(|c| c.images().first())
+            .map(|top| top.format.read_format().to_shared_format_u32())
+            .unwrap_or(0u32),
         Some("qcow2") => IMAGE_FORMAT_QCOW2,
         Some("vmdk") => IMAGE_FORMAT_VMDK4,
         Some("raw") => IMAGE_FORMAT_RAW,
@@ -11123,7 +11273,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=16); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=18); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -11188,6 +11338,22 @@ fn map_rebase_error(code: u32) -> String {
              (extended L2 entries, or unknown/compression feature bits). \
              Use -u for a metadata-only rebase or fall back to \
              `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_BACKING_FORMAT_SLOT => {
+            "the overlay's recorded backing format cannot be updated in place: \
+             the new format's name needs a header extension of a different \
+             width (`parallels` is wider than every other name), and this \
+             rebase does not move the extensions behind it. -u does not \
+             avoid this, because it rewrites the record too; fall back to \
+             `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_CHAIN_UNREADABLE => {
+            "a backing chain member is a format this build cannot read \
+             (rebase reads qcow2, raw, VHD and VHDX chain members); the \
+             overlay itself is fine. Use -u for a metadata-only rebase, or \
+             fall back to `qemu-img rebase`"
                 .into()
         }
         c if c == shared::RebaseResult::ERROR_OVERLAY_INCONSISTENT => {
@@ -13235,7 +13401,7 @@ fn run_rebase_guest(
     // Layout (must match shared::RebaseConfig exactly):
     //    0: magic                u32 ("REBA")
     //    4: overlay_format       u32
-    //    8: new_backing_format   u32 (0 = guest auto-detect)
+    //    8: new_backing_format   u32 (0 = no format stated)
     //   12: flags                u32
     //   16: sector_size          u32
     //   20: overlay_cluster_size u32

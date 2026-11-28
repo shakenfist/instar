@@ -480,7 +480,7 @@ pub fn plan_qcow2<'a>(
         None => None,
     };
     let backing_format_bytes: Option<&[u8]> = match &opts.backing {
-        Some(b) => b.format.map(image_format_name_bytes),
+        Some(b) => b.format.map(|f| f.qemu_driver_name().as_bytes()),
         None => None,
     };
 
@@ -816,32 +816,6 @@ fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Result<&'b
         .ok_or(CreateError::ParentNameTooLong)?;
     core::str::from_utf8(buf.get(..total).ok_or(CreateError::ParentNameTooLong)?)
         .map_err(|_| CreateError::ParentNameTooLong)
-}
-
-/// Map a backing-image format hint to the ASCII bytes qemu-img writes
-/// into the qcow2 `EXT_BACKING_FORMAT` header extension.
-fn image_format_name_bytes(fmt: ImageFormat) -> &'static [u8] {
-    match fmt {
-        ImageFormat::Raw => b"raw",
-        ImageFormat::Qcow2 => b"qcow2",
-        ImageFormat::Vmdk4 | ImageFormat::Vmdk3 | ImageFormat::VmdkDescriptor => b"vmdk",
-        ImageFormat::Vhd => b"vpc",
-        ImageFormat::Vhdx => b"vhdx",
-        ImageFormat::Qcow1 => b"qcow",
-        ImageFormat::Vdi => b"vdi",
-        ImageFormat::Qed => b"qed",
-        ImageFormat::Iso => b"iso",
-        ImageFormat::Luks => b"luks",
-        // Detection/info-name only; create has no read or write path
-        // for these, so this arm only affects the informational
-        // backing-format-hint string, never whether a backing file is
-        // actually opened.
-        ImageFormat::Parallels => b"parallels",
-        ImageFormat::Bochs => b"bochs",
-        ImageFormat::Cloop => b"cloop",
-        ImageFormat::Dmg => b"dmg",
-        ImageFormat::Unknown => b"",
-    }
 }
 
 /// Build a metadata plan for a VMDK image (monolithicSparse or
@@ -2271,6 +2245,25 @@ mod qcow2_plan_tests {
         assert_eq!(&bytes[off..off + backing.path.len()], backing.path);
         let exts = qcow2::parse_header_extensions(&bytes, &parsed);
         assert_eq!(exts.backing_format.as_str(), "qcow2");
+    }
+
+    #[test]
+    fn plan_qcow2_records_an_iso_backing_as_raw() {
+        // The record names a qemu *driver*, and qemu has none called
+        // `iso`: an overlay recording it is one qemu-img refuses to
+        // open. An ISO is read through the raw driver, so that is
+        // the name written -- the spelling `rebase` records too,
+        // from the same `ImageFormat::qemu_driver_name` table.
+        let mut opts = default_opts(1 << 30);
+        opts.backing = Some(BackingRef {
+            path: b"base.iso",
+            format: Some(ImageFormat::Iso),
+        });
+        let bytes = run_round_trip(&opts);
+        let parsed = qcow2::QcowHeader::parse(&bytes).expect("parse header");
+        let exts = qcow2::parse_header_extensions(&bytes, &parsed);
+        let data = exts.backing_format_offset;
+        assert_eq!(&bytes[data..data + exts.backing_format_len], b"raw");
     }
 
     #[test]

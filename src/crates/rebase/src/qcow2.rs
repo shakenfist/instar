@@ -28,8 +28,9 @@
 //! [`RebaseError::UnsupportedFormat`].
 
 use qcow2::{
-    QcowHeader, BACKING_FILE_OFFSET_OFFSET, BACKING_FILE_SIZE_OFFSET, INCOMPAT_CORRUPT,
-    INCOMPAT_DIRTY, INCOMPAT_EXTERNAL_DATA, QCOW2_HEADER_LENGTH_V3, V2_HEADER_EXTENSION_OFFSET,
+    find_header_extension, QcowHeader, BACKING_FILE_OFFSET_OFFSET, BACKING_FILE_SIZE_OFFSET,
+    EXT_BACKING_FORMAT, INCOMPAT_CORRUPT, INCOMPAT_DIRTY, INCOMPAT_EXTERNAL_DATA,
+    QCOW2_HEADER_LENGTH_V3, V2_HEADER_EXTENSION_OFFSET,
 };
 
 use crate::{RebaseError, RebaseMode, RebasePatch, RebasePlan};
@@ -51,6 +52,39 @@ const _: () = assert!(
         && HEADER_REWRITE_SPAN == (BACKING_FILE_SIZE_OFFSET - BACKING_FILE_OFFSET_OFFSET) + 4,
     "header field layout assumption broken"
 );
+
+/// Widest backing-format record the planner will rewrite in
+/// place: the extension's own length word plus the padded room
+/// its name occupies. The widest driver name a rebase records is
+/// `parallels`, 9 bytes padded to 16; every other is 3 to 5
+/// bytes and pads to 8. So this is sized for the widest name, and
+/// a record wider than it can never be rewritten anyway, because
+/// no name pads to its width -- the width check refuses it first.
+/// The bound is kept separately because the scratch carve has to
+/// be a constant, and the fuzz target, which passes arbitrary
+/// names, is what reaches it.
+const BACKING_FORMAT_REWRITE_MAX: usize = 4 + 16;
+
+/// Scratch either qcow2 planner carves: the header rewrite, the
+/// path buffer and the backing-format record, in that order.
+/// Exported so a caller sizing the scratch region can assert
+/// against the planners' own sum rather than a copy of it, which
+/// is what stops a new carve from silently outgrowing the region.
+pub const QCOW2_PLAN_SCRATCH_REQUIRED: usize =
+    HEADER_REWRITE_SPAN + MAX_BACKING_PATH_LEN + BACKING_FORMAT_REWRITE_MAX;
+
+/// Round an extension's declared length up to the 8-byte
+/// boundary the next extension starts on.
+///
+/// This is the number that has to be preserved by a rewrite.
+/// The records form a chain walked by `8 + align8(len)` per
+/// hop, so a rewrite that changes a record's *padded* width
+/// moves every record after it -- the backing-format name can
+/// grow from `raw` to `qcow2` in place because both pad to 8,
+/// and cannot grow past 8 without relaying out the header.
+fn align8(len: usize) -> usize {
+    (len + 7) & !7
+}
 
 /// Options for [`plan_rebase_qcow2`].
 ///
@@ -97,6 +131,18 @@ pub struct Qcow2RebaseOpts<'a> {
     /// Detach: `new_backing_path` should be empty and the
     /// rewrite zeros the backing-file pointer.
     pub detach: bool,
+    /// The driver name to record for the new backing in the
+    /// overlay's `EXT_BACKING_FORMAT` header extension, spelled
+    /// as qemu spells it (`raw`, `qcow2`, `vpc`, `vdi`, ...).
+    ///
+    /// Empty means the caller has no format to state, and the
+    /// extension is left exactly as it is: an overlay that
+    /// records no backing format keeps recording none, which is
+    /// the shape that makes a reader probe the backing file.
+    /// Writing a name the caller only guessed at would be worse
+    /// than recording nothing, because a reader trusts this
+    /// field and refuses the overlay when it is wrong.
+    pub new_backing_format_name: &'a [u8],
 }
 
 /// Output of [`plan_rebase_qcow2`].
@@ -241,15 +287,13 @@ fn plan_qcow2_safe<'a>(
     // guest's qcow2-write staging.)
     let header_rewrite_len = HEADER_REWRITE_SPAN;
     let path_buf_len = MAX_BACKING_PATH_LEN;
-    let need = header_rewrite_len
-        .checked_add(path_buf_len)
-        .ok_or(RebaseError::Overflow)?;
-    if scratch.len() < need {
+    if scratch.len() < QCOW2_PLAN_SCRATCH_REQUIRED {
         return Err(RebaseError::ScratchTooSmall);
     }
 
     let (header_rewrite_buf, rest) = scratch.split_at_mut(header_rewrite_len);
-    let (path_buf, _rest) = rest.split_at_mut(path_buf_len);
+    let (path_buf, rest) = rest.split_at_mut(path_buf_len);
+    let (ext_buf, _rest) = rest.split_at_mut(BACKING_FORMAT_REWRITE_MAX);
 
     // Populate the path buffer (left-padded with zero bytes
     // beyond `path_len`; the patch references only the first
@@ -286,6 +330,16 @@ fn plan_qcow2_safe<'a>(
         bytes: header_patch_bytes,
     })?;
 
+    // Last, so the recorded format is only ever updated for a
+    // header whose pointer rewrite was already planned.
+    push_backing_format_patch(
+        opts,
+        parsed,
+        &mut plan,
+        ext_buf,
+        (new_backing_file_size > 0).then_some((new_backing_file_offset, new_backing_file_size)),
+    )?;
+
     let context = RebaseQcow2SafeContext {
         overlay_cluster_size: cluster_size as u32,
         overlay_cluster_count: parsed.virtual_size.div_ceil(cluster_size),
@@ -299,6 +353,151 @@ fn plan_qcow2_safe<'a>(
     })
 }
 
+/// End of the overlay's fixed header: the first byte a patch may
+/// write without landing in a field the header rewrite owns.
+///
+/// For v3 that is the declared `header_length` (qemu 5.1+ writes
+/// 112, not the 104 minimum, to cover `compression_type` and its
+/// padding), floored at the minimum so a header under-declaring
+/// its own length cannot lower the bar. For v2 it is the fixed
+/// 72-byte end, where v2's extensions begin.
+fn fixed_header_end(parsed: &QcowHeader) -> u64 {
+    if parsed.version >= 3 {
+        u64::from(parsed.header_length.max(QCOW2_HEADER_LENGTH_V3))
+    } else {
+        V2_HEADER_EXTENSION_OFFSET as u64
+    }
+}
+
+/// Append the patch that records the new backing's format in the
+/// overlay's `EXT_BACKING_FORMAT` header extension.
+///
+/// Without this the overlay keeps whatever format its *old*
+/// backing had, which a reader then trusts: an overlay rebased
+/// from a qcow2 backing onto a raw one went on claiming `qcow2`,
+/// and `qemu-img info` refused to open it with "Image is not in
+/// qcow2 format". The content was right and the overlay was
+/// unusable.
+///
+/// The rewrite is in place, which is what makes it safe to do
+/// here rather than in a header relayout: the record's padded
+/// width is preserved, so the extension chain behind it does not
+/// move. Every name a rebase can record pads to the same 8 bytes
+/// except `parallels`, so the common cross-format rebase fits; a
+/// record whose width would have to change is refused
+/// rather than written at the wrong width, because a shifted
+/// chain is a corrupt header.
+///
+/// The record is found with [`find_header_extension`], not
+/// [`qcow2::parse_header_extensions`], because the latter reads
+/// nothing from a v2 header and qemu does write this record into v2
+/// overlays (`-o compat=0.10 -F`): a v2 overlay would otherwise
+/// keep the stale record this function exists to replace.
+///
+/// The search only sees `opts.overlay_header`, which both callers
+/// stage as the overlay's first sector. qemu writes this record
+/// first in the chain, so it is always inside that window; a
+/// record a third-party writer placed past it is not found, and
+/// the overlay keeps it unchanged -- so the "records no format"
+/// branch below means "none in the staged window", not "none".
+///
+/// `path_write` is the path-bytes write the caller has already
+/// planned, if it planned one, so that a header pointing its
+/// backing name into the extension area is refused rather than
+/// having its path bytes overwritten by this patch.
+fn push_backing_format_patch<'a>(
+    opts: &Qcow2RebaseOpts<'_>,
+    parsed: &QcowHeader,
+    plan: &mut RebasePlan<'a>,
+    ext_buf: &'a mut [u8],
+    path_write: Option<(u64, u32)>,
+) -> Result<(), RebaseError> {
+    // A detached overlay has no backing to describe, and no
+    // reader consults the field once the reference is gone.
+    if opts.detach || opts.new_backing_format_name.is_empty() {
+        return Ok(());
+    }
+    let record = find_header_extension(
+        opts.overlay_header,
+        parsed.header_length as usize,
+        EXT_BACKING_FORMAT,
+    );
+    let Some((data_offset, data_len)) = record.filter(|&(_, len)| len > 0) else {
+        // The overlay records no backing format. Adding a record
+        // means relaying the extension chain out, which is the
+        // same deferred work as long-path relocation; leaving it
+        // absent is not a wrong answer, because a reader with no
+        // recorded format probes the backing file instead.
+        return Ok(());
+    };
+
+    let name = opts.new_backing_format_name;
+    let padded = align8(data_len);
+    if align8(name.len()) != padded || 4 + padded > BACKING_FORMAT_REWRITE_MAX {
+        return Err(RebaseError::BackingFormatSlotWidth);
+    }
+    if ext_buf.len() < 4 + padded {
+        return Err(RebaseError::ScratchTooSmall);
+    }
+
+    // The record is `(type u32, len u32, data[len], padding)`, so
+    // the length word is the four bytes before the data and both
+    // are rewritten together: a length that disagreed with the
+    // bytes beside it would be read as a different name.
+    let len_offset = data_offset
+        .checked_sub(4)
+        .ok_or(RebaseError::HeaderMismatch)? as u64;
+
+    // `backing_format_offset` is walked out of the staged header
+    // using lengths the image itself declares, and this turns it
+    // into a write offset -- the shape of issue #485. The bound is
+    // the one the format defines: extensions live after the fixed
+    // header and inside the first cluster, so a declared chain
+    // that walks past either is refused rather than aimed at an L1
+    // table or a guest data cluster.
+    let record_end = len_offset
+        .checked_add(4 + padded as u64)
+        .ok_or(RebaseError::Overflow)?;
+    let slot_limit = parsed.cluster_size.min(opts.overlay_file_size);
+    if len_offset < fixed_header_end(parsed) || record_end > slot_limit {
+        return Err(RebaseError::HeaderMismatch);
+    }
+
+    // Both this record and the backing path are bounded to the same
+    // window -- after the fixed header, inside the first cluster --
+    // and `compute_path_target` deliberately does not walk the
+    // extensions to narrow its end of it. In a header qemu wrote the
+    // two never meet, because the name is laid down after the
+    // extension chain. In a hand-made or corrupt one they can, and
+    // then the plan holds two writes over the same bytes: this patch
+    // is pushed last, so it would silently overwrite the path the
+    // plan had just written. Refuse instead, which is what
+    // `BackingFormatSlotWidth` already does for the other way
+    // this record can be unwritable.
+    if let Some((path_offset, path_len)) = path_write {
+        let path_end = path_offset
+            .checked_add(u64::from(path_len))
+            .ok_or(RebaseError::Overflow)?;
+        if len_offset < path_end && path_offset < record_end {
+            return Err(RebaseError::HeaderMismatch);
+        }
+    }
+
+    ext_buf[0..4].copy_from_slice(&(name.len() as u32).to_be_bytes());
+    ext_buf[4..4 + name.len()].copy_from_slice(name);
+    // Out to the padded width: a shorter name must not leave the
+    // tail of the longer one it replaced inside the record.
+    for byte in ext_buf[4 + name.len()..4 + padded].iter_mut() {
+        *byte = 0;
+    }
+    let bytes: &'a [u8] = &ext_buf[..4 + padded];
+    plan.push(RebasePatch::Write {
+        byte_offset: len_offset,
+        bytes,
+    })?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Unsafe mode
 // ---------------------------------------------------------------------------
@@ -310,15 +509,13 @@ fn plan_qcow2_unsafe<'a>(
 ) -> Result<Qcow2RebaseOutput<'a>, RebaseError> {
     let header_rewrite_len = HEADER_REWRITE_SPAN;
     let path_buf_len = MAX_BACKING_PATH_LEN;
-    let need = header_rewrite_len
-        .checked_add(path_buf_len)
-        .ok_or(RebaseError::Overflow)?;
-    if scratch.len() < need {
+    if scratch.len() < QCOW2_PLAN_SCRATCH_REQUIRED {
         return Err(RebaseError::ScratchTooSmall);
     }
 
     let (header_rewrite_buf, rest) = scratch.split_at_mut(header_rewrite_len);
-    let (path_buf, _rest) = rest.split_at_mut(path_buf_len);
+    let (path_buf, rest) = rest.split_at_mut(path_buf_len);
+    let (ext_buf, _rest) = rest.split_at_mut(BACKING_FORMAT_REWRITE_MAX);
 
     let path_len = opts.new_backing_path.len();
     path_buf[..path_len].copy_from_slice(opts.new_backing_path);
@@ -342,6 +539,16 @@ fn plan_qcow2_unsafe<'a>(
         byte_offset: BACKING_FILE_OFFSET_OFFSET as u64,
         bytes: header_patch_bytes,
     })?;
+
+    // Last, so the recorded format is only ever updated for a
+    // header whose pointer rewrite was already planned.
+    push_backing_format_patch(
+        opts,
+        parsed,
+        &mut plan,
+        ext_buf,
+        (new_backing_file_size > 0).then_some((new_backing_file_offset, new_backing_file_size)),
+    )?;
 
     Ok(Qcow2RebaseOutput::Unsafe { plan })
 }
@@ -416,11 +623,7 @@ fn compute_path_target(
     // here would mean trusting a second set of unchecked lengths,
     // and both qemu and instar's create path lay the backing
     // string down after the extensions anyway.
-    let header_end = if parsed.version >= 3 {
-        u64::from(parsed.header_length.max(QCOW2_HEADER_LENGTH_V3))
-    } else {
-        V2_HEADER_EXTENSION_OFFSET as u64
-    };
+    let header_end = fixed_header_end(parsed);
     // `cluster_size` is `1 << cluster_bits` with `cluster_bits`
     // validated to 9..=21 by `QcowHeader::parse`, so it is never
     // zero here. Clamping to the overlay's size as well keeps the
@@ -523,6 +726,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: path,
             detach,
+            new_backing_format_name: b"",
         };
         plan_rebase_qcow2(&opts, scratch)
     }
@@ -564,6 +768,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: b"/tmp/new.qcow2",
             detach: false,
+            new_backing_format_name: b"",
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::ExternalDataFile));
@@ -586,6 +791,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: b"/tmp/new.qcow2",
             detach: false,
+            new_backing_format_name: b"",
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::LuksUnsupported));
@@ -606,6 +812,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20, // smaller
             new_backing_path: b"/tmp/new.qcow2",
             detach: false,
+            new_backing_format_name: b"",
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::NewBackingIncompatible));
@@ -627,6 +834,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: &too_long,
             detach: false,
+            new_backing_format_name: b"",
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::BackingPathTooLong));
@@ -651,6 +859,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: b"/tmp/new.qcow2", // 14 bytes
             detach: false,
+            new_backing_format_name: b"",
         };
         let out = plan_rebase_qcow2(&opts, &mut scratch).expect("plan succeeds");
         match out {
@@ -704,6 +913,7 @@ mod tests {
             new_backing_virtual_size: 0,
             new_backing_path: b"",
             detach: true,
+            new_backing_format_name: b"",
         };
         let out = plan_rebase_qcow2(&opts, &mut scratch).expect("plan succeeds");
         match out {
@@ -746,6 +956,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: b"/tmp/new.qcow2",
             detach: false,
+            new_backing_format_name: b"",
         };
         let out = plan_rebase_qcow2(&opts, &mut scratch).expect("plan succeeds");
         match out {
@@ -787,6 +998,7 @@ mod tests {
             new_backing_virtual_size: 0,
             new_backing_path: b"",
             detach: true,
+            new_backing_format_name: b"",
         };
         let out = plan_rebase_qcow2(&opts, &mut scratch).expect("plan succeeds");
         match out {
@@ -830,6 +1042,7 @@ mod tests {
                 new_backing_virtual_size: 1 << 20,
                 new_backing_path: &path,
                 detach: false,
+                new_backing_format_name: b"",
             };
             let r = plan_rebase_qcow2(&opts, &mut scratch);
             assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
@@ -858,6 +1071,7 @@ mod tests {
                 new_backing_virtual_size: 1 << 20,
                 new_backing_path: &path,
                 detach: false,
+                new_backing_format_name: b"",
             };
             let r = plan_rebase_qcow2(&opts, &mut scratch);
             assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
@@ -883,6 +1097,7 @@ mod tests {
                 new_backing_virtual_size: 1 << 20,
                 new_backing_path: b"/tmp/new.qcow2",
                 detach: false,
+                new_backing_format_name: b"",
             };
             let r = plan_rebase_qcow2(&opts, &mut scratch);
             assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
@@ -908,6 +1123,7 @@ mod tests {
                 new_backing_virtual_size: 1 << 20,
                 new_backing_path: b"/tmp/new.qcow2",
                 detach: false,
+                new_backing_format_name: b"",
             };
             let r = plan_rebase_qcow2(&opts, &mut scratch);
             assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
@@ -1028,6 +1244,51 @@ mod tests {
         assert_eq!(path_patch_offset(&out), None);
     }
 
+    /// A v2 overlay's backing-format record is rewritten too. qemu
+    /// writes one at offset 72 (`qemu-img create -o compat=0.10
+    /// -F`), and the extension parser the planner used to consult
+    /// reports nothing for a v2 header, so the record was left
+    /// naming the old backing's format: an overlay rebased onto a
+    /// raw backing went on claiming `qcow2`, which qemu-img refuses
+    /// to open.
+    #[test]
+    fn v2_overlay_backing_format_record_is_rewritten() {
+        let mut h = make_header_versioned(2, 0, 1 << 20, 96, 9);
+        // The record, padded to 8, then EXT_END, then the name.
+        h[72..76].copy_from_slice(&qcow2::EXT_BACKING_FORMAT.to_be_bytes());
+        h[76..80].copy_from_slice(&5u32.to_be_bytes());
+        h[80..88].copy_from_slice(b"qcow2\0\0\0");
+        h[88..96].fill(0);
+        h[96..105].copy_from_slice(b"old.qcow2");
+
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: &h[..512],
+            overlay_file_size: 1 << 20,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: 1 << 20,
+            new_backing_path: b"new.raw",
+            detach: false,
+            new_backing_format_name: b"raw",
+        };
+        let mut scratch = [0xccu8; 4096];
+        let out = plan_rebase_qcow2(&opts, &mut scratch).expect("plan");
+        let Qcow2RebaseOutput::Unsafe { plan } = out else {
+            panic!("expected Unsafe");
+        };
+        let record = plan.patches().iter().find_map(|p| match p {
+            RebasePatch::Write {
+                byte_offset: 76,
+                bytes,
+            } => Some(*bytes),
+            _ => None,
+        });
+        assert_eq!(record, Some(&b"\0\0\0\x03raw\0\0\0\0\0"[..]));
+    }
+
     /// An overlay shorter than the header it declares cannot
     /// hold the backing-pointer rewrite either.
     #[test]
@@ -1053,6 +1314,7 @@ mod tests {
             new_backing_virtual_size: 1 << 20,
             new_backing_path: b"/tmp/new.qcow2", // 14 bytes > 4
             detach: false,
+            new_backing_format_name: b"",
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::BackingPathTooLong));

@@ -63,6 +63,7 @@ fn safe_mode_context_matches_overlay_geometry() {
         new_backing_virtual_size: VIRTUAL_SIZE,
         new_backing_path: new_path,
         detach: false,
+        new_backing_format_name: b"",
     };
     let mut scratch = vec![0u8; 64 * 1024];
     let out = plan_rebase_qcow2(&opts, &mut scratch).expect("rebase plan");

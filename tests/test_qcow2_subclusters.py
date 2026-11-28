@@ -26,10 +26,11 @@ Three narrower sets of tests sit beside those:
 
 * every pair in `helpers.qcow2_subclusters.COMPARE_PAIRS` is compared in
   both argument orders, and instar must agree with `qemu-img compare`;
-* the data-file images in `CHECK_CHAIN_FIXTURES`, all over qcow2 backing
-  files, pass `check --chain` with no chain error, as `qemu-img check` does:
-  a data file is not a chain layer (a raw backing file always reports a
-  chain error, #808);
+* the images in `CHECK_CHAIN_FIXTURES` pass `check --chain` with no chain
+  error, as `qemu-img check` does. Two things are being pinned: a data file
+  is not a chain layer, and a backing file the secure-mode info gate could
+  not name is checked as raw rather than reported as a format mismatch
+  (#808 -- every raw-backed fixture here used to report one);
 * the fixtures in `REVERSED_COMPARE_FIXTURES` are also compared with
   qemu-img's raw output as the first input, so the fixture's devices follow
   the other input's.
@@ -98,10 +99,19 @@ FAILS_CLOSED_MESSAGES = {
     'data_file_mid_chain': 'external data files are only supported on the top image of a chain',
 }
 
-# Data-file images over qcow2 backing files that check --chain must pass
-# without a chain error.
+# Images that check --chain must pass without a chain error. The first
+# three are data-file images over qcow2 backing files; the rest are backed
+# by a headerless raw file, which secure-mode info names `unknown` and
+# which the guest's own header probe names raw -- the disagreement that
+# was #808. They are listed by name rather than derived from the shape
+# table so that a fixture gaining a backing file does not silently join
+# the set.
 CHECK_CHAIN_FIXTURES = ('mixed_ext_backing_datafile_over_64k_qcow2', 'data_file_holds_qcow2_header',
-                        'data_file_empty')
+                        'data_file_empty',
+                        'issue_654', 'issue_653_backing', 'data_file_partial_backing',
+                        'data_file_classic_no_copied_backing', 'issue_650_backing',
+                        'host_without_ref_backing', 'issue_654_32k', 'data_file_partial_32k',
+                        'issue_653_32k', 'issue_792_backing_classic', 'issue_792_backing_ext')
 
 # Fixtures that are also compared with qemu-img's raw output given first. A
 # monolithicFlat VMDK smaller than its overlay is followed in the device array
@@ -433,6 +443,15 @@ for _label, _table in (('EXPECTED_FAILURES', EXPECTED_FAILURES), ('FAILS_CLOSED'
     _unknown = {key for key in _table if key[1] not in qcow2_subclusters.BUILDERS}
     if _unknown:
         raise RuntimeError(f'{_label} names fixtures that do not exist: {sorted(_unknown)}')
+for _label, _table in (('EXPECTED_FAILURES', EXPECTED_FAILURES), ('FAILS_CLOSED', FAILS_CLOSED)):
+    # The fixture half of each key is checked above. The operation half
+    # is checked here, because an entry keyed on an operation that is
+    # not run is never consulted: a divergence silently stops being
+    # expected, or a fails-closed refusal silently stops being pinned,
+    # and the run stays green either way.
+    _unknown = {key[0] for key in _table if key[0] not in OPERATIONS}
+    if _unknown:
+        raise RuntimeError(f'{_label} names operations that are not run: {sorted(_unknown)}')
 _both = set(EXPECTED_FAILURES) & set(FAILS_CLOSED)
 if _both:
     raise RuntimeError(f'EXPECTED_FAILURES and FAILS_CLOSED both name: {sorted(_both)}')

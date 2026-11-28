@@ -165,6 +165,17 @@ fuzz_target!(|data: &[u8]| {
         slice(60 * 1024, 256)
     };
 
+    // Format name for the backing-format header extension,
+    // carved from the pool tail as well. An empty name, or a
+    // name whose padded width does not match the slot already
+    // in the header, leaves the extension alone or returns
+    // BackingFormatSlotWidth; both are ignored below.
+    let new_backing_format_name: &[u8] = if detach {
+        &[]
+    } else {
+        slice(61 * 1024, 24)
+    };
+
     // ------------------------------------------------------------------
     // Dispatch on format_sel.
     // ------------------------------------------------------------------
@@ -184,6 +195,7 @@ fuzz_target!(|data: &[u8]| {
                     refblock_count,
                     new_backing_virtual_size,
                     new_backing_path,
+                    new_backing_format_name,
                     detach,
                 };
                 if let Ok(output) = plan_rebase_qcow2(&opts, &mut scratch) {

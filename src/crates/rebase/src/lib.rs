@@ -111,6 +111,16 @@ pub enum RebaseError {
     /// header bytes. Indicates either a corrupted image or a
     /// host bug. Maps to `RebaseResult::ERROR_PARSE_FAILED`.
     ParseFailed,
+    /// The new backing's driver name pads to a different width
+    /// than the overlay's existing `EXT_BACKING_FORMAT` record --
+    /// wider or narrower -- so recording the truth would mean
+    /// moving every header extension behind it. Every driver name
+    /// pads to one 8-byte slot except `parallels`, which pads to
+    /// 16, so this is a rebase between a Parallels backing and any
+    /// other format, in either direction, or a hand-made header.
+    /// Maps to
+    /// `RebaseResult::ERROR_BACKING_FORMAT_SLOT`.
+    BackingFormatSlotWidth,
 }
 
 /// Mode selector for the rebase planners.
@@ -284,7 +294,10 @@ impl<'a> RebasePlan<'a> {
 // Re-export the per-format opts, outputs, and (vmdk-side)
 // allocator helpers so downstream callers see a flat API
 // surface.
-pub use qcow2::{plan_rebase_qcow2, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseQcow2SafeContext};
+pub use qcow2::{
+    plan_rebase_qcow2, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseQcow2SafeContext,
+    QCOW2_PLAN_SCRATCH_REQUIRED,
+};
 pub use vmdk::{
     allocate_overlay_grain_vmdk, plan_rebase_vmdk, GrainAllocationState, RebaseVmdkSafeContext,
     VmdkRebaseOpts, VmdkRebaseOutput,

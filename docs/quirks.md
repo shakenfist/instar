@@ -623,12 +623,18 @@ different confidence levels).
 
 **Default behavior (secure)**: instar requires files detected as "raw" to have
 a valid partition table (MBR or GPT). Files without recognized format headers
-AND without valid partition tables are rejected as "unknown format" rather
-than being silently accepted as raw images.
+AND without valid partition tables are *named* "unknown" rather than "raw".
 
-This prevents the backing file disclosure attacks described above, because
-`/etc/shadow` would be rejected as "not a valid disk image" rather than
-being treated as a raw disk.
+The gate decides the name; each operation decides what to do with it. `instar
+bench` declines an `unknown` file named on its command line. The backing-chain
+reader reads an `unknown` chain member as raw, as qemu-img does, so a chain
+instar reads is a chain qemu-img reads.
+
+So this gate is not what prevents the backing file disclosure attacks described
+above. The backing-path allowlist is: a backing, data-file or extent reference
+is checked against it before anything on disk is opened, so a reference to
+`/etc/shadow` never resolves. See
+[chain-discovery.md](chain-discovery.md#path-validation).
 
 **With `--unsafe-quirks` flag**: instar matches qemu-img's behavior, treating
 any unrecognized file as a valid raw image. This is required for exact

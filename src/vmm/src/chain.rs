@@ -84,6 +84,32 @@ impl ImageFormat {
         matches!(self, ImageFormat::Qcow2 | ImageFormat::Qcow1)
     }
 
+    /// The format the guest should read this image's bytes as.
+    ///
+    /// `Unknown` is the name the secure-mode `info` operation gives a
+    /// file whose header matches no magic and which carries no
+    /// partition table, and the name discovery keeps for an ISO. It is
+    /// a statement about identification, not about layout: the bytes
+    /// are at the guest-virtual offset, which is exactly what raw
+    /// means, and the guest's chain reader has always read such a
+    /// member through its raw arm by falling through its format
+    /// dispatch.
+    ///
+    /// Reporting and reading want different answers here, so they ask
+    /// different questions. `info --chain` prints [`Self::format`]'s
+    /// own name, so an unidentifiable backing file is still listed as
+    /// `unknown` and the listing agrees with `instar info` run on that
+    /// file alone. The guest is told `raw`, because an operation that
+    /// allowlists the formats it can read must see the format it will
+    /// actually use -- `Unknown` failed those allowlists, which refused
+    /// chains the same build reads correctly through `convert`.
+    pub fn read_format(self) -> Self {
+        match self {
+            ImageFormat::Unknown => ImageFormat::Raw,
+            other => other,
+        }
+    }
+
     /// Convert to shared crate's ImageFormat u32 value.
     ///
     /// These values must match `shared::ImageFormat` enum values defined in
@@ -344,6 +370,26 @@ pub enum ChainError {
     /// Carries the backing image's path and the data file reference as
     /// its header records it, which is untrusted text.
     BackingDataFileUnsupported { image: PathBuf, data_file: String },
+    /// A reference read from an image's header or descriptor is in
+    /// Windows convention (`C:\images\base.qcow2`, `\\server\share`).
+    /// No file on this host is named by it, and the same spelling is
+    /// also a legal POSIX file name, so joining it onto the image's
+    /// directory would open whatever happened to sit there under that
+    /// name (issue #899). Carries the image that records it and the
+    /// reference as recorded, which is untrusted text.
+    WindowsAbsoluteReference { image: PathBuf, reference: String },
+    /// A differencing VHD or VHDX child's parent resolved to an image
+    /// of a different format. Both specifications require the parent
+    /// to be the same format as the child, and a reader that composes
+    /// the chain would otherwise read the parent's bytes through the
+    /// child format's parent arm (issue #608). A reporting walk ends
+    /// its listing instead of raising this.
+    DifferencingParentFormat {
+        child: PathBuf,
+        child_format: String,
+        parent: PathBuf,
+        parent_format: String,
+    },
     /// I/O error
     IoError(std::io::Error),
 }
@@ -388,6 +434,34 @@ impl std::fmt::Display for ChainError {
                      files are only supported on the top image of a chain",
                     terminal_safe(&image.to_string_lossy()),
                     terminal_safe(data_file)
+                )
+            }
+            ChainError::WindowsAbsoluteReference { image, reference } => {
+                write!(
+                    f,
+                    "{} records a reference in Windows convention ({}), which \
+                     names no file on this host; qemu-img refuses it as an unknown \
+                     protocol and instar will not open a POSIX file of that literal \
+                     name instead",
+                    terminal_safe(&image.to_string_lossy()),
+                    terminal_safe(reference)
+                )
+            }
+            ChainError::DifferencingParentFormat {
+                child,
+                child_format,
+                parent,
+                parent_format,
+            } => {
+                write!(
+                    f,
+                    "{} is a differencing {} image, so its parent must be {} too, but \
+                     {} is {}",
+                    terminal_safe(&child.to_string_lossy()),
+                    child_format,
+                    child_format,
+                    terminal_safe(&parent.to_string_lossy()),
+                    parent_format
                 )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),
@@ -886,12 +960,71 @@ pub fn validate_backing_write_target(
     )
 }
 
+/// Is this reference a Windows absolute path?
+///
+/// True for a drive-letter path (`C:\images\parent.vhdx`, the VHDX
+/// `absolute_win32_path` locator key) and for anything rooted at `\\`
+/// (`\\?\Volume{GUID}\...`, the `volume_path` key, and plain UNC
+/// shares). Both keys reach the host verbatim, in Windows convention,
+/// because that is what the image says and `info` prints what the
+/// image says.
+///
+/// Either separator counts after the drive letter: Windows itself
+/// accepts `C:/images/parent.vhdx`, tools that pass a path through a
+/// URL or a JSON document often emit it that way, and qemu-img refuses
+/// both spellings for the same reason -- everything before the first
+/// colon is read as a protocol name. Taking only the backslash form
+/// would have left the forward-slash one classified relative and so
+/// joined onto the image's directory, which is the behaviour this
+/// classifier exists to stop.
+///
+/// This is a *classification*, never a conversion. No caller builds a
+/// host path from the value: a reporting walk uses the answer to stop,
+/// and [`validate_reference`] uses it to refuse. The VHDX
+/// `relative_path` key does not arrive in Windows convention at all --
+/// the guest renders it into POSIX before reporting it -- so a
+/// `.\parent.vhdx` locator reaches the host as `parent.vhdx` and
+/// resolves like any other relative name.
+pub fn is_windows_absolute_reference(reference: &str) -> bool {
+    if reference.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = reference.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
 fn validate_reference(
     parent_image: &Path,
     backing_path: &str,
     security_config: &SecurityConfig,
     fallback: FileNameFallback,
 ) -> Result<PathBuf, ChainError> {
+    // A reference in Windows convention names no file on this host, so
+    // nothing is opened for it. It is refused here rather than joined
+    // onto the image's directory, which is what used to happen: a
+    // drive-letter or UNC reference is also a legal POSIX file name, so
+    // `C:\images\base.qcow2` beside the image was opened as the
+    // backing file while `info` -- which classifies the same string as
+    // absolute, and so prints it with no resolved path -- reported
+    // nothing of the kind. Whoever could write the image's directory
+    // chose what the reading operations opened, and the audit step did
+    // not show it (issue #899).
+    //
+    // qemu-img refuses the same reference, for its own reason: it reads
+    // everything before the first colon as a protocol name and reports
+    // "Unknown protocol 'C'". So this is parity as well as the stricter
+    // of the two available answers, and it leaves `info` and the
+    // reading operations agreeing about what a chain holds.
+    if is_windows_absolute_reference(backing_path) {
+        return Err(ChainError::WindowsAbsoluteReference {
+            image: parent_image.to_path_buf(),
+            reference: backing_path.to_string(),
+        });
+    }
+
     // The image's directory is canonicalised, so that both `$IMAGE_DIR`
     // and the base relative references are joined to are physical paths
     // whose lexical form means what it says. As spelled, a `..` after a
@@ -1336,6 +1469,46 @@ mod tests {
             ImageFormat::from_str("unknown_format"),
             ImageFormat::Unknown
         );
+    }
+
+    #[test]
+    fn unknown_is_read_as_raw_and_nothing_else_moves() {
+        // The one remapping: a member the info gate could not identify
+        // is read as raw, which is how the guest's chain reader has
+        // always served it.
+        assert_eq!(ImageFormat::Unknown.read_format(), ImageFormat::Raw);
+        assert_eq!(
+            ImageFormat::Unknown.read_format().to_shared_format_u32(),
+            ImageFormat::Raw.to_shared_format_u32()
+        );
+        // Every other format reads as itself. A format that gained a
+        // remapping here would be read through the wrong arm of the
+        // chain reader, which is a wrong-bytes bug under exit 0, so
+        // this is asserted over the whole enum rather than a sample.
+        for format in [
+            ImageFormat::Raw,
+            ImageFormat::Qcow2,
+            ImageFormat::Qcow1,
+            ImageFormat::Vmdk4,
+            ImageFormat::Vmdk3,
+            ImageFormat::Vhd,
+            ImageFormat::Vhdx,
+            ImageFormat::Vdi,
+            ImageFormat::Parallels,
+            ImageFormat::Luks,
+            ImageFormat::VmdkDescriptor,
+            ImageFormat::Dmg,
+        ] {
+            assert_eq!(format.read_format(), format, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn reporting_keeps_the_name_the_info_gate_gave() {
+        // `info --chain` prints `format`, not `read_format`, so an
+        // unidentifiable backing file is still listed as `unknown` and
+        // the listing agrees with `instar info` on that file alone.
+        assert_eq!(ImageFormat::Unknown.to_string(), "unknown");
     }
 
     #[test]

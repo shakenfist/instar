@@ -29,9 +29,10 @@ Common options:
                                existing file's magic bytes
   -b, --backing <BACKING>      Required. New backing file path,
                                or empty string ("") to detach.
-  -F, --backing-format <FMT>   qcow2 | vmdk | raw. Optional
-                               format hint for the new backing;
-                               the guest probes it either way.
+  -F, --backing-format <FMT>   qcow2 | vmdk | raw. Optional.
+                               The guest probes the new backing
+                               either way; this is what gets
+                               recorded in the overlay.
   -u, --backing-unsafe         Unsafe (metadata-only) rebase.
                                Trusts the caller that the new
                                backing has the same content as
@@ -146,6 +147,45 @@ verbatim — instar does not canonicalise to absolute paths.
 Detach is signalled by `-b ""`. The backing pointer is zeroed
 and the overlay becomes standalone.
 
+A qcow2 overlay also records its backing's *format*, in a header
+extension, and a reader trusts that field over probing the file. So
+a rebase that changes format rewrites it: without `-F`, to the
+format chain discovery found for the new backing; with `-F`, to
+what `-F` says. `-u` is no exception -- the new backing is still
+opened to discover its format, so `rebase -u -b new.raw` records
+`raw` with no `-F` given. A v2 (`compat=0.10`) overlay is no
+exception either: qemu writes the record into v2 headers too, at
+offset 72, and rebase finds and rewrites it there. The record is
+looked for in the overlay's first sector, where qemu and instar
+always put it; one a third-party writer placed further out is left
+as it was.
+
+The name written is the driver's, as `qemu-img rebase -F <driver>`
+would write it, for every format discovery identifies: `vpc` for
+VHD, `vmdk` for a VMDK descriptor or a VMDK3 image as well as a
+VMDK4 one, `qcow` for qcow version 1, `vdi`, and so on; an ISO is
+`raw`, since qemu has no ISO driver. `-F` spells only `qcow2`,
+`vmdk` and `raw`, so the rest are reached without it -- `-u` in
+particular accepts a backing in a format rebase cannot read, and
+records it all the same. `create` writes the record from the same
+table, so the two cannot come to spell a format differently.
+
+The record is rewritten in place, at the width it already has.
+Every driver name pads to the same 8 bytes except `parallels`,
+which pads to 16, so a rebase that would change an overlay's record
+between `parallels` and any other name is refused, in either mode,
+with "the overlay's recorded backing format cannot be updated in
+place", and the overlay is left untouched. Leaving the old name
+behind instead would write an overlay that `qemu-img` refuses to
+open. `qemu-img rebase` relays the header out and handles this.
+
+An overlay that recorded no format keeps recording
+none -- a reader then probes the backing file, as it did before --
+because adding a record means relaying the extension chain out, and
+that is the same deferred work as long-path relocation. A detach
+leaves the record alone: there is no backing left for it to
+describe.
+
 ## Differencing images in the backing chain
 
 `rebase` only accepts a qcow2 or vmdk overlay as the image being
@@ -183,6 +223,15 @@ not be composed
  master-plan TODO; for now the picker in the differential
  fuzzer matches the backing-name length to the overlay's
  existing slot.
+- **`-u` still requires the new backing to exist.** `qemu-img
+ rebase -u -F raw -b not-yet-there.raw overlay.qcow2` succeeds,
+ writing the reference for a file that is not there yet; instar
+ refuses it with `Path resolution error: ... No such file or
+ directory`, because chain discovery runs on the new backing
+ whatever mode it is in -- which is also how `-u` comes to record
+ the discovered format. The error message says to pass `-u` to
+ skip the existence check, which only applies to the check at
+ argument-parsing time. Tracked as issue #979.
 - **Safe-mode rebase for vmdk is not yet supported.** instar
  rejects with `ERROR_UNSUPPORTED_FORMAT`. qemu-img also
  rejects vmdk rebase entirely (there is no upstream vmdk
@@ -302,6 +351,19 @@ not be composed
  succeeds but the resulting overlay has inconsistent
  metadata; the master plan tracks this as a future
  hardening item.
+- **A chain member rebase cannot read is refused by its own
+ reason.** Safe mode reads the old and new chains through the
+ guest's chain reader, which serves qcow2, raw, VHD and VHDX
+ members; a chain holding any other format -- a VMDK backing
+ file, say, which `qemu-img rebase` reads -- is refused before
+ anything is read or written, with a message naming the formats
+ it can read. That includes an overlay with internal snapshots,
+ where a safe rebase grows the refcount structures before it
+ copies anything: the chain is checked first, so the refused
+ overlay is byte-for-byte what it was. It used to be refused inside the per-cluster reader,
+ which could only report that a read had failed, and that
+ surfaced as `ERROR_PARSE_FAILED`: "the overlay's header could
+ not be parsed", about an overlay that parses perfectly well.
 - **External-data-file qcow2 overlays are refused.** Rebase
  refuses any overlay with the `INCOMPAT_EXTERNAL_DATA`
  feature bit set; that's the qcow2 v3 external data file

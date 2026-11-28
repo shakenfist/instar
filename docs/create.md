@@ -391,8 +391,13 @@ that decides how a fixed VHD parent is sized. The hint is used as the
 initial format guess; if
 the backing file's first sector contradicts the hint via its magic
 bytes, auto-detection wins and the metadata records the detected
-format. vpc and vhdx additionally require the parent to be their own
-format — a vpc child needs a VHD parent, a vhdx child a VHDX one — and
+format. A qcow2 child records that format as the name of the qemu
+*driver* that reads it, from `ImageFormat::qemu_driver_name` — the
+table `rebase` records from too — so a VHD backing is recorded as
+`vpc`, and an ISO backing as `raw`, since qemu has no `iso` driver and
+refuses to open an overlay that names one (instar wrote `iso` until
+issue #972 was fixed). vpc and vhdx additionally require the parent to
+be their own format — a vpc child needs a VHD parent, a vhdx child a VHDX one — and
 refuse with `ERROR_PARENT_FORMAT_MISMATCH` otherwise, whether the
 mismatch comes from detection or from an explicit `-F` that
 contradicts it; qcow2 and vmdk are unaffected and continue to accept a

@@ -217,14 +217,21 @@ ADVERSARIAL_LOCATOR_REASONS = {
 # of the host. The three that are absolute or `..`-escaping references
 # (`/etc/passwd`, the traversal and the overlong name) are outside the
 # allowlist and are refused before the filesystem is consulted. The rest
-# are "not found" inside the allowlist. The UNC fixture is "not found"
-# rather than classified: the Windows-absolute classifier belongs to the
-# reporting walk, and a composing walk simply joins the reference to the
-# child's directory and finds nothing, which refuses just as firmly.
+# are "not found" inside the allowlist.
+#
+# The UNC fixture is classified, like the reporting walk's answer and
+# for the same reason (#899): a reference in Windows convention names no
+# file on this host, so joining it onto the child's directory and
+# reporting what was or was not there made the refusal depend on a file
+# instar was never going to open. It is now refused before the
+# filesystem is consulted, which is also the oracle property this
+# directory's fixtures exist to protect. The URL fixture is not
+# classified -- `http://` has no drive letter and no `\\` root -- so it
+# stays "not found" inside the allowlist.
 COMPOSING_LOCATOR_REASONS = {
     'vhd-diff-locator-etc-passwd': "Backing file '/etc/passwd' is outside allowed paths",
     'vhd-diff-locator-dotdot': 'is outside allowed paths',
-    'vhd-diff-locator-unc': 'Backing file not found',
+    'vhd-diff-locator-unc': 'records a reference in Windows convention',
     'vhd-diff-locator-url': 'Backing file not found',
     'vhd-diff-locator-overlong': 'is outside allowed paths',
     'vhd-diff-locator-conflicting': 'Backing file not found',

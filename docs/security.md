@@ -379,6 +379,19 @@ This is why oslo.utils `format_inspector` detects MBR/GPT partition tables -
 to distinguish genuine raw disk images from arbitrary files that qemu-img would
 happily accept. See [quirks.md](quirks.md#raw-as-fallback-format) for details.
 
+**What instar does with that distinction.** instar's secure-mode `info` makes
+the same one: a file with no recognised header and no partition table is
+*named* `unknown` rather than `raw`. The name is a statement about
+identification, and what each operation does with it is that operation's
+decision -- `instar bench` declines such a file when it is the image named on
+the command line. It is not what stops the attack above. In backing position
+instar reads an unidentified chain member as raw, as qemu-img does, so a chain
+instar reads is a chain qemu-img reads; what stops a backing reference reaching
+`/etc/shadow` is that the reference never resolves, because every backing,
+data-file and extent reference is checked against the backing-path allowlist
+before anything on disk is opened. See
+[chain-discovery.md](chain-discovery.md#path-validation) for the allowlist.
+
 ---
 
 ## Recommendations

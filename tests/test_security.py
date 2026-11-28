@@ -1045,3 +1045,109 @@ class TestCVEReproduction(InstarTestBase):
             result.stdout + result.stderr,
             'CVE-2024-4467 json: CLI argument'
         )
+
+
+class TestWindowsConventionBackingReference(InstarTestBase):
+    """A Windows-convention backing reference opens nothing.
+
+    `C:\\images\\base.qcow2` is a legal POSIX file name as well as a
+    Windows path. Chain discovery used to join it onto the image's
+    directory, so whoever could write that directory chose what
+    `convert`, `compare`, `dd`, `bench` and `rebase` opened as the
+    backing image -- while `info`, which is the audit step before a
+    conversion, classifies the same string as absolute and so reported
+    no resolved path at all (issue #899). qemu-img refuses the same
+    reference, reading everything before the first colon as a protocol
+    name: `Unknown protocol 'C'`.
+
+    The planted file here is a real qcow2 full of a distinctive byte, so
+    a regression that opens it is caught by the content of the output
+    and not only by an exit code.
+    """
+
+    REFERENCE = 'C:\\images\\base.qcow2'
+    PLANTED_BYTE = 0x99
+
+    def plant(self, directory):
+        """An overlay recording REFERENCE, beside a file of that name."""
+        directory = Path(directory)
+        planted = directory / self.REFERENCE
+        # The forward-slash spelling joins into a nested path rather
+        # than one file name, which is the shape the hazard takes for
+        # that spelling: the directories have to exist for the plant
+        # to be the file a regression would open.
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', str(planted), '1M'],
+            capture_output=True, check=True)
+        subprocess.run(
+            ['qemu-io', '-f', 'qcow2', '-c',
+             f'write -P 0x{self.PLANTED_BYTE:02x} 0 64k', str(planted)],
+            capture_output=True, check=True)
+        overlay = directory / 'overlay.qcow2'
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', '-u', '-F', 'qcow2',
+             '-b', self.REFERENCE, str(overlay), '1M'],
+            capture_output=True, check=True)
+        return overlay, planted
+
+    def test_info_reports_the_reference_as_recorded(self):
+        """Unchanged, and what qemu-img prints: no resolved path."""
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            overlay, _ = self.plant(td)
+            stdout, stderr, rc = self.run_instar_info(overlay)
+            self.assertEqual(rc, 0, f'info failed: {stderr!r}')
+            self.assertIn(f'backing file: {self.REFERENCE}', stdout)
+            self.assertNotIn('actual path', stdout,
+                             'a Windows-convention reference has no resolved path')
+
+    def test_a_reading_operation_opens_nothing_for_it(self):
+        """convert refuses, and the planted bytes reach no output."""
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            overlay, _ = self.plant(td)
+            out = Path(td) / 'out.raw'
+            _, stderr, rc = self.run_instar_convert(overlay, out)
+            self.assertNotEqual(
+                rc, 0, 'a Windows-convention backing reference must be refused')
+            self.assertIn('Windows convention', stderr,
+                          f'refusal does not name the reason: {stderr!r}')
+            if out.exists():
+                self.assertNotIn(
+                    bytes([self.PLANTED_BYTE]) * 64, out.read_bytes(),
+                    'the planted file was read as the backing image')
+
+    def test_chain_discovery_and_info_agree(self):
+        """`info --chain` refuses the reference `info` would not resolve.
+
+        The disagreement this closes was between these two commands on
+        the same image: one printed a reference it said it could not
+        resolve, the other walked into a file of that literal name.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            overlay, planted = self.plant(td)
+            stdout, stderr, rc = self.run_instar_info(overlay, chain=True)
+            self.assertNotEqual(rc, 0, f'info --chain listed it: {stdout!r}')
+            self.assertIn('Windows convention', stderr,
+                          f'refusal does not name the reason: {stderr!r}')
+            self.assertNotIn(str(planted), stdout,
+                             'the planted file was listed as a chain member')
+
+
+class TestWindowsConventionForwardSlashReference(TestWindowsConventionBackingReference):
+    """The same hazard, spelled with forward slashes.
+
+    `C:/images/base.qcow2` is the spelling a path acquires on its way
+    through a URL or a JSON document, and Windows accepts it as readily
+    as the backslash form. qemu-img refuses both for the same reason --
+    everything before the first colon is a protocol name -- but instar's
+    classifier originally required a literal backslash, so this spelling
+    was classified relative and joined onto the image's directory, and a
+    planted `C:/images/base.qcow2` was opened as the backing file.
+
+    Every assertion is inherited; only the reference changes.
+    """
+
+    REFERENCE = 'C:/images/base.qcow2'

@@ -36,6 +36,7 @@ use qcow2_write_exec::{execute, growth, read_bytes, CallTableIo, Regions};
 use rebase::{
     plan_rebase_qcow2, plan_rebase_vmdk, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError,
     RebaseMode, RebasePatch, RebasePlan, VmdkRebaseOpts, VmdkRebaseOutput,
+    QCOW2_PLAN_SCRATCH_REQUIRED,
 };
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ChainConfig,
@@ -249,8 +250,8 @@ const _: () = assert!(
 const _: () = assert!(PLANNER_BOUNCE_LIMIT >= COMPARE_BUF_SIZE);
 const _: () = assert!(PROBE_L2_LIMIT >= COMPARE_BUF_SIZE);
 const _: () = assert!(OVERLAY_L2_LIMIT / COMPARE_BUF_SIZE >= 2);
-// The deferred-metadata planner needs 12 + 1024 bytes.
-const _: () = assert!(SAFE_PLAN_SCRATCH_LIMIT >= 12 + 1024);
+// The qcow2 planners' scratch carve, summed where they carve it.
+const _: () = assert!(SAFE_PLAN_SCRATCH_LIMIT >= QCOW2_PLAN_SCRATCH_REQUIRED);
 
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
@@ -319,7 +320,45 @@ fn map_rebase_error(e: RebaseError) -> u32 {
         RebaseError::DescriptorTooLarge => RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
         RebaseError::ParseFailed => RebaseResult::ERROR_PARSE_FAILED,
         RebaseError::Overflow => RebaseResult::ERROR_INTERNAL_OVERFLOW,
+        RebaseError::BackingFormatSlotWidth => RebaseResult::ERROR_BACKING_FORMAT_SLOT,
     }
+}
+
+/// The driver name to record for the new backing in the
+/// overlay's `EXT_BACKING_FORMAT` extension, as qemu spells it.
+///
+/// Every format a rebase can put under an overlay is named, not
+/// just the three `-F` spells: without `-F` the host states what
+/// chain discovery found for the new backing, and `-u` reaches
+/// formats this build cannot read (a VDI, a VMDK descriptor) as
+/// well as the ones it can. An unnamed format would leave the
+/// overlay recording its *old* backing's format, and a stale
+/// record is worse than none -- a reader with no record probes
+/// the backing, while a reader with a wrong one opens it with the
+/// wrong driver and refuses the overlay.
+///
+/// The spelling is the driver's, from
+/// [`ImageFormat::qemu_driver_name`] -- the same table `create`
+/// writes the record from -- so a format instar can discover is a
+/// format it can name.
+///
+/// The one empty answer is `Unknown`, and here it means "no
+/// format stated": the host sends 0 only when there is no new
+/// backing to have discovered a format for (a detach), because
+/// discovery's own `unknown` is sent as `raw`. The planner then
+/// leaves the record alone.
+///
+/// The names pad to one 8-byte record slot except `parallels`,
+/// which pads to 16. `push_backing_format_patch` refuses a width
+/// change rather than shifting the extensions behind the record,
+/// so rebasing an overlay between an 8-byte name and `parallels`
+/// is refused with `ERROR_BACKING_FORMAT_SLOT` -- a typed refusal,
+/// where leaving the record alone would have written a header no
+/// reader can open.
+fn backing_format_record_name(format_code: u32) -> &'static [u8] {
+    ImageFormat::from_u32(format_code)
+        .qemu_driver_name()
+        .as_bytes()
 }
 
 /// Map a `qcow2_write::Gate` envelope refusal on the OVERLAY
@@ -582,6 +621,7 @@ unsafe fn run_qcow2_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reb
         new_backing_virtual_size: config.overlay_virtual_size,
         new_backing_path,
         detach: config.is_detach(),
+        new_backing_format_name: backing_format_record_name(config.new_backing_format),
     };
 
     let scratch =
@@ -1026,6 +1066,7 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         new_backing_virtual_size: config.overlay_virtual_size,
         new_backing_path,
         detach: config.is_detach(),
+        new_backing_format_name: backing_format_record_name(config.new_backing_format),
     };
 
     let planner_scratch =
@@ -1122,6 +1163,106 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // historical behaviour (it has never offered a
     // crash-consistency contract).
     let mut io = CallTableIo::new(call_table, false);
+
+    // ----- Initialise chain-reader state -------------------
+    // Everything in this block can refuse, and it all runs before
+    // the refcount growth below, which is the first write to the
+    // overlay. A refusal of the chain (too deep, a member this
+    // build cannot read, a member whose metadata does not parse)
+    // must leave the overlay exactly as it was, as every other
+    // refusal does; growth first would have left a snapshot-bearing
+    // overlay with refblocks it never needed. The chain reader's
+    // carves (CHAIN_CACHES, PLANNER_SCRATCH) are disjoint from the
+    // growth buffers, so the order is free.
+    let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
+    if !chain_config.is_valid() {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+
+    let device_count = {
+        let old_end = config
+            .old_chain_first
+            .saturating_add(config.old_chain_count);
+        let new_end = config
+            .new_chain_first
+            .saturating_add(config.new_chain_count);
+        old_end.max(new_end) as usize
+    };
+    if device_count > MAX_CHAIN_DEVICES {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_CHAIN_DEPTH,
+        );
+    }
+
+    // Refuse a chain this build cannot read before staging a byte
+    // of it or writing one to the overlay, and refuse it with a
+    // reason of its own. The old
+    // refusal happened inside the per-cluster reader, which had no
+    // way to say more than "the read failed" and so surfaced as a
+    // parse failure blamed on the overlay (issue #632).
+    for (first, count) in [
+        (config.old_chain_first, config.old_chain_count),
+        (config.new_chain_first, config.new_chain_count),
+    ] {
+        if !chain_segment_is_readable(chain_config, first, count) {
+            (call_table.debug_print)(
+                b"rebase: a chain member's format cannot be read by this build\n\0".as_ptr(),
+            );
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_CHAIN_UNREADABLE,
+            );
+        }
+    }
+
+    let mut chain_states = qcow2::ChainStates::default();
+    let mut bytes_read: u64 = 0;
+    if device_count > 0
+        && !qcow2::init_chain_states(
+            call_table,
+            chain_config,
+            &mut chain_states,
+            device_count,
+            sector_size,
+            CHAIN_CACHES,
+            // Per-device DMG chunk-table scratch. rebase's chain
+            // reader (`read_chain_cluster`) serves qcow2, raw, VHD and
+            // VHDX devices and refuses every other format, so a DMG
+            // device in a rebase chain is refused at READ time and the
+            // chunk table staged for it here is never consulted. We
+            // still hand init_chain_states a valid region to stage
+            // into: the `-u`/vmdk PLANNER_SCRATCH carve, which no
+            // planner touches on the safe-mode path that reaches here.
+            // DMG_REQUIRED_SCRATCH (≈3.25 MiB) fits within
+            // PLANNER_SCRATCH_LIMIT (4 MiB).
+            //
+            // This is now the carve's only use on the read path.
+            // `read_chain_cluster`'s two bounce buffers used to be
+            // taken from it as well, which was safe only because the
+            // allowlist refuses DMG -- nothing ever read back a chunk
+            // table a read had overwritten. They have their own carve
+            // (`CHAIN_READ_COMPRESSED`), so widening the allowlist to
+            // DMG no longer turns that into an aliasing bug; it would
+            // only mean the chunk table staged here is consulted, as
+            // init_chain_states already intends.
+            PLANNER_SCRATCH,
+            qcow2::DMG_REQUIRED_SCRATCH,
+            &mut bytes_read,
+        )
+    {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
 
     // ----- Preemptive refcount growth -----------------------
     // COW allocates at most one new data cluster plus one new L2
@@ -1230,75 +1371,6 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
                     * cluster_size_usize;
             }
         }
-    }
-
-    // ----- Initialise chain-reader state -------------------
-    let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
-    if !chain_config.is_valid() {
-        return err_result(
-            config.overlay_format,
-            RebaseResult::MODE_SAFE,
-            RebaseResult::ERROR_PARSE_FAILED,
-        );
-    }
-
-    let device_count = {
-        let old_end = config
-            .old_chain_first
-            .saturating_add(config.old_chain_count);
-        let new_end = config
-            .new_chain_first
-            .saturating_add(config.new_chain_count);
-        old_end.max(new_end) as usize
-    };
-    if device_count > MAX_CHAIN_DEVICES {
-        return err_result(
-            config.overlay_format,
-            RebaseResult::MODE_SAFE,
-            RebaseResult::ERROR_CHAIN_DEPTH,
-        );
-    }
-
-    let mut chain_states = qcow2::ChainStates::default();
-    let mut bytes_read: u64 = 0;
-    if device_count > 0
-        && !qcow2::init_chain_states(
-            call_table,
-            chain_config,
-            &mut chain_states,
-            device_count,
-            sector_size,
-            CHAIN_CACHES,
-            // Per-device DMG chunk-table scratch. rebase's chain
-            // reader (`read_chain_cluster`) serves qcow2, raw, VHD and
-            // VHDX devices and refuses every other format, so a DMG
-            // device in a rebase chain is refused at READ time and the
-            // chunk table staged for it here is never consulted. We
-            // still hand init_chain_states a valid region to stage
-            // into: the `-u`/vmdk PLANNER_SCRATCH carve, which no
-            // planner touches on the safe-mode path that reaches here.
-            // DMG_REQUIRED_SCRATCH (≈3.25 MiB) fits within
-            // PLANNER_SCRATCH_LIMIT (4 MiB).
-            //
-            // This is now the carve's only use on the read path.
-            // `read_chain_cluster`'s two bounce buffers used to be
-            // taken from it as well, which was safe only because the
-            // allowlist refuses DMG -- nothing ever read back a chunk
-            // table a read had overwritten. They have their own carve
-            // (`CHAIN_READ_COMPRESSED`), so widening the allowlist to
-            // DMG no longer turns that into an aliasing bug; it would
-            // only mean the chunk table staged here is consulted, as
-            // init_chain_states already intends.
-            PLANNER_SCRATCH,
-            qcow2::DMG_REQUIRED_SCRATCH,
-            &mut bytes_read,
-        )
-    {
-        return err_result(
-            config.overlay_format,
-            RebaseResult::MODE_SAFE,
-            RebaseResult::ERROR_PARSE_FAILED,
-        );
     }
 
     // ----- Per-cluster comparison loop ---------------------
@@ -1834,6 +1906,57 @@ unsafe fn read_input_byte_range(
 // Chain reader
 // ---------------------------------------------------------------------------
 
+/// Pre-flight a chain segment: every member must be a format this
+/// build's chain reader can serve.
+///
+/// `#[cfg(feature = ...)]` here would check this *crate's* own
+/// feature table, not qcow2's -- rebase-op declares no such
+/// features itself, so the qcow2 dependency features below are
+/// unconditional for this binary. Without a format's `-input`
+/// feature on that dependency the qcow2 crate falls through to
+/// `read_raw_sectors` for that format, which is wrong for any
+/// image whose data isn't laid out at the guest-virtual offset;
+/// this allowlist is what rebase-op's own Cargo.toml feature list
+/// (`vhd-input`, `vhdx-input`, alongside the qcow2/raw case that
+/// needed no feature at all) actually supports.
+///
+/// It runs once per segment before the comparison loop rather than
+/// per cluster inside the reader, which is what lets the refusal
+/// have a reason of its own. Inside the reader all it could do was
+/// return "the read failed", which the runner reported as
+/// `ERROR_PARSE_FAILED` -- "the overlay's header could not be
+/// parsed", about an overlay that parsed perfectly well (issue
+/// #632).
+///
+/// The guest has no number formatting, so which member it was goes
+/// no further than this: the error code carries the class of
+/// refusal and the host's message names the formats a rebase can
+/// read, which is what the user needs to act.
+fn chain_segment_is_readable(
+    chain_config: &ChainConfig,
+    chain_first: u32,
+    chain_count: u32,
+) -> bool {
+    for i in 0..chain_count {
+        // `chain_first + i` is bounded by the device-count gate the
+        // runner applies first, so this cannot wrap today; checking
+        // keeps that an assumption this function makes rather than
+        // one it inherits.
+        let idx = match chain_first.checked_add(i) {
+            Some(idx) => idx as usize,
+            None => return false,
+        };
+        if idx >= MAX_CHAIN_DEVICES {
+            return false;
+        }
+        match chain_config.devices[idx].detected_format() {
+            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Read whatever data the backing chain at
 /// `[chain_first, chain_first + chain_count)` provides at
 /// `guest_offset` into `out_buf`. Walks the chain top-to-base,
@@ -1846,21 +1969,25 @@ unsafe fn read_input_byte_range(
 /// v1 supports qcow2, raw, vhd and vhdx chain members: the
 /// rebase binary enables `vhd-input` / `vhdx-input`, so the
 /// shared chain reader composes a differencing VHD or VHDX the
-/// same way `convert` and `bench` do. A vmdk chain member still
-/// forces the call to return `false`, because `vmdk-input` is
-/// not enabled here and without it the qcow2 crate's chain
-/// reader falls through to `read_raw_sectors` for an
-/// unrecognised format, which would silently misread vmdk data
-/// as raw sectors. Future work tracks promotion to a shared
+/// same way `convert` and `bench` do. This function does not
+/// check the member formats itself: `vmdk-input` is not enabled
+/// here, so the qcow2 crate's chain reader would read a vmdk
+/// member through `read_raw_sectors` and silently misread it,
+/// and it is [`chain_segment_is_readable`], run once per segment
+/// before the comparison loop, that keeps such a member from
+/// reaching this call. Future work tracks promotion to a shared
 /// crate that handles the full chain-member set.
 ///
 /// # Safety
 ///
 /// `call_table` must be valid. `chain_config` must describe the
-/// referenced devices. `chain_states` must already be
-/// initialised for every qcow2 member via
-/// [`qcow2::init_chain_states`]. `out_buf` must point to at
-/// least `cluster_size` writable bytes.
+/// referenced devices. [`chain_segment_is_readable`] must have
+/// returned `true` for `[chain_first, chain_first + chain_count)`:
+/// that is the only format check on this path, and the only bound
+/// keeping the segment's indices below `MAX_CHAIN_DEVICES`.
+/// `chain_states` must already be initialised for every qcow2
+/// member via [`qcow2::init_chain_states`]. `out_buf` must point
+/// to at least `cluster_size` writable bytes.
 unsafe fn read_chain_cluster(
     call_table: &CallTable,
     chain_first: u32,
@@ -1872,36 +1999,17 @@ unsafe fn read_chain_cluster(
     out_buf: *mut u8,
     sector_size: usize,
 ) -> bool {
+    debug_assert!(chain_segment_is_readable(
+        chain_config,
+        chain_first,
+        chain_count
+    ));
     if chain_count == 0 {
         // No chain at this slot range: read as zeros. Mirrors
         // the all-unallocated path inside the qcow2 chain
         // reader.
         core::ptr::write_bytes(out_buf, 0, cluster_size as usize);
         return true;
-    }
-
-    // Pre-flight: every chain member must be a format the chain
-    // reader can handle in this build. `#[cfg(feature = ...)]`
-    // here would check this *crate's* own feature table, not
-    // qcow2's -- rebase-op declares no such features itself, so
-    // the qcow2 dependency features below are unconditional for
-    // this binary. Without a format's `-input` feature on that
-    // dependency the qcow2 crate falls through to
-    // `read_raw_sectors` for that format, which is wrong for any
-    // image whose data isn't laid out at the guest-virtual
-    // offset; this allowlist is what rebase-op's own Cargo.toml
-    // feature list (`vhd-input`, `vhdx-input`, alongside the
-    // qcow2/raw case that needed no feature at all) actually
-    // supports.
-    for i in 0..chain_count {
-        let idx = (chain_first + i) as usize;
-        if idx >= MAX_CHAIN_DEVICES {
-            return false;
-        }
-        match chain_config.devices[idx].detected_format() {
-            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
-            _ => return false,
-        }
     }
 
     // `compressed_buf` and `staging_buf` are unused for the
