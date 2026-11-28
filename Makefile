@@ -773,6 +773,15 @@ test-container: instar-devcontainer instar
 # is what makes a failed probe red here instead of a skip that reads as
 # a pass; see tests/test_slow_host_read.py.
 #
+# INSTAR_REQUIRE_LANDLOCK and INSTAR_REQUIRE_SECCOMP are the same bargain
+# for TestInfoFileUrl in tests/test_info_safe.py, which accepts a fetcher
+# running without a layer only when the kernel says it cannot provide one.
+# Unset, a container that stopped providing Landlock or the seccomp kill
+# action would turn the assertion that the policy applied into the weaker
+# one that its absence was reported, and the run would stay green; set,
+# that substitution is a failure. test-rust passes the same two through
+# for the fetcher's own tests.
+#
 # The selection is listed before it is run so the run has a discovery
 # count to be checked against: a crashed stestr worker leaves a totals
 # block that exits 0, and tools/ci/check-stestr-run.sh needs the count
@@ -796,7 +805,9 @@ test-container-core: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_LANDLOCK \
 		-e INSTAR_REQUIRE_LIBVHDI \
+		-e INSTAR_REQUIRE_SECCOMP \
 		-e INSTAR_REQUIRE_STRACE \
 		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \

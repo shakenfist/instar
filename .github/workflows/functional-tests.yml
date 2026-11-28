@@ -1166,6 +1166,16 @@ jobs:
       # behaviour being guarded is one constant away from regressing,
       # so the skip has to be loud here; see
       # tests/test_slow_host_read.py.
+      #
+      # INSTAR_REQUIRE_LANDLOCK and INSTAR_REQUIRE_SECCOMP do it for
+      # TestInfoFileUrl, which runs a file:// input through a confined
+      # fetcher and checks that --verbose accounts for each layer. It
+      # accepts "this kernel has no landlock" as an answer, because on
+      # such a kernel that is the truth; here the container is the same
+      # devcontainer build-and-test runs the fetcher's unit tests in
+      # with both set, so both layers must apply, and a runner image or
+      # container profile that took one away turns this job red rather
+      # than quietly testing less.
       # The fixture half of the split VMDK literal guard, which needs a
       # testdata clone; the pin-against-source half runs in ci-tooling.
       # The 33 GiB fixture is the only committed witness past sixteen
@@ -1178,7 +1188,9 @@ jobs:
 
       - name: Run core integration tests
         env:
+          INSTAR_REQUIRE_LANDLOCK: '1'
           INSTAR_REQUIRE_LIBVHDI: '1'
+          INSTAR_REQUIRE_SECCOMP: '1'
           INSTAR_REQUIRE_STRACE: '1'
           INSTAR_REQUIRE_ZSTD: '1'
         run: |

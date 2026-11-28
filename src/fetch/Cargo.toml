@@ -11,8 +11,8 @@ categories = ["os::unix-apis"]
 # Not published to crates.io: it is instar's own helper, not a library.
 publish = false
 
-# The wire format, and libc for the two syscalls std does not expose
-# safely. Nothing else: this process is the untrusted half of the
+# The wire format, and libc for the syscalls and kernel types std does
+# not expose -- the confinement calls among them. Nothing else: this process is the untrusted half of the
 # partition, and every dependency it takes is code running next to the
 # bytes an attacker controls.
 [dependencies]

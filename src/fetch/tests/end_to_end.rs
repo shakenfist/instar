@@ -684,6 +684,50 @@ fn layers_instar_would_name() -> String {
     layers.join(",")
 }
 
+/// A fetcher named a layer list it cannot obey exits non-zero without ever
+/// sending an init reply.
+///
+/// The spawn-side half of the contract the privileged side's `--verbose`
+/// lines rest on: they say a layer is applied because a fetcher that could
+/// not apply it would have failed before replying, and this is that failure
+/// through the real binary rather than an in-process probe. An unknown name
+/// is the half that can be provoked here. The other half, a layer named that
+/// the kernel lacks, cannot be on a kernel that has every layer, and the
+/// fetcher's own tests assert it where the kernel allows.
+#[test]
+fn a_fetcher_named_a_list_it_cannot_obey_exits_without_replying() -> io::Result<()> {
+    let image = TempImage::new(IMAGE_LEN)?;
+    let served = image.open()?;
+    let (ours, theirs) = SeqPacketSocket::pair()?;
+    let max_datagram = ours.max_datagram()?;
+    let mut fetcher = spawn_fetcher_confined(theirs, &served, Some("nonsense"))?;
+    drop(served);
+
+    // Asked, so that a fetcher which went ahead regardless would have
+    // something to answer. The send itself may fail if the fetcher has
+    // already gone, which is the outcome being tested, not a fault in it.
+    let _ = ours.send(&InitRequest::new(max_datagram).encode());
+    ours.set_recv_timeout(Duration::from_secs(10))?;
+    let mut reply = [0u8; 64];
+    let received = ours.recv(&mut reply);
+    // Either way the peer is gone without a word: an orderly end of stream
+    // if it left before the request arrived, a reset if it left with the
+    // request unread in its queue.
+    assert!(
+        matches!(&received, Ok(0))
+            || matches!(&received, Err(err) if err.kind() == io::ErrorKind::ConnectionReset),
+        "a fetcher named a list it cannot obey answered its init, or never hung up: {received:?}"
+    );
+
+    let status = fetcher.wait()?;
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "a fetcher named a list it cannot obey did not exit as a usage error: {status}"
+    );
+    Ok(())
+}
+
 /// A fetcher confined the way instar confines it still serves every byte,
 /// and then ends with a zero.
 ///

@@ -385,6 +385,10 @@ fn signal_name(signal: i32) -> Option<&'static str> {
         libc::SIGABRT => "SIGABRT",
         libc::SIGKILL => "SIGKILL",
         libc::SIGTERM => "SIGTERM",
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGPIPE => "SIGPIPE",
         libc::SIGXCPU => "SIGXCPU",
         libc::SIGXFSZ => "SIGXFSZ",
         _ => return None,
@@ -407,6 +411,12 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 /// mistake and not the user's, and saying so is the difference between a bug
 /// that gets reported and a user who concludes their image is broken.
 ///
+/// The signals a user sends -- an interrupt from the terminal, a hangup, a
+/// quit, a polite termination -- get a sentence of their own too, because a
+/// Ctrl-C reaches every process in the foreground group and the fetcher may be
+/// reaped before instar itself goes. Told in the same words as a crash, it
+/// would read as the fetcher misbehaving when somebody had stopped it.
+///
 /// Said whatever verbosity the caller asked for. A child killed by a signal is
 /// abnormal by definition, the operation it was serving has already failed by
 /// the time this is known, and a diagnosis that only appears if the user
@@ -425,6 +435,16 @@ fn reaped_fetcher_note(pid: u32, status: ExitStatus) -> Option<String> {
              call its sandbox does not allow. That is a bug in instar rather than anything wrong \
              with the input or the way it was invoked, and the input it was serving was not read \
              to the end"
+        ));
+    }
+    if matches!(
+        signal,
+        libc::SIGINT | libc::SIGHUP | libc::SIGQUIT | libc::SIGTERM
+    ) {
+        return Some(format!(
+            "instar: the fetcher (pid {pid}) was stopped by {named}, a signal sent to interrupt \
+             it rather than one it raised itself, and the input it was serving was not read to \
+             the end"
         ));
     }
     Some(format!(
@@ -645,7 +665,9 @@ fn spawn_fetcher_binary(
         child,
         client: None,
     };
-    source.client = Some(FetchClient::new(ours)?);
+    source.client = Some(FetchClient::new(ours).map_err(|err| {
+        explain_init_failure(err, &confinement.confine_argument(), inherit_stderr)
+    })?);
 
     // Said after the init exchange rather than before it, so that the lines
     // describe what happened: a fetcher that could not apply a layer it was
@@ -657,6 +679,31 @@ fn spawn_fetcher_binary(
         }
     }
     Ok(source)
+}
+
+/// The error for a fetcher whose init exchange failed, with the way to find
+/// out why.
+///
+/// A fetcher that fails before it replies -- a layer it was named and could
+/// not apply is the case its confinement adds -- says why on its own stderr,
+/// and on a default run that is `/dev/null`, so all that reaches the user is
+/// a socket that closed. This side cannot know what the fetcher would have
+/// said, but it can say what the fetcher was asked to do and where its own
+/// account goes, which is the same argument that makes a signal death a
+/// sentence whatever the verbosity: the run has failed, and a diagnosis
+/// nobody is told how to see is a diagnosis nobody gets. Under `--verbose`
+/// the fetcher's own line is already on stderr, so the error is left alone.
+fn explain_init_failure(err: io::Error, confine_argument: &str, inherit_stderr: bool) -> io::Error {
+    if inherit_stderr {
+        return err;
+    }
+    io::Error::new(
+        err.kind(),
+        format!(
+            "{err}; the fetcher was started with {confine_argument}, and its own account of why \
+             it stopped is printed with --verbose"
+        ),
+    )
 }
 
 /// Helpers for any module's tests that need a real fetcher.
@@ -1109,6 +1156,66 @@ mod tests {
         assert!(
             unnamed.contains(&format!("signal {}", libc::SIGWINCH)),
             "an unnamed signal is not identified at all: {unnamed}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_somebody_interrupted_is_told_as_an_interruption() {
+        for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGTERM] {
+            let note = reaped_fetcher_note(4242, ExitStatus::from_raw(signal))
+                .expect("a fetcher killed by a signal is reported");
+            assert!(
+                note.contains(&format!("signal {signal} (SIG")),
+                "the note does not name signal {signal}: {note}"
+            );
+            assert!(
+                note.contains("interrupt"),
+                "signal {signal} is one a user sends, and the note does not say the fetcher was \
+                 interrupted: {note}"
+            );
+            assert!(
+                !note.contains("bug in instar") && !note.contains("rather than exiting"),
+                "signal {signal} was described as the fetcher misbehaving: {note}"
+            );
+        }
+        // SIGKILL stays with the crashes: it is how the OOM killer ends a
+        // process, so it is not evidence that anybody meant to stop this one.
+        let killed = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGKILL))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            !killed.contains("interrupt"),
+            "SIGKILL was described as an interruption: {killed}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_that_fails_before_its_init_reply_is_explained_on_a_quiet_run() {
+        // `false` stands in for a fetcher that exits before it replies, which
+        // is what a real one does when it cannot apply a layer it was named:
+        // the kernel under test can apply every layer the probe names, so
+        // that failure cannot be provoked with the real binary here.
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let stand_in = Path::new("/bin/false");
+        let confine = KernelConfinement::probe().confine_argument();
+
+        let quiet = spawn_fetcher_binary(stand_in, &path, false)
+            .err()
+            .expect("a fetcher that exits before replying fails the init exchange");
+        let quiet = quiet.to_string();
+        assert!(
+            quiet.contains(&confine) && quiet.contains("--verbose"),
+            "a default run hides the fetcher's stderr, and the error neither says what the \
+             fetcher was asked to apply nor how to see why it stopped: {quiet}"
+        );
+
+        let verbose = spawn_fetcher_binary(stand_in, &path, true)
+            .err()
+            .expect("a fetcher that exits before replying fails the init exchange");
+        assert!(
+            !verbose.to_string().contains("--verbose"),
+            "a verbose run was told to use --verbose: {verbose}"
         );
     }
 

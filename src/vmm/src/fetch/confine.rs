@@ -284,43 +284,85 @@ mod tests {
 
     /// How many probes the leak test makes.
     ///
-    /// Many, because the question is asked of a process whose other tests
-    /// are opening and closing descriptors of their own at the same time: a
-    /// probe that created one descriptor each time leaves a mark far larger
-    /// than that churn, where a single probe's leak would be lost in it.
+    /// Many, so that a probe leaking a descriptor only some of the time is
+    /// still caught.
     const PROBES_FOR_THE_LEAK_TEST: usize = 200;
 
-    /// How much concurrent descriptor churn the leak test tolerates.
+    /// The descriptor numbers the leak test inspects.
     ///
-    /// The suite runs one test thread per core, and a test of the parent
-    /// module holds a socketpair, an image and a child while it runs, so the
-    /// descriptors other tests hold during this one's measurement are a
-    /// two-figure number on a sixteen-core machine and larger on a bigger
-    /// one. The allowance is set well above that and still far below the
-    /// mark a probe leaking one descriptor each time would leave.
-    const CHURN_ALLOWANCE: usize = 64;
+    /// A new descriptor always takes the lowest free number, and a test
+    /// process holds far fewer than this, so a leaked one lands inside the
+    /// range.
+    const DESCRIPTORS_INSPECTED: libc::c_int = 4096;
 
+    /// How many descriptors this process holds below
+    /// [`DESCRIPTORS_INSPECTED`], counted without allocating.
+    ///
+    /// One `fcntl` per number rather than a listing of `/proc/self/fd`, so
+    /// that it can run in a forked child, where nothing may allocate.
+    fn open_descriptors_without_allocating() -> usize {
+        (0..DESCRIPTORS_INSPECTED)
+            // SAFETY: F_GETFD reads one descriptor's flags and changes
+            // nothing; on a number that is not open it fails with EBADF.
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            .count()
+    }
+
+    /// The leak is measured in a forked child, where it is exact.
+    ///
+    /// Counted in this process, the number would include whatever the other
+    /// tests running alongside opened and closed in the meantime -- one test
+    /// thread per core, several holding a socketpair, an image and a child --
+    /// so it could only be compared with an allowance, and an allowance
+    /// sized for one machine is a false failure on a bigger one. The child of
+    /// a `fork` has one thread, so nothing else in it opens anything, and
+    /// the counts before and after the probes must be equal.
     #[test]
     fn probing_confines_nothing_and_opens_nothing() {
-        let before = own_descriptor_count();
         let mode_before = own_seccomp_mode();
-        for _ in 0..PROBES_FOR_THE_LEAK_TEST {
-            let _ = KernelConfinement::probe();
+        // SAFETY: the child runs only the probe -- two raw syscalls with
+        // stack arguments -- and `fcntl`, all async-signal-safe, then leaves
+        // with `_exit`; it allocates nothing, takes no lock and returns into
+        // nothing the parent's other threads were in the middle of.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            let before = open_descriptors_without_allocating();
+            for _ in 0..PROBES_FOR_THE_LEAK_TEST {
+                let _ = KernelConfinement::probe();
+            }
+            let after = open_descriptors_without_allocating();
+            // SAFETY: _exit ends the child without running the parent's
+            // destructors or flushing its buffers a second time.
+            unsafe { libc::_exit(if before == after { 0 } else { 1 }) };
         }
-        let after = own_descriptor_count();
+        let mut status = 0;
+        // SAFETY: pid is this process's own child, not yet waited for, and
+        // status is a local the call writes once.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            io::Error::last_os_error()
+        );
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{PROBES_FOR_THE_LEAK_TEST} probes in a single-threaded child changed how many \
+             descriptors it held (wait status {status:#x}), so the probe leaks one; a leaked \
+             descriptor crosses the fork into a fetcher whose whole descriptor set is accounted \
+             for"
+        );
 
+        // The seccomp half is a property of the privileged side itself, so
+        // it is asked of a probe run in this process.
+        let _ = KernelConfinement::probe();
         assert_eq!(
             own_seccomp_mode(),
             mode_before,
             "the probe changed the seccomp state of the privileged side, which is the process \
              holding the user's credentials; asking what the kernel can do must not be a way of \
              confining the asker"
-        );
-        assert!(
-            after <= before + CHURN_ALLOWANCE,
-            "{PROBES_FOR_THE_LEAK_TEST} probes took this process from {before} descriptors to \
-             {after}, so the probe leaks one; a leaked descriptor crosses the fork into a \
-             fetcher whose whole descriptor set is accounted for"
         );
     }
 
@@ -337,13 +379,6 @@ mod tests {
         // SAFETY: PR_GET_SECCOMP takes no further argument and only reports
         // the calling thread's own seccomp mode.
         unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) }
-    }
-
-    /// How many descriptors this process holds.
-    fn own_descriptor_count() -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .expect("this process has a /proc/self/fd")
-            .count()
     }
 
     #[test]

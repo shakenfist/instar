@@ -688,8 +688,8 @@ its execution notes and all five mutations caught. What later phases
 need from them: the confinement is two-stage, with the parent setting
 `RLIMIT_NPROC` 0, `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 8 and
 `PR_SET_NO_NEW_PRIVS` between the fork and the exec, and the fetcher
-applying a deny-all Landlock ruleset and then a nineteen-call seccomp
-allowlist to itself before it reads from the peer; the host probes the
+applying a deny-all Landlock ruleset and then a seccomp allowlist of
+measured calls and a named margin to itself before it reads from the peer; the host probes the
 kernel and names the layers as `--confine=`, and a named layer the
 fetcher cannot apply is a non-zero exit before the init reply; the
 allowlist is the file backend's own and phase 5 adds a policy for the

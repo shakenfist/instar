@@ -282,8 +282,8 @@ flag, the fetcher applies nothing: choosing a policy is the privileged side's
 job, not a default the fetcher picks for itself.
 
 Both descriptors are numbers the parent has already opened. The fetcher takes
-no paths and opens nothing, so it can in principle be given no
-filesystem access at all. It is single-threaded, answers each read with
+no paths and opens nothing, so it can in principle be given no filesystem
+access at all. It is single-threaded, answers each read with
 `pread` on the file, and never panics on anything the peer sends: a malformed
 request is answered with a status, or noted on stderr. It exits 0 when the
 peer closes the socket and for `--help`, 2 for a usage error, and 1 for
@@ -396,8 +396,9 @@ how the descriptor set above is asserted.
 *After its setup and before its first read from the peer, the fetcher applies
 the rest to itself.* A Landlock ruleset that handles every filesystem access
 the running kernel's ABI knows and permits none goes on first, then a seccomp
-allowlist of nineteen syscalls that kills the process on anything else. The
-filter goes on last, because it denies the calls the filesystem step makes.
+allowlist of the calls the serving loop was measured making, plus a named
+margin, that kills the process on anything else. The filter goes on last,
+because it denies the calls the filesystem step makes.
 
 **Why a filesystem denial cannot precede the `exec`.** A ruleset that permits
 nothing, applied before the `exec`, denies the kernel's loader the fetcher
@@ -419,9 +420,10 @@ peers: `recvfrom`, `pread64`, `sendto`, `write`, `close`, `exit_group`, `brk`,
 which an allocation gets a mapping of its own, and `gettid` and `futex` on a
 panic, so each was provoked rather than waited for. `recvfrom` and `sendto`
 are what the C library issues for `recv` and `send` on this architecture.
-Eight more were never seen and are allowed as insurance against another C
-library, kept in a separate list so a reader can tell the two kinds of entry
-apart. Absent are `socket`, `socketpair`, `connect`, `bind`, `openat` and
+The margin is calls that were never seen and are allowed as insurance against
+another C library or allocator, kept in a separate list so a reader can tell
+the two kinds of entry apart; `src/fetch/src/confine.rs` gives the reason for
+each. Absent are `socket`, `socketpair`, `connect`, `bind`, `openat` and
 `tgkill`, among the rest. With every call that makes a descriptor denied, the
 `sendto` that is allowed can only name the socket the host passed. Without
 `tgkill`, an abort or a stack overflow reaches the host as `SIGSYS`, which is
