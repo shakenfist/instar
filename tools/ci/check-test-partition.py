@@ -260,12 +260,19 @@ def parse_makefile_list(makefile_text, target):
 # run: a copy that exits 0 having written part of the input, and an empty
 # output file left where a caller testing for the file's existence reads
 # it as success. A skip and a pass are indistinguishable for both.
+#
+# The file:// confinement test is a weaker shape of the same thing: it
+# does not skip without its layers, it settles for asserting that their
+# absence was reported, and that passes. Each variable makes the weaker
+# branch a failure for its own layer.
 ENV_REQUIRED_BY = (
     ('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),
     ('TestSlowHostRead', 'INSTAR_REQUIRE_STRACE'),
     ('TestLuksInnerFormatProbeReadFailure', 'INSTAR_REQUIRE_STRACE'),
     ('TestCopyReadFailure', 'INSTAR_REQUIRE_STRACE'),
     ('TestFailedOutputFile', 'INSTAR_REQUIRE_STRACE'),
+    ('TestInfoFileUrl', 'INSTAR_REQUIRE_LANDLOCK'),
+    ('TestInfoFileUrl', 'INSTAR_REQUIRE_SECCOMP'),
 )
 
 

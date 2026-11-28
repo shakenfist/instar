@@ -558,12 +558,26 @@ test-venv:
 test: test-rust test-integration
 
 # Run Rust unit tests (all workspace crates except no_main guest binaries)
+#
+# INSTAR_REQUIRE_LANDLOCK is passed through without a value, so it is set
+# inside the container only when the caller set it. A kernel without
+# Landlock makes the fetcher's filesystem-policy test assert the refusal
+# the fetcher owes that kernel instead of the policy biting, which is a
+# weaker assertion than the one worth having; setting the variable turns
+# that substitution into a failure.
+#
+# INSTAR_REQUIRE_SECCOMP is the same arrangement for the fetcher's syscall
+# policy: on a kernel that cannot kill a process for a violation, the tests
+# assert that a fetcher asked for the policy refuses to run, and setting
+# the variable makes that a failure too.
 test-rust: instar-devcontainer
 	@echo "Running Rust unit tests..."
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
 		-e HOME=/build \
 		-e CARGO_HOME=/build/.cargo \
+		-e INSTAR_REQUIRE_LANDLOCK \
+		-e INSTAR_REQUIRE_SECCOMP \
 		-v "$(CURDIR):/workspace" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
@@ -759,6 +773,15 @@ test-container: instar-devcontainer instar
 # is what makes a failed probe red here instead of a skip that reads as
 # a pass; see tests/test_slow_host_read.py.
 #
+# INSTAR_REQUIRE_LANDLOCK and INSTAR_REQUIRE_SECCOMP are the same bargain
+# for TestInfoFileUrl in tests/test_info_safe.py, which accepts a fetcher
+# running without a layer only when the kernel says it cannot provide one.
+# Unset, a container that stopped providing Landlock or the seccomp kill
+# action would turn the assertion that the policy applied into the weaker
+# one that its absence was reported, and the run would stay green; set,
+# that substitution is a failure. test-rust passes the same two through
+# for the fetcher's own tests.
+#
 # The selection is listed before it is run so the run has a discovery
 # count to be checked against: a crashed stestr worker leaves a totals
 # block that exits 0, and tools/ci/check-stestr-run.sh needs the count
@@ -782,7 +805,9 @@ test-container-core: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_LANDLOCK \
 		-e INSTAR_REQUIRE_LIBVHDI \
+		-e INSTAR_REQUIRE_SECCOMP \
 		-e INSTAR_REQUIRE_STRACE \
 		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \

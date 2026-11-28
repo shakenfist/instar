@@ -39,6 +39,14 @@
 //! * **It holds five descriptors and no more:** the three standard ones, its
 //!   socket, and the file. Everything it is handed is something a future
 //!   sandbox would otherwise have to take back off it.
+//! * **It is confined before its first instruction, and again once it is
+//!   running.** What only a parent can set -- the resource limits, and the
+//!   promise that no `exec` of its can gain privilege -- is set between the
+//!   `fork` and the `exec`. The policies that have to come later, because a
+//!   filesystem denial applied before `exec` would stop the `exec` itself,
+//!   are applied by the fetcher to itself; this side decides which of those
+//!   the running kernel can provide and names them on the command line, so
+//!   the child applies what it was told or fails, and never quietly nothing.
 //! * **It is reaped by a `Drop`,** not by a call at the end of an operation,
 //!   because the paths that most need reaping are the ones nobody writes
 //!   down. `std::process::exit` is the one path a `Drop` cannot cover, so an
@@ -48,12 +56,16 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use fetch_protocol::{FetchClient, SeqPacketSocket};
+
+mod confine;
+
+use confine::{set_hard_limit, KernelConfinement, CHILD_MAX_FILES};
 
 /// What an input argument turned out to be.
 #[derive(Debug, PartialEq, Eq)]
@@ -357,6 +369,90 @@ impl RemoteSource {
     }
 }
 
+/// The name of `signal`, for the handful a fetcher could plausibly die on.
+///
+/// A table rather than `strsignal`, which would mean a pointer from the C
+/// library to read and a locale to render it in: the number is printed in
+/// every case, so an unnamed signal is still identified, and what the name
+/// buys is that the common ones are recognisable without a lookup.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGINT => "SIGINT",
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return None,
+    })
+}
+
+/// What to tell the operator about a fetcher that has been reaped, or `None`
+/// where there is nothing to tell.
+///
+/// A fetcher that exited by itself, with any status, says nothing here: a
+/// clean exit is the normal end of a run, and a failure it reports through the
+/// protocol has already reached the user as a sentence this side wrote from a
+/// status. A fetcher killed by a signal is the case this exists for, because
+/// the protocol carries nothing at all in that case -- the socket simply stops
+/// answering -- and the signal is the only description of what happened that
+/// anybody has.
+///
+/// `SIGSYS` gets its own sentence because it has a single cause: the fetcher
+/// reached a system call its own policy does not allow. That is this program's
+/// mistake and not the user's, and saying so is the difference between a bug
+/// that gets reported and a user who concludes their image is broken.
+///
+/// The signals a user sends -- an interrupt from the terminal, a hangup, a
+/// quit, a polite termination -- get a sentence of their own too, because a
+/// Ctrl-C reaches every process in the foreground group and the fetcher may be
+/// reaped before instar itself goes. Told in the same words as a crash, it
+/// would read as the fetcher misbehaving when somebody had stopped it.
+///
+/// Said whatever verbosity the caller asked for. A child killed by a signal is
+/// abnormal by definition, the operation it was serving has already failed by
+/// the time this is known, and a diagnosis that only appears if the user
+/// happens to run the command again with another flag is a diagnosis nobody
+/// gets. The runs that are required to be silent on stderr are the ones that
+/// succeed, and on those this returns `None`.
+fn reaped_fetcher_note(pid: u32, status: ExitStatus) -> Option<String> {
+    let signal = status.signal()?;
+    let named = match signal_name(signal) {
+        Some(name) => format!("signal {signal} ({name})"),
+        None => format!("signal {signal}"),
+    };
+    if signal == libc::SIGSYS {
+        return Some(format!(
+            "instar: the fetcher (pid {pid}) was killed by {named}, which means it made a system \
+             call its sandbox does not allow. That is a bug in instar rather than anything wrong \
+             with the input or the way it was invoked, and the input it was serving was not read \
+             to the end"
+        ));
+    }
+    if matches!(
+        signal,
+        libc::SIGINT | libc::SIGHUP | libc::SIGQUIT | libc::SIGTERM
+    ) {
+        return Some(format!(
+            "instar: the fetcher (pid {pid}) was stopped by {named}, a signal sent to interrupt \
+             it rather than one it raised itself, and the input it was serving was not read to \
+             the end"
+        ));
+    }
+    Some(format!(
+        "instar: the fetcher (pid {pid}) was killed by {named} rather than exiting when its \
+         socket closed; the input it was serving was not read to the end"
+    ))
+}
+
 impl Drop for RemoteSource {
     fn drop(&mut self) {
         // Closing the socket is how the fetcher is asked to stop: its `recv`
@@ -368,7 +464,15 @@ impl Drop for RemoteSource {
         let started = Instant::now();
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(status)) => {
+                    // The status is the only account of a fetcher that was
+                    // killed, so it is read here rather than discarded: this
+                    // is the last moment it exists.
+                    if let Some(note) = reaped_fetcher_note(self.child.id(), status) {
+                        eprintln!("{note}");
+                    }
+                    return;
+                }
                 Ok(None) => {}
                 Err(err) => {
                     // Nothing useful is left to do: the child cannot be
@@ -442,8 +546,14 @@ fn spawn_fetcher_binary(
     let staged_socket_fd = staged_socket.as_raw_fd();
     let staged_file_fd = staged_file.as_raw_fd();
 
+    // Asked before the spawn, so that the layers the child is told to apply
+    // are the ones this kernel really has, and so that the answer can be
+    // reported to a caller who asked for it.
+    let confinement = KernelConfinement::probe();
+
     let mut command = Command::new(fetcher);
     command
+        .arg(confinement.confine_argument())
         .arg(CHILD_SOCKET_FD.to_string())
         .arg(CHILD_FILE_FD.to_string())
         // The child is assumed hostile, and instar's stdout is the output a
@@ -467,20 +577,64 @@ fn spawn_fetcher_binary(
         } else {
             Stdio::null()
         });
+    // What this closure does and does not do is the parent's half of the
+    // confinement, and both halves are deliberate.
+    //
+    // It sets what only a parent can set. The three limits have to be in
+    // place before the image of a new program exists, and `no_new_privs` has
+    // to be set by something the fetcher cannot later be talked out of: once
+    // set it cannot be unset, which is what makes it a promise that no
+    // `exec` of the fetcher's -- it makes none -- could gain privilege, and
+    // it is also the precondition for an unprivileged process installing a
+    // seccomp filter on itself at all.
+    //
+    // It does not set a file-size limit, although a fetcher that writes
+    // nothing looks like a free win for one. Its stderr is a file the caller
+    // chose: `instar info --verbose file:///x 2>log` makes it a regular
+    // file, and a zero file-size limit turns the fetcher's first diagnostic
+    // line into a SIGXFSZ. The limit would kill the process for printing
+    // what it was asked to print.
+    //
+    // It does not make the child undumpable either. What that would protect
+    // against is a process of the same uid attaching to the fetcher, and
+    // such a process can attach to instar itself just as easily, so it is
+    // not a boundary; the fetcher holds no secret of its own beyond an image
+    // the invoking user already owns. What it would cost is this side's own
+    // diagnostics: `/proc/<pid>` of the child becomes unreadable even to its
+    // parent, and reading it is how the descriptor set is asserted and how
+    // an operator straces a fetcher that is misbehaving. The crash-dump
+    // worry it is usually reached for is covered by the core limit below.
+    //
     // SAFETY: the closure runs in the child between `fork` and `exec`, where
     // only async-signal-safe work is permitted: a thread holding a lock in
     // the parent did not come across the fork, so taking that lock here
     // would deadlock a process that can never be released. It therefore
-    // calls `dup2` twice and nothing else. It captures two descriptor
-    // numbers by value, allocates nothing, locks nothing and formats
-    // nothing; `io::Error::last_os_error` only records errno, and the
-    // message for it is rendered by the parent.
+    // makes two `dup2` calls, three `setrlimit` calls and one `prctl`, and
+    // nothing else. It captures two descriptor numbers by value, allocates
+    // nothing, locks nothing and formats nothing; `io::Error::last_os_error`
+    // only records errno, and the message for it is rendered by the parent.
+    //
+    // The limits come after the two `dup2` calls, which is the only order
+    // that works: the descriptors being copied are staged on numbers that
+    // may be above the new ceiling, and lowering it first would leave them
+    // uncopyable.
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(staged_socket_fd, CHILD_SOCKET_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::dup2(staged_file_fd, CHILD_FILE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // A fetcher serves one file on one socket in one thread; it has
+            // no reason to fork, and the limit is enforced at `fork` rather
+            // than at `exec`, so setting it here costs the `exec` nothing.
+            set_hard_limit(libc::RLIMIT_NPROC, 0)?;
+            // A core dump of the fetcher would be the image's bytes written
+            // somewhere nobody asked for them.
+            set_hard_limit(libc::RLIMIT_CORE, 0)?;
+            set_hard_limit(libc::RLIMIT_NOFILE, CHILD_MAX_FILES)?;
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -511,8 +665,45 @@ fn spawn_fetcher_binary(
         child,
         client: None,
     };
-    source.client = Some(FetchClient::new(ours)?);
+    source.client = Some(FetchClient::new(ours).map_err(|err| {
+        explain_init_failure(err, &confinement.confine_argument(), inherit_stderr)
+    })?);
+
+    // Said after the init exchange rather than before it, so that the lines
+    // describe what happened: a fetcher that could not apply a layer it was
+    // named exits before it replies, and there would have been no init to
+    // complete.
+    if inherit_stderr {
+        for line in confinement.report() {
+            eprintln!("{line}");
+        }
+    }
     Ok(source)
+}
+
+/// The error for a fetcher whose init exchange failed, with the way to find
+/// out why.
+///
+/// A fetcher that fails before it replies -- a layer it was named and could
+/// not apply is the case its confinement adds -- says why on its own stderr,
+/// and on a default run that is `/dev/null`, so all that reaches the user is
+/// a socket that closed. This side cannot know what the fetcher would have
+/// said, but it can say what the fetcher was asked to do and where its own
+/// account goes, which is the same argument that makes a signal death a
+/// sentence whatever the verbosity: the run has failed, and a diagnosis
+/// nobody is told how to see is a diagnosis nobody gets. Under `--verbose`
+/// the fetcher's own line is already on stderr, so the error is left alone.
+fn explain_init_failure(err: io::Error, confine_argument: &str, inherit_stderr: bool) -> io::Error {
+    if inherit_stderr {
+        return err;
+    }
+    io::Error::new(
+        err.kind(),
+        format!(
+            "{err}; the fetcher was started with {confine_argument}, and its own account of why \
+             it stopped is printed with --verbose"
+        ),
+    )
 }
 
 /// Helpers for any module's tests that need a real fetcher.
@@ -832,6 +1023,199 @@ mod tests {
             fds,
             BTreeSet::from([0, 1, 2, CHILD_SOCKET_FD, CHILD_FILE_FD]),
             "the fetcher holds descriptors it was not given"
+        );
+    }
+
+    /// The soft and hard limit `/proc/<pid>/limits` reports for `label`.
+    ///
+    /// The file is a fixed-width table whose first column is a label with
+    /// spaces in it, so the line is found by its label and the two numbers
+    /// are the first two fields of what is left.
+    fn reported_limit(limits: &str, label: &str) -> (String, String) {
+        let line = limits
+            .lines()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("/proc/<pid>/limits has no {label:?} line:\n{limits}"));
+        let mut fields = line[label.len()..].split_whitespace();
+        let soft = fields.next().expect("a soft limit").to_string();
+        let hard = fields.next().expect("a hard limit").to_string();
+        (soft, hard)
+    }
+
+    #[test]
+    fn the_child_serves_under_the_limits_the_parent_set() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        // Read of a fetcher that has completed its init exchange, so the
+        // limits are asserted of a process that got far enough to serve
+        // rather than of one that died on its way up.
+        let mut source = spawn_fetcher_binary(&fetcher_binary(), &path, true)
+            .expect("spawn a fetcher under the limits");
+        let mut byte = [0u8; 1];
+        source
+            .client_mut()
+            .read_at(7, &mut byte)
+            .expect("a confined fetcher still answers a read");
+        assert_eq!(byte[0], pattern(7));
+
+        let limits = std::fs::read_to_string(format!("/proc/{}/limits", source.pid()))
+            .expect("a live fetcher has a /proc/<pid>/limits");
+        assert_eq!(
+            reported_limit(&limits, "Max processes"),
+            ("0".to_string(), "0".to_string()),
+            "the fetcher can fork:\n{limits}"
+        );
+        assert_eq!(
+            reported_limit(&limits, "Max core file size"),
+            ("0".to_string(), "0".to_string()),
+            "a crash would write the image's bytes to a core dump:\n{limits}"
+        );
+        assert_eq!(
+            reported_limit(&limits, "Max open files"),
+            (CHILD_MAX_FILES.to_string(), CHILD_MAX_FILES.to_string()),
+            "the fetcher's descriptor ceiling is not the one it was given:\n{limits}"
+        );
+    }
+
+    #[test]
+    fn the_child_cannot_gain_privilege_by_exec() {
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let source = spawn_fetcher_binary(&fetcher_binary(), &path, true).expect("spawn a fetcher");
+
+        let status = std::fs::read_to_string(format!("/proc/{}/status", source.pid()))
+            .expect("a live fetcher has a /proc/<pid>/status");
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("NoNewPrivs:"))
+            .expect("a kernel that reports NoNewPrivs");
+        assert_eq!(
+            line.split_whitespace().nth(1),
+            Some("1"),
+            "the fetcher runs without no_new_privs, so a setuid binary it exec'd could gain \
+             privilege and it could not install a filter on itself: {line}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_that_exited_by_itself_is_not_reported() {
+        for raw in [0, 1 << 8, 70 << 8] {
+            let status = ExitStatus::from_raw(raw);
+            assert_eq!(
+                None,
+                reaped_fetcher_note(4242, status),
+                "a fetcher that exited with {status:?} was reported as though it had been killed, \
+                 which would put a line on the stderr of a run that is required to be silent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fetcher_killed_for_a_call_its_policy_denies_is_told_as_this_programs_fault() {
+        // A wait status whose low seven bits are the signal is what the
+        // kernel reports for a process that died on one.
+        let note = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGSYS))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            note.contains("SIGSYS") && note.contains(&format!("signal {}", libc::SIGSYS)),
+            "the note does not name the signal: {note}"
+        );
+        assert!(
+            note.contains("system call") && note.contains("sandbox"),
+            "the note does not say what SIGSYS means for this process: {note}"
+        );
+        assert!(
+            note.contains("bug in instar"),
+            "the note leaves the user to conclude their input was at fault: {note}"
+        );
+        assert!(
+            note.contains("4242"),
+            "the note does not name the pid: {note}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_killed_by_any_other_signal_names_that_signal() {
+        let note = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGSEGV))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            note.contains("SIGSEGV") && note.contains(&format!("signal {}", libc::SIGSEGV)),
+            "the note does not name the signal: {note}"
+        );
+        assert!(
+            !note.contains("bug in instar"),
+            "a signal that is not SIGSYS was described as a policy violation: {note}"
+        );
+
+        // A signal with no name in the table is still identified, because the
+        // number is in every one of these sentences.
+        let unnamed = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGWINCH))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            unnamed.contains(&format!("signal {}", libc::SIGWINCH)),
+            "an unnamed signal is not identified at all: {unnamed}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_somebody_interrupted_is_told_as_an_interruption() {
+        for signal in [libc::SIGINT, libc::SIGHUP, libc::SIGQUIT, libc::SIGTERM] {
+            let note = reaped_fetcher_note(4242, ExitStatus::from_raw(signal))
+                .expect("a fetcher killed by a signal is reported");
+            assert!(
+                note.contains(&format!("signal {signal} (SIG")),
+                "the note does not name signal {signal}: {note}"
+            );
+            assert!(
+                note.contains("interrupt"),
+                "signal {signal} is one a user sends, and the note does not say the fetcher was \
+                 interrupted: {note}"
+            );
+            assert!(
+                !note.contains("bug in instar") && !note.contains("rather than exiting"),
+                "signal {signal} was described as the fetcher misbehaving: {note}"
+            );
+        }
+        // SIGKILL stays with the crashes: it is how the OOM killer ends a
+        // process, so it is not evidence that anybody meant to stop this one.
+        let killed = reaped_fetcher_note(4242, ExitStatus::from_raw(libc::SIGKILL))
+            .expect("a fetcher killed by a signal is reported");
+        assert!(
+            !killed.contains("interrupt"),
+            "SIGKILL was described as an interruption: {killed}"
+        );
+    }
+
+    #[test]
+    fn a_fetcher_that_fails_before_its_init_reply_is_explained_on_a_quiet_run() {
+        // `false` stands in for a fetcher that exits before it replies, which
+        // is what a real one does when it cannot apply a layer it was named:
+        // the kernel under test can apply every layer the probe names, so
+        // that failure cannot be provoked with the real binary here.
+        let dir = tempdir().expect("a temporary directory");
+        let path = dir.path().join("image.raw");
+        write_fixture(&path, 4096);
+        let stand_in = Path::new("/bin/false");
+        let confine = KernelConfinement::probe().confine_argument();
+
+        let quiet = spawn_fetcher_binary(stand_in, &path, false)
+            .err()
+            .expect("a fetcher that exits before replying fails the init exchange");
+        let quiet = quiet.to_string();
+        assert!(
+            quiet.contains(&confine) && quiet.contains("--verbose"),
+            "a default run hides the fetcher's stderr, and the error neither says what the \
+             fetcher was asked to apply nor how to see why it stopped: {quiet}"
+        );
+
+        let verbose = spawn_fetcher_binary(stand_in, &path, true)
+            .err()
+            .expect("a fetcher that exits before replying fails the init exchange");
+        assert!(
+            !verbose.to_string().contains("--verbose"),
+            "a verbose run was told to use --verbose: {verbose}"
         );
     }
 

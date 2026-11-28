@@ -86,6 +86,26 @@ strikes for the libvhdi oracle, `INSTAR_REQUIRE_LIBYAL` for the
 fuzzer's, and `INSTAR_REQUIRE_STRACE` for the latency injection in
 `TestSlowHostRead` (below).
 
+`INSTAR_REQUIRE_LANDLOCK` and `INSTAR_REQUIRE_SECCOMP` strike it for the
+fetcher's sandbox. A fetcher is only told to apply a layer the running kernel
+provides, so on a kernel with no Landlock, or none that can kill a process for
+a seccomp violation, the tests settle for the weaker claim that is owed there:
+that a fetcher asked for the layer refuses to run, and that the run carries on
+without it and says so. That is a real assertion and it passes, but it is not
+the one that shows the policy biting -- a path denied while an inherited
+descriptor still reads, a denied syscall ending in `SIGSYS` -- and nothing
+would show that the strong one had stopped being run. With either variable
+set, the corresponding weak branch is a failure instead of a pass, in the
+fetcher's unit and end-to-end tests and in `TestInfoFileUrl`. In
+`.github/workflows/functional-tests.yml` both are set by the `build-and-test`
+job, which runs the unit tests through `make test-rust`, and by the
+`integration-core` job, which runs `TestInfoFileUrl` through
+`make test-container-core`; both targets pass them through from the caller's
+environment, and `tools/ci/check-test-partition.py` lists the pairing in
+`ENV_REQUIRED_BY`, so whichever job claims that class has to set them. A
+runner whose kernel or container profile cannot provide a layer turns those
+jobs red rather than quietly testing less.
+
 **A `_run_tool` timeout is a hang guard, not a performance
 assertion.** The budget (`QEMU_TOOL_TIMEOUT`, 300s) exists so a wedged
 `qemu-img` cannot block a stestr worker forever; it is not a claim
