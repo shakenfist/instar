@@ -88,11 +88,22 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
         ('qed', '_qed_parent', 'is qed', 'not supported for reading'),
     )
 
+    def _substitutes(self):
+        """The SUBSTITUTES rows this host's qemu-img can write.
+
+        RHEL-family qemu-img has no qed driver, so the qed parent cannot
+        be written there. The row is dropped rather than skipped inside
+        its subTest, which subunit does not report cleanly.
+        """
+        if self.qemu_img_supports_format('qed'):
+            return self.SUBSTITUTES
+        return tuple(row for row in self.SUBSTITUTES if row[0] != 'qed')
+
     def test_info_chain_ends_the_listing_at_a_wrong_format_parent(self):
         """The listing stops at the child, exits 0, and says why."""
         self._require_qemu_img()
         for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
-            for label, writer, named, _refusal in self.SUBSTITUTES:
+            for label, writer, named, _refusal in self._substitutes():
                 with self.subTest(image=image_id, parent=label):
                     child = self._substituted_copy(
                         image_id, getattr(self, writer))
@@ -131,7 +142,7 @@ class TestDifferencingParentWrongFormat(DifferencingTestBase):
         """convert refuses, says why, and writes nothing."""
         self._require_qemu_img()
         for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
-            for label, writer, named, refusal in self.SUBSTITUTES:
+            for label, writer, named, refusal in self._substitutes():
                 with self.subTest(image=image_id, parent=label):
                     child = self._substituted_copy(
                         image_id, getattr(self, writer))

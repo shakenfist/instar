@@ -349,6 +349,10 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
             ('vmdk', ['-o', 'subformat=monolithicFlat'], 'vmdk'),
             ('qcow', [], 'qcow'),
         )
+        # RHEL-family qemu-img has no qcow driver, so it cannot write
+        # that backing. The row is dropped there rather than skipped
+        # inside its subTest, which subunit does not report cleanly.
+        cases = [c for c in cases if self.qemu_img_supports_format(c[0])]
         for create_format, options, recorded in cases:
             with self.subTest(format=create_format):
                 with tempfile.TemporaryDirectory() as td:
@@ -388,6 +392,7 @@ class TestRebaseRecordsBackingFormat(TestRebaseSmoke):
         typed, and the overlay is left as it was, reference included.
         """
         self._require_qemu_tools()
+        self.skip_unless_qemu_supports('parallels')
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             overlay = self._overlay_over_qcow2(td)
