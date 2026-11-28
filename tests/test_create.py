@@ -2648,15 +2648,21 @@ class TestCreateVmdkFlat(InstarTestBase):
             self.assertTrue(descriptor.startswith(b'# Disk DescriptorFile\n'))
             self.assertNotIn(b'\xaa', descriptor)
 
-    def test_failure_opening_the_extent_removes_the_descriptor(self):
-        """When the extent cannot be opened, the descriptor already opened is removed."""
+    def test_failure_opening_the_extent_keeps_a_descriptor_it_found(self):
+        """When the extent cannot be opened, a descriptor that was already there is kept.
+
+        Opening the descriptor truncates it, so what survives is empty. The guarantee is
+        that create does not delete a file it did not make, not that it preserves the
+        contents of one it overwrote; qemu-img leaves a truncated file behind too.
+        """
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / 'c.vmdk').write_bytes(b'old')
             (Path(td) / 'c-flat.vmdk').mkdir()
             _, stderr, rc = self.run_instar_create(*FLAT, 'c.vmdk', '1M', cwd=td)
             self.assertEqual(rc, 1)
             self.assertIn("open 'c-flat.vmdk' failed", stderr)
-            self.assertEqual(self.files_in(td), ['c-flat.vmdk'])
+            self.assertEqual(self.files_in(td), ['c-flat.vmdk', 'c.vmdk'])
+            self.assertEqual((Path(td) / 'c.vmdk').stat().st_size, 0)
             self.assertTrue((Path(td) / 'c-flat.vmdk').is_dir())
 
     def test_failure_sizing_the_extent_removes_both_files(self):

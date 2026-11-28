@@ -31,6 +31,7 @@ mod kvm_stats;
 mod stats;
 mod version;
 mod virtio;
+mod vmdk_create;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,11 @@ use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
 use stats::VmmStats;
 use virtio::VirtioBlockDevice;
+use vmdk_create::{
+    is_vmdk_flat_create, is_vmdk_split_flat_create, run_create_vmdk_flat,
+    run_create_vmdk_split_flat, validate_vmdk_flat_create_args, vmdk_flat_descriptor,
+    vmdk_flat_extent_path,
+};
 
 // Memory layout constants (import shared ones from the shared crate)
 const GDT_BASE: u64 = 0x1000;
@@ -9900,7 +9906,8 @@ struct CreateArgs {
     /// --format.
     #[arg(long, default_value = "",
           value_parser = ["", "monolithicSparse", "streamOptimized",
-                          "monolithicFlat", "dynamic", "fixed"])]
+                          "monolithicFlat", "twoGbMaxExtentFlat", "dynamic",
+                          "fixed"])]
     subformat: String,
 
     /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
@@ -16991,69 +16998,6 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     execute_convert(exec, verbose)
 }
 
-/// Name the extent file of a monolithicFlat VMDK the way qemu does.
-///
-/// Returns the extent's path and the name the descriptor records for it.
-/// qemu (`filename_decompose`, `block/vmdk.c:2279-2316`, and the `"%s-flat%s"`
-/// format in `vmdk_co_do_create`, `:2599`, qemu 7.0.0) takes the basename
-/// after the last `/`, splits it at its last `.`, and writes
-/// `<prefix>-flat<postfix>` in the output's directory. The output's own
-/// extension is kept, a name with no dot gets a bare `-flat` suffix, and a
-/// leading dot is the split point (`.hid` gives `-flat.hid`). qemu also
-/// looks for `\` and then `:` when there is no `/`; neither is a path
-/// separator on the hosts instar runs on, so they are not split on.
-///
-/// The descriptor records the name as a quoted string on a line of UTF-8
-/// text, so a name that is not UTF-8, or that holds a `"`, CR or LF, is
-/// refused rather than written: it would name a file other than the
-/// extent, or end the quoted string and add descriptor lines of its own.
-/// qemu writes such names verbatim. `op` prefixes the refusal.
-fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf, String), String> {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-    let bytes = output.as_os_str().as_bytes();
-    let base_start = bytes.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-    let (dir, base) = bytes.split_at(base_start);
-    let (prefix, postfix) = match base.iter().rposition(|&b| b == b'.') {
-        Some(i) => base.split_at(i),
-        None => (base, &base[base.len()..]),
-    };
-    let mut name = Vec::with_capacity(base.len() + 5);
-    name.extend_from_slice(prefix);
-    name.extend_from_slice(b"-flat");
-    name.extend_from_slice(postfix);
-    let recordable = std::str::from_utf8(&name)
-        .ok()
-        .filter(|n| !n.contains(['"', '\r', '\n']));
-    let Some(recorded) = recordable else {
-        return Err(format!(
-            "{}: vmdk monolithicFlat cannot record the extent name {:?} in its descriptor \
-             (it must be UTF-8 without '\"', CR or LF)",
-            op,
-            String::from_utf8_lossy(&name)
-        ));
-    };
-    let recorded = recorded.to_string();
-    let mut path = dir.to_vec();
-    path.extend_from_slice(&name);
-    Ok((
-        std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
-        recorded,
-    ))
-}
-
-/// The monolithicFlat descriptor naming `extent_name`, for create and
-/// convert. The builder reports the length it needs whatever the buffer, so
-/// it is measured first and the buffer sized to fit.
-fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
-    let needed = vmdk::build_flat_descriptor(&mut [], 0, capacity_sectors, extent_name.as_bytes());
-    let mut text = vec![0u8; needed];
-    let written =
-        vmdk::build_flat_descriptor(&mut text, 0, capacity_sectors, extent_name.as_bytes());
-    debug_assert_eq!(written, needed);
-    text
-}
-
 /// Enter the guest, and say what happened if entering it failed.
 ///
 /// Every run loop enters the guest through here rather than calling
@@ -18644,10 +18588,18 @@ fn parse_create_o_options(
                     "monolithicSparse" => out.vmdk_subformat = Some(0),
                     "streamOptimized" => out.vmdk_subformat = Some(1),
                     "monolithicFlat" => out.vmdk_subformat = Some(2),
+                    "twoGbMaxExtentFlat" => out.vmdk_subformat = Some(4),
+                    "twoGbMaxExtentSparse" => {
+                        return Err("create: vmdk subformat 'twoGbMaxExtentSparse' is not \
+                             supported for create (supported: monolithicSparse, \
+                             streamOptimized, monolithicFlat, twoGbMaxExtentFlat)"
+                            .into())
+                    }
                     _ => {
                         return Err(format!(
                             "create: bad value '{}' for -o key 'subformat' \
-                             (expected monolithicSparse / streamOptimized / monolithicFlat)",
+                             (expected monolithicSparse / streamOptimized / monolithicFlat / \
+                             twoGbMaxExtentFlat)",
                             value
                         )
                         .into())
@@ -21559,6 +21511,11 @@ fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error
         return run_create_vmdk_flat(&args);
     }
 
+    // A twoGbMaxExtentFlat VMDK is the same, with one extent per 2 GiB.
+    if is_vmdk_split_flat_create(&args) {
+        return run_create_vmdk_split_flat(&args);
+    }
+
     run_create_nonraw(&args, _verbose)
 }
 
@@ -21569,11 +21526,6 @@ fn resolve_create_args(mut args: CreateArgs) -> Result<CreateArgs, Box<dyn std::
     apply_create_overrides(&mut args, overrides);
     validate_create_args(&args)?;
     Ok(args)
-}
-
-/// Whether `args` (with `-o` applied) asks for a monolithicFlat VMDK.
-fn is_vmdk_flat_create(args: &CreateArgs) -> bool {
-    args.target_format == "vmdk" && args.subformat == "monolithicFlat"
 }
 
 /// Apply parsed `-o` overrides on top of the individual `--flag`
@@ -21602,7 +21554,10 @@ fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverride
             0 => "monolithicSparse",
             1 => "streamOptimized",
             2 => "monolithicFlat",
-            _ => "monolithicSparse",
+            4 => "twoGbMaxExtentFlat",
+            // The parser only produces the numbers above; a new one must
+            // be added here rather than become some other subformat.
+            other => unreachable!("create: unmapped vmdk subformat number {other}"),
         }
         .to_string();
     }
@@ -22628,109 +22583,6 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Host-side monolithicFlat VMDK creation: a sparse raw extent and the
-/// text descriptor that names it.
-///
-/// The extent is the requested size rounded up to a whole sector, as qemu
-/// writes it (a 1000-byte request gives a 1024-byte extent and `RW 2
-/// FLAT`). qemu only truncates the extent, under every preallocation mode,
-/// so `falloc` and `full` allocate nothing here either; that is why
-/// `create_raw_finalize` is not used. The extent is named by
-/// `vmdk_flat_extent_path`, as convert names it, and the descriptor is the
-/// one convert writes.
-///
-/// The arguments were validated before this runs, so nothing is opened
-/// for a refused command. Once a file has been opened (and so truncated),
-/// any failure removes every file this call opened. A symlink is followed
-/// when opened and only the link is removed, so the file it points at is
-/// left truncated, as `run_create_raw` leaves it.
-fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let size_str = args
-        .size
-        .as_ref()
-        .ok_or("create: vmdk monolithicFlat requires SIZE")?;
-    let virtual_size = parse_memory_size(size_str)?
-        .checked_next_multiple_of(512)
-        .ok_or("create: SIZE is too large")?;
-
-    let descriptor_path = Path::new(&args.filename);
-    let (extent_path, extent_name) = vmdk_flat_extent_path(descriptor_path, "create")?;
-    let mut opened = Vec::new();
-    let result = write_vmdk_flat(
-        descriptor_path,
-        &extent_path,
-        &extent_name,
-        virtual_size,
-        &mut opened,
-    );
-    let descriptor_len = match result {
-        Ok(n) => n,
-        Err(e) => {
-            for path in &opened {
-                let _ = std::fs::remove_file(path);
-            }
-            return Err(e);
-        }
-    };
-
-    render_create_success(args, virtual_size, descriptor_len, descriptor_len, 0);
-    Ok(())
-}
-
-/// Write a monolithicFlat VMDK for `run_create_vmdk_flat`, returning the
-/// descriptor's length. Each file is pushed onto `opened` as soon as it
-/// has been opened, so the caller can remove exactly those on failure.
-fn write_vmdk_flat(
-    descriptor_path: &Path,
-    extent_path: &Path,
-    extent_name: &str,
-    virtual_size: u64,
-    opened: &mut Vec<std::path::PathBuf>,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let open = |path: &Path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o644)
-            .open(path)
-            .map_err(|e| format!("create: open '{}' failed: {}", path.display(), e))
-    };
-
-    let mut descriptor = open(descriptor_path)?;
-    opened.push(descriptor_path.to_path_buf());
-    let extent = open(extent_path)?;
-    opened.push(extent_path.to_path_buf());
-
-    extent.set_len(virtual_size).map_err(|e| {
-        format!(
-            "create: ftruncate '{}' failed: {}",
-            extent_path.display(),
-            e
-        )
-    })?;
-
-    let text = vmdk_flat_descriptor(virtual_size / 512, extent_name);
-    descriptor.write_all(&text).map_err(|e| {
-        format!(
-            "create: write '{}' failed: {}",
-            descriptor_path.display(),
-            e
-        )
-    })?;
-
-    extent
-        .sync_all()
-        .map_err(|e| format!("create: sync '{}' failed: {}", extent_path.display(), e))?;
-    descriptor
-        .sync_all()
-        .map_err(|e| format!("create: sync '{}' failed: {}", descriptor_path.display(), e))?;
-    Ok(text.len() as u64)
-}
-
 /// Apply ftruncate + optional preallocation pass + fsync. Split out
 /// so `run_create_raw` can handle cleanup uniformly on any failure.
 ///
@@ -22996,34 +22848,6 @@ fn render_create_success_json(
     println!("}}");
 }
 
-/// The options a monolithicFlat VMDK cannot take.
-///
-/// qemu refuses a backing file ("Flat image can't have backing file") and
-/// `zeroed_grain=on` ("Flat image can't enable zeroed grain"), at
-/// `block/vmdk.c:2428-2437` in qemu 7.0.0. A grain size means nothing for
-/// a flat extent, so it is refused rather than ignored. Without a backing
-/// file the size must be given. `preallocation=metadata` is refused by the
-/// common preallocation check.
-fn validate_vmdk_flat_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.backing.is_some() {
-        return Err("create: vmdk monolithicFlat cannot have a backing file".into());
-    }
-    if args.size.is_none() {
-        return Err("create: vmdk monolithicFlat requires SIZE".into());
-    }
-    if args.zeroed_grain {
-        return Err("create: vmdk monolithicFlat cannot enable zeroed_grain".into());
-    }
-    if args.grain_size != 0 {
-        return Err(format!(
-            "create: vmdk monolithicFlat has no grains, so it takes no grain size (got {})",
-            args.grain_size
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// Whether `args` (with `-o` applied) asks for a fixed VHDX.
 fn is_vhdx_fixed_create(args: &CreateArgs) -> bool {
     args.target_format == "vhdx" && args.subformat == "fixed"
@@ -23058,7 +22882,7 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     }
     // Before the size check, because a flat image cannot take its size
     // from a backing file.
-    if is_vmdk_flat_create(args) {
+    if is_vmdk_flat_create(args) || is_vmdk_split_flat_create(args) {
         validate_vmdk_flat_create_args(args)?;
     }
     // Before the size check too, so that `-b` without a size is told
@@ -23128,11 +22952,14 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         "vmdk" => {
             if !matches!(
                 args.subformat.as_str(),
-                "" | "monolithicSparse" | "streamOptimized" | "monolithicFlat"
+                "" | "monolithicSparse"
+                    | "streamOptimized"
+                    | "monolithicFlat"
+                    | "twoGbMaxExtentFlat"
             ) {
                 return Err(format!(
-                    "create: --subformat '{}' is not valid for vmdk \
-                     (expected monolithicSparse, streamOptimized, or monolithicFlat)",
+                    "create: --subformat '{}' is not valid for vmdk (expected monolithicSparse, \
+                     streamOptimized, monolithicFlat, or twoGbMaxExtentFlat)",
                     args.subformat
                 )
                 .into());
@@ -23897,6 +23724,162 @@ mod create_option_tests {
         resolve(&["-f", "vmdk", "-o", "zeroed_grain=on", "f.vmdk", "1M"]).unwrap();
     }
 
+    /// Run `instar create ARGV...` through resolution and routing, as
+    /// `main` does.
+    fn run_create_cli(argv: &[&str]) -> Result<(), String> {
+        let args = resolve_create_args(parse_create_cli(argv)).map_err(|e| e.to_string())?;
+        run_create(args, false).map_err(|e| e.to_string())
+    }
+
+    /// Both spellings reach the split writer: three extents for 5 GiB,
+    /// at the lengths the layout gives them, and a descriptor of the
+    /// split type. The `-o` spelling goes through a number and back, so
+    /// this also catches it being mapped to some other subformat.
+    #[test]
+    fn split_flat_subformat_is_created_by_both_spellings() {
+        for (name, spelling) in [
+            ("o", &["-o", "subformat=twoGbMaxExtentFlat"][..]),
+            ("flag", &["--subformat", "twoGbMaxExtentFlat"][..]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join(format!("{name}.vmdk"));
+            let mut argv = vec!["-q", "-f", "vmdk"];
+            argv.extend_from_slice(spelling);
+            argv.extend_from_slice(&[out.to_str().unwrap(), "5G"]);
+            run_create_cli(&argv).unwrap();
+
+            let text = std::fs::read_to_string(&out).unwrap();
+            assert!(
+                text.contains("createType=\"twoGbMaxExtentFlat\""),
+                "{name}: {text}"
+            );
+            let gib = 1024u64 * 1024 * 1024;
+            for (i, want) in [(1, 2 * gib), (2, 2 * gib), (3, gib)] {
+                let extent = dir.path().join(format!("{name}-f{i:03}.vmdk"));
+                let len = std::fs::metadata(&extent)
+                    .unwrap_or_else(|e| panic!("{name}: extent {i}: {e}"))
+                    .len();
+                assert_eq!(len, want, "{name}: extent {i}");
+            }
+            assert!(!dir.path().join(format!("{name}-f004.vmdk")).exists());
+            assert!(!dir.path().join(format!("{name}-flat.vmdk")).exists());
+        }
+    }
+
+    #[test]
+    fn split_flat_resolves_to_the_split_route_only() {
+        for argv in [
+            &[
+                "-f",
+                "vmdk",
+                "-o",
+                "subformat=twoGbMaxExtentFlat",
+                "s.vmdk",
+                "5G",
+            ][..],
+            &[
+                "-f",
+                "vmdk",
+                "--subformat",
+                "twoGbMaxExtentFlat",
+                "s.vmdk",
+                "5G",
+            ][..],
+        ] {
+            let args = resolve(argv).unwrap();
+            assert!(is_vmdk_split_flat_create(&args), "{:?}", argv);
+            assert!(!is_vmdk_flat_create(&args), "{:?}", argv);
+        }
+        let single = resolve(&["-f", "vmdk", "-o", FLAT_O, "f.vmdk", "1M"]).unwrap();
+        assert!(!is_vmdk_split_flat_create(&single));
+        let sparse = resolve(&["-f", "vmdk", "f.vmdk", "1M"]).unwrap();
+        assert!(!is_vmdk_split_flat_create(&sparse));
+        assert_eq!(sparse.subformat, "");
+    }
+
+    /// The `-o` route names the subformat and what is supported; clap
+    /// refuses the `--subformat` route, and its help does not list it.
+    #[test]
+    fn split_sparse_is_refused_and_the_supported_subformats_named() {
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=twoGbMaxExtentSparse",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk subformat 'twoGbMaxExtentSparse' is not supported for create \
+             (supported: monolithicSparse, streamOptimized, monolithicFlat, twoGbMaxExtentFlat)"
+        );
+        use clap::Parser;
+        let refused = Cli::try_parse_from([
+            "instar",
+            "create",
+            "-f",
+            "vmdk",
+            "--subformat",
+            "twoGbMaxExtentSparse",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("twoGbMaxExtentSparse"), "{refused}");
+        assert!(refused.contains("twoGbMaxExtentFlat"), "{refused}");
+    }
+
+    #[test]
+    fn existing_vmdk_subformats_still_resolve_to_themselves() {
+        for sub in ["monolithicSparse", "streamOptimized", "monolithicFlat"] {
+            let o = format!("subformat={sub}");
+            let args = resolve(&["-f", "vmdk", "-o", &o, "f.vmdk", "1M"]).unwrap();
+            assert_eq!(args.subformat, sub);
+        }
+        let err = resolve(&["-f", "vmdk", "-o", "subformat=bogus", "f.vmdk", "1M"]).unwrap_err();
+        assert!(err.starts_with("create: bad value 'bogus'"), "{err}");
+    }
+
+    /// A split flat image takes the options a monolithicFlat one cannot,
+    /// refused under its own name.
+    #[test]
+    fn split_flat_refuses_what_flat_refuses() {
+        let sub = "subformat=twoGbMaxExtentFlat";
+        let err = resolve(&["-f", "vmdk", "-o", sub, "-b", "p.vmdk", "s.vmdk"]).unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk twoGbMaxExtentFlat cannot have a backing file"
+        );
+        let err = resolve(&["-f", "vmdk", "-o", sub, "s.vmdk"]).unwrap_err();
+        assert_eq!(err, "create: vmdk twoGbMaxExtentFlat requires SIZE");
+        let o = format!("{sub},zeroed_grain=on");
+        let err = resolve(&["-f", "vmdk", "-o", &o, "s.vmdk", "5G"]).unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk twoGbMaxExtentFlat cannot enable zeroed_grain"
+        );
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            sub,
+            "--grain-size",
+            "4096",
+            "s.vmdk",
+            "5G",
+        ])
+        .unwrap_err();
+        assert!(
+            err.starts_with("create: vmdk twoGbMaxExtentFlat has no grains"),
+            "{err}"
+        );
+        let o = format!("{sub},preallocation=metadata");
+        assert!(resolve(&["-f", "vmdk", "-o", &o, "s.vmdk", "5G"]).is_err());
+    }
+
     #[test]
     fn flat_refuses_a_grain_size() {
         let want =
@@ -23994,17 +23977,112 @@ mod create_option_tests {
         assert!(!text.contains(&0xAA));
     }
 
+    /// Half one of the create-only cleanup guarantee: a failed create
+    /// does not delete a file that was there before it ran. The
+    /// extent's name is taken by a directory, so opening it fails after
+    /// the descriptor has been opened and truncated.
     #[test]
-    fn flat_failure_after_opening_removes_the_descriptor() {
-        // The extent's name is taken by a directory, so opening it fails
-        // after the descriptor has been opened (and truncated).
+    fn flat_failure_keeps_the_descriptor_it_did_not_create() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("c.vmdk"), b"old").unwrap();
+        let descriptor = dir.path().join("c.vmdk");
+        std::fs::write(&descriptor, b"old").unwrap();
         std::fs::create_dir(dir.path().join("c-flat.vmdk")).unwrap();
         let err = create_flat(dir.path(), "c.vmdk", "1M", &[]).unwrap_err();
         assert!(err.contains("c-flat.vmdk"), "{}", err);
-        assert!(!dir.path().join("c.vmdk").exists());
+        assert!(
+            descriptor.exists(),
+            "a failed create deleted a descriptor it did not create"
+        );
+        // Empty, because the open truncated it before the failure. The
+        // guarantee is that create does not delete what it did not
+        // make, not that it keeps what it overwrote; qemu-img leaves a
+        // truncated file behind too.
+        assert_eq!(std::fs::metadata(&descriptor).unwrap().len(), 0);
         assert!(dir.path().join("c-flat.vmdk").is_dir());
+    }
+
+    /// Half two of the same guarantee: what the run did create is still
+    /// removed, so a failed create leaves no litter. Same injected
+    /// failure, with no descriptor in place beforehand.
+    #[test]
+    fn flat_failure_removes_the_descriptor_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("c-flat.vmdk")).unwrap();
+        let err = create_flat(dir.path(), "c.vmdk", "1M", &[]).unwrap_err();
+        assert!(err.contains("c-flat.vmdk"), "{}", err);
+        assert!(
+            !dir.path().join("c.vmdk").exists(),
+            "a failed create left the descriptor it had made"
+        );
+        assert!(dir.path().join("c-flat.vmdk").is_dir());
+    }
+
+    /// Run the split flat writer for `name` in `dir` with SIZE `size`.
+    /// The arguments are the ones clap parses rather than resolved ones;
+    /// the writer reads only the filename and the size.
+    fn create_split_flat(dir: &Path, name: &str, size: &str) -> Result<(), String> {
+        let out = dir.join(name);
+        let args = parse_create_cli(&[
+            "-q",
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=twoGbMaxExtentFlat",
+            out.to_str().unwrap(),
+            size,
+        ]);
+        run_create_vmdk_split_flat(&args).map_err(|e| e.to_string())
+    }
+
+    /// A directory counts as a derived extent's path being taken, so
+    /// the plan refuses before anything is opened. The descriptor the
+    /// user named keeps its bytes, because the open that would have
+    /// truncated it never runs.
+    #[test]
+    fn split_create_refuses_a_directory_at_an_extent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = dir.path().join("s.vmdk");
+        std::fs::write(&descriptor, b"old").unwrap();
+        std::fs::create_dir(dir.path().join("s-f002.vmdk")).unwrap();
+        let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
+        assert!(err.contains("s-f002.vmdk"), "{}", err);
+        assert!(err.contains("instar derived that path"), "{}", err);
+        assert_eq!(std::fs::read(&descriptor).unwrap(), b"old");
+        assert!(
+            !dir.path().join("s-f001.vmdk").exists(),
+            "a refused create opened an extent"
+        );
+    }
+
+    /// The cleanup guarantee at the split entry point: the extents this
+    /// run made are removed when the write fails. The failure is a
+    /// directory at the descriptor's own path, which is the only one a
+    /// split create can be made to take -- the plan refuses every other
+    /// file it could find in place -- and because the descriptor is
+    /// opened last, it fires with both extents already on disk. The
+    /// assertion on where the error comes from is what keeps that true:
+    /// a failure moved into the plan would leave nothing to clean up.
+    ///
+    /// The other half of the guarantee, that a file this run did not
+    /// create is kept once truncated, cannot be reached from here at
+    /// all: after the first file is opened, nothing this writer opens
+    /// can be a file the user already had. It is tested in
+    /// `vmdk_created_files_tests`, where the bookkeeping is.
+    #[test]
+    fn split_failure_removes_the_extents_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("s.vmdk")).unwrap();
+        let err = create_split_flat(dir.path(), "s.vmdk", "2049M").unwrap_err();
+        assert!(err.starts_with("create: open "), "{}", err);
+        assert!(err.contains("s.vmdk"), "{}", err);
+        for extent in ["s-f001.vmdk", "s-f002.vmdk"] {
+            assert!(
+                !dir.path().join(extent).exists(),
+                "a failed create left {} behind",
+                extent
+            );
+        }
+        assert!(dir.path().join("s.vmdk").is_dir());
     }
 
     #[test]
@@ -26713,99 +26791,5 @@ mod clap_count_indices_tests {
             m.indices_of("clear").is_some(),
             "absent Count flag still yields a phantom index; gate on get_count() > 0"
         );
-    }
-}
-
-#[cfg(test)]
-mod vmdk_flat_extent_path_tests {
-    //! Unit tests for `vmdk_flat_extent_path`. Integration coverage against
-    //! the host qemu-img lives in `tests/test_convert.py`.
-    use super::*;
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
-
-    /// Assert `output` gives the extent path `extent`, and that the descriptor
-    /// records the final component of `extent`.
-    fn check(output: &str, extent: &str) {
-        let (path, name) = vmdk_flat_extent_path(Path::new(output), "test").unwrap();
-        assert_eq!(path, PathBuf::from(extent));
-        assert_eq!(name, extent.rsplit('/').next().unwrap());
-    }
-
-    #[test]
-    fn vmdk_extension_is_kept() {
-        check("out.vmdk", "out-flat.vmdk");
-    }
-
-    #[test]
-    fn other_extension_is_kept() {
-        check("out.img", "out-flat.img");
-    }
-
-    #[test]
-    fn no_extension_gets_a_bare_suffix() {
-        check("out", "out-flat");
-    }
-
-    #[test]
-    fn leading_dot_is_the_split_point() {
-        check(".hid", "-flat.hid");
-    }
-
-    #[test]
-    fn split_is_at_the_last_dot() {
-        check("a.b.c", "a.b-flat.c");
-    }
-
-    #[test]
-    fn trailing_dot_is_kept() {
-        check("x.", "x-flat.");
-    }
-
-    #[test]
-    fn extent_stays_in_the_outputs_directory() {
-        check("dir/sub/x.y", "dir/sub/x-flat.y");
-        check("/abs/noext", "/abs/noext-flat");
-    }
-
-    #[test]
-    fn dots_in_directories_are_ignored() {
-        check("d.ir/out", "d.ir/out-flat");
-    }
-
-    #[test]
-    fn backslash_and_colon_are_not_separators() {
-        check("a\\b.vmdk", "a\\b-flat.vmdk");
-        check("a:b.vmdk", "a:b-flat.vmdk");
-    }
-
-    /// Assert `output` is refused, naming `op` and the offending name.
-    fn refused(output: &[u8], shown: &str) {
-        let err = vmdk_flat_extent_path(Path::new(OsStr::from_bytes(output)), "op").unwrap_err();
-        assert!(err.starts_with("op: "), "{err}");
-        assert!(err.contains(shown), "{err} should show {shown}");
-    }
-
-    #[test]
-    fn non_utf8_basename_is_refused() {
-        refused(b"d/\xff\xfe.img", "\"\u{fffd}\u{fffd}-flat.img\"");
-    }
-
-    #[test]
-    fn descriptor_breaking_characters_are_refused() {
-        refused(b"a\"b.vmdk", r#""a\"b-flat.vmdk""#);
-        refused(b"a\nb.vmdk", r#""a\nb-flat.vmdk""#);
-        refused(b"a\rb.vmdk", r#""a\rb-flat.vmdk""#);
-    }
-
-    #[test]
-    fn non_utf8_and_quotes_in_directories_are_allowed() {
-        // Only the basename is recorded; the directory never reaches the
-        // descriptor.
-        let out = Path::new(OsStr::from_bytes(b"\xff\"/out.vmdk"));
-        let (path, name) = vmdk_flat_extent_path(out, "op").unwrap();
-        assert_eq!(path.as_os_str().as_bytes(), b"\xff\"/out-flat.vmdk");
-        assert_eq!(name, "out-flat.vmdk");
     }
 }
